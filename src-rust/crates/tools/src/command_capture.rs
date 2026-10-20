@@ -855,8 +855,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("owned marker & exact.txt");
         let command = format!("echo owned > \"{}\"", marker.display());
-        let (child, mut group) =
-            spawn_owned_cmd_shell_checked(&command, dir.path()).expect("owned cmd shell");
+        let (child, mut group) = spawn_owned_cmd_shell_checked(&command, dir.path())
+            .unwrap_or_else(|error| panic!("owned cmd shell: {}", error.message()));
         let output = capture_owned_with_cancel(
             child,
             Duration::from_secs(5),

@@ -4428,9 +4428,7 @@ pub mod hooks {
     use std::process::ExitStatus;
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-    #[cfg(not(windows))]
-    use tokio::process::Command;
-    use tokio::process::{Child, ChildStdin};
+    use tokio::process::{Child, ChildStdin, Command};
     use tokio::task::JoinSet;
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, warn};

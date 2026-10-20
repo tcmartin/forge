@@ -543,9 +543,8 @@ async fn run_windows_fallback(
     timeout_ms: u64,
     ctx: &ToolContext,
 ) -> ToolResult {
-    let argv = vec!["cmd".to_string(), "/C".to_string(), command.to_string()];
     let (child, mut group) =
-        match crate::command_capture::spawn_owned_argv_checked(&argv, effective_cwd) {
+        match crate::command_capture::spawn_owned_cmd_shell_checked(command, effective_cwd) {
             Ok(pair) => pair,
             Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
                 return not_run_result(format!("Failed to spawn command: {error}"));
@@ -1548,10 +1547,15 @@ mod windows_tests {
     async fn windows_fallback_timeout_kills_owned_descendant() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pty-timeout-pids.txt");
-        let marker_literal = marker.display().to_string().replace('\'', "''");
-        let command = format!(
-            "powershell -NoProfile -NonInteractive -Command \"$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value ($PID.ToString()+','+$p.Id); Wait-Process -Id $p.Id\""
-        );
+        std::fs::write(
+            dir.path().join("pty-timeout.ps1"),
+            r#"$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru
+Set-Content -NoNewline -LiteralPath 'pty-timeout-pids.txt' -Value ($PID.ToString()+','+$p.Id)
+Wait-Process -Id $p.Id
+"#,
+        )
+        .unwrap();
+        let command = "powershell -NoProfile -NonInteractive -File pty-timeout.ps1".to_string();
         let cwd = dir.path().to_path_buf();
         let ctx = allow_all_context();
         let task = tokio::spawn(async move {

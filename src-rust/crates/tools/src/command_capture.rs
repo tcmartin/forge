@@ -314,6 +314,25 @@ pub(crate) fn spawn_owned_argv_checked_with_stdio(
     spawn_owned_command_checked(command)
 }
 
+/// Spawn one authorized raw shell command through cmd.exe without applying
+/// CRT argv quoting to the command text. cmd.exe parses /C text itself and
+/// does not follow CommandLineToArgvW rules; raw_arg preserves embedded quotes
+/// and shell metacharacters while the outer pair supplies cmd /S /C framing.
+#[cfg(windows)]
+pub(crate) fn spawn_owned_cmd_shell_checked(
+    command_text: &str,
+    cwd: &Path,
+) -> Result<(Child, ProcessGroupGuard), SpawnOwnedError> {
+    let mut command = claurst_core::windows_job_object::cmd_shell_command(command_text);
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    spawn_owned_command_checked(command)
+}
+
 #[cfg(windows)]
 pub(crate) fn spawn_owned_command_checked(
     command: Command,
@@ -828,6 +847,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let argv = vec!["definitely-not-a-real-program-for-r55".into()];
         assert!(spawn_owned_argv_checked(&argv, dir.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_shell_preserves_quoted_path_and_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("owned marker & exact.txt");
+        let command = format!("echo owned > \"{}\"", marker.display());
+        let (child, mut group) =
+            spawn_owned_cmd_shell_checked(&command, dir.path()).expect("owned cmd shell");
+        let output = capture_owned_with_cancel(
+            child,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+            &mut group,
+        )
+        .await
+        .expect("bounded cmd capture");
+        assert!(output.status.expect("cmd status").success());
+        assert!(
+            marker.is_file(),
+            "quoted metacharacter path was not written"
+        );
+        assert!(group.confirmed_empty().await);
     }
 
     #[cfg(unix)]

@@ -4428,7 +4428,9 @@ pub mod hooks {
     use std::process::ExitStatus;
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-    use tokio::process::{Child, ChildStdin, Command};
+    #[cfg(not(windows))]
+    use tokio::process::Command;
+    use tokio::process::{Child, ChildStdin};
     use tokio::task::JoinSet;
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, warn};
@@ -4830,19 +4832,19 @@ pub mod hooks {
                 .filter(|total| *total <= MAX_HOOK_ENV_BYTES)
                 .ok_or_else(|| io::Error::other("hook environment exceeded byte limit"))
         })?;
-        let shell = if cfg!(windows) { "cmd" } else { "sh" };
-        let args: &[&str] = if cfg!(windows) {
-            &["/C", command]
-        } else {
-            &["-c", command]
-        };
         let mut process = HookChild::new({
-            let mut cmd = Command::new(shell);
+            #[cfg(windows)]
+            let mut cmd = windows_job_object::cmd_shell_command(command);
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", command]);
+                cmd
+            };
             for env in environment {
                 cmd.env(env.name, env.value);
             }
-            cmd.args(args)
-                .current_dir(working_dir)
+            cmd.current_dir(working_dir)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());

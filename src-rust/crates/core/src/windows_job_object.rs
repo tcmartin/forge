@@ -317,6 +317,19 @@ impl SpawnOwnedError {
     }
 }
 
+/// Build a Windows `cmd.exe` command with raw shell-text framing.
+///
+/// `cmd.exe` parses `/C` text using its own grammar rather than the CRT
+/// `CommandLineToArgvW` grammar used by ordinary argv arguments. Keep the
+/// command text as one raw argument inside the required outer quote pair.
+pub fn cmd_shell_command(command_text: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command
+        .args(["/D", "/S", "/C"])
+        .raw_arg(format!("\"{command_text}\""));
+    command
+}
+
 /// Spawn a Windows child through the complete suspended -> owned -> resumed
 /// sequence. The returned child is still owned by the caller when arming
 /// fails, allowing bounded cleanup and an explicit Unknown result.

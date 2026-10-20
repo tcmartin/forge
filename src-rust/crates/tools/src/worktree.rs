@@ -1299,7 +1299,7 @@ mod tests {
         let mut ctx = allow_all_context(tmp.path().into());
         ctx.session_id = uuid::Uuid::new_v4().to_string();
         let post_create_command = if cfg!(windows) {
-            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath marker -Value 'worktree-marker'; Write-Output verified-worktree"#
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath marker -Value 'worktree-marker'; Write-Output verified-worktree""#
         } else {
             "printf worktree-marker > marker; printf verified-worktree"
         };
@@ -1357,7 +1357,7 @@ mod tests {
         );
         assert!(!tmp.path().join("marker").exists());
         let shell_command = if cfg!(windows) {
-            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath shell-file -Value 'shell-marker'; Write-Output worktree-evidence"#
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath shell-file -Value 'shell-marker'; Write-Output worktree-evidence""#
         } else {
             "printf shell-marker > shell-file; printf worktree-evidence"
         };
@@ -1378,7 +1378,7 @@ mod tests {
         assert!(!evidence.is_error, "{}", evidence.content);
         assert!(evidence.content.contains("worktree-evidence"));
         let parent_command = if cfg!(windows) {
-            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath parent-file -Value 'parent-marker'"#
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath parent-file -Value 'parent-marker'""#
         } else {
             "printf parent-marker > parent-file"
         };

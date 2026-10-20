@@ -215,15 +215,7 @@ async fn child_for(
 ) -> Result<(Child, ProcessGroupGuard), ChildLaunchError> {
     #[cfg(windows)]
     {
-        let mut child_command = tokio::process::Command::new("cmd");
-        child_command
-            .args(["/C", command])
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        return match crate::command_capture::spawn_owned_command_checked(child_command) {
+        return match crate::command_capture::spawn_owned_cmd_shell_checked(command, cwd) {
             Ok(pair) => Ok(pair),
             Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
                 Err(ChildLaunchError::Spawn(error.to_string()))

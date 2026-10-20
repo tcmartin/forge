@@ -517,7 +517,12 @@ mod tests {
 
         fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(request.path.as_deref(), self.path.to_str());
+            let requested = std::fs::canonicalize(std::path::Path::new(
+                request.path.as_deref().expect("permission path"),
+            ))
+            .expect("canonical requested permission path");
+            let expected = std::fs::canonicalize(&self.path).expect("canonical fixture path");
+            assert_eq!(requested, expected);
             std::fs::write(&self.path, "Approved current body: $ARGUMENTS").unwrap();
             self.check_permission(request)
         }

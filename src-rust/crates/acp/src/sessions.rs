@@ -390,9 +390,10 @@ mod tests {
 
     #[test]
     fn registry_insert_get_remove_round_trip() {
+        let root = temp_root("registry");
         let registry = SessionRegistry::new();
         let id = acp::SessionId::new("session-2");
-        let state = SessionState::new(id.clone(), PathBuf::from("/tmp")).unwrap();
+        let state = SessionState::new(id.clone(), root.clone()).unwrap();
 
         assert!(registry.get(&id).is_none());
 
@@ -407,6 +408,7 @@ mod tests {
             .expect("session should be present to remove");
         assert!(Arc::ptr_eq(&removed, &state));
         assert!(registry.get(&id).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -418,6 +420,7 @@ mod tests {
 
     #[test]
     fn load_reservation_excludes_pending_and_active_owners() {
+        let root = temp_root("reservation");
         let registry = Arc::new(SessionRegistry::new());
         let id = acp::SessionId::new("acp-reserved");
         let reservation = registry.reserve_load(&id).unwrap();
@@ -428,12 +431,13 @@ mod tests {
         drop(reservation);
 
         let reservation = registry.reserve_load(&id).unwrap();
-        let state = SessionState::new(id.clone(), PathBuf::from("/tmp")).unwrap();
+        let state = SessionState::new(id.clone(), root.clone()).unwrap();
         reservation.activate(Arc::clone(&state)).unwrap();
         assert!(Arc::ptr_eq(&registry.get(&id).unwrap(), &state));
         assert!(registry.reserve_load(&id).is_none());
         registry.remove(&id).unwrap();
         assert!(registry.reserve_load(&id).is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -21,6 +21,9 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
 const WINDOWS_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
 
+#[cfg(windows)]
+const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+
 pub const MAX_CATALOG_ENTRIES: usize = 4096;
 pub const MAX_TOOL_NAME_BYTES: usize = 256;
 pub const MAX_DESCRIPTION_CHARS: usize = 160;
@@ -86,8 +89,10 @@ fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>),
 #[cfg(windows)]
 fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>), ToolCatalogError> {
     let mut options = fs::OpenOptions::new();
+    // Metadata-only opens do not participate in Windows sharing checks.
+    // Directory read access makes the missing delete share block replacement.
     options
-        .access_mode(0)
+        .access_mode(FILE_LIST_DIRECTORY)
         .share_mode(WINDOWS_SHARE_READ_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     let handle = Arc::new(

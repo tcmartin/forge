@@ -1583,11 +1583,12 @@ mod tests {
             child_registration(&id, &ctx, CancellationToken::new()).expect("register child");
 
         let partial = "partial 🦀\u{0001}".repeat(20_000);
+        let long_path_root = root.path().join(format!("path/{}", "deep/".repeat(2_000)));
         let result = ToolResult::error(partial).with_metadata(json!({
             "adversarial": "\u{0001}".repeat(100_000),
             "child_provenance": {
                 "child_agent_id": "agent-".repeat(2_000),
-                "working_dir": "/tmp/".to_string() + &"path/".repeat(2_000),
+                "working_dir": long_path_root.to_string_lossy().into_owned(),
             },
         }));
         finish(
@@ -1819,6 +1820,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parent_acceptance_requires_matching_artifacts_and_fresh_registered_check() {
         let (_root, parent, child, mut ctx) = acceptance_fixture("test -f artifact.txt");
@@ -1896,6 +1898,7 @@ mod tests {
         ctx.trusted_checker_catalog = Arc::new(crate::TrustedCheckerCatalog::empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mismatched_parent_artifact_keeps_acceptance_barrier() {
         let (_root, _parent, child, ctx) = acceptance_fixture("true");
@@ -1942,6 +1945,58 @@ mod tests {
             .expect("clear parent test barrier");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unavailable_windows_parent_checker_keeps_barrier_without_evidence() {
+        let (_root, parent, child, ctx) = acceptance_fixture("test -f artifact.txt");
+        std::fs::write(child.join("artifact.txt"), b"accepted\n").unwrap();
+        std::fs::write(parent.join("artifact.txt"), b"accepted\n").unwrap();
+        let id = format!("agent-test-{}", uuid::Uuid::new_v4());
+        let owner = register(
+            id.clone(),
+            "isolated child".to_string(),
+            &ctx,
+            format!("child-{id}"),
+            child.clone(),
+            Some(child),
+            CancellationToken::new(),
+        )
+        .expect("register isolated child");
+        finish(
+            &id,
+            &owner,
+            &ctx,
+            AgentTaskStatus::Completed,
+            ChildCleanup::ConfirmedClean,
+            ToolResult::success("child complete").with_metadata(json!({
+                "pending_parent_acceptance": true,
+            })),
+        )
+        .await
+        .expect("publish child completion");
+        let rejected = crate::tasks::TaskAcceptTool
+            .execute(
+                json!({"task_id": id, "verification_command": "test -f artifact.txt"}),
+                &ctx,
+            )
+            .await;
+        assert!(rejected.is_error);
+        assert!(rejected.content.contains("not registered"));
+        assert!(rejected.metadata.is_none());
+        assert!(mutation::pending_for_scope(&ctx));
+        assert_eq!(
+            output(&id, &ctx, false).await.unwrap()["task"]["status"],
+            "awaiting_parent_acceptance"
+        );
+        let process = AGENT_PROCESSES.remove(&id).unwrap().1;
+        process
+            .parent_pending
+            .as_ref()
+            .unwrap()
+            .confirm_terminal()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn failed_isolated_child_is_not_accepted_and_releases_parent_barrier() {
         let parent = tempdir().expect("parent workspace");
@@ -1978,6 +2033,7 @@ mod tests {
         AGENT_PROCESSES.remove(&id);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_parent_checker_retains_barrier_and_exact_evidence() {
         let (_root, parent, child, ctx) = acceptance_fixture("printf verifier-failed; exit 7");
@@ -2176,6 +2232,10 @@ mod tests {
     #[tokio::test]
     async fn task_output_execute_bounds_escaped_tool_result_and_keeps_evidence() {
         let root = tempdir().expect("temporary workspace");
+        let long_working_dir = root.path().join(format!("deep/{}", "path/".repeat(2_000)));
+        let long_worktree = root
+            .path()
+            .join(format!("worktree/{}", "path/".repeat(2_000)));
         let mut ctx = allow_all_context(root.path().to_path_buf());
         ctx.session_id = "agent-task-escaped-output".to_string();
         let id = format!("agent-test-{}", uuid::Uuid::new_v4());
@@ -2184,8 +2244,8 @@ mod tests {
             "subject \u{0001} ".repeat(4_000),
             &ctx,
             "child-output".to_string(),
-            PathBuf::from(format!("/tmp/{}", "deep/".repeat(2_000))),
-            Some(PathBuf::from(format!("/tmp/{}", "worktree/".repeat(2_000)))),
+            long_working_dir,
+            Some(long_worktree),
             CancellationToken::new(),
         )
         .expect("register child");

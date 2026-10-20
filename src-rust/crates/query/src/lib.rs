@@ -6866,7 +6866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_effort_query_uses_lower_wire_then_returns_to_base() {
+    async fn verified_effort_query_requires_receipt_before_lower_wire() {
         let root = tempfile::tempdir().expect("query fixture root");
         std::fs::write(root.path().join("target"), b"before").expect("target");
         let command = "test \"$(cat target)\" = after; printf x >> checker-runs";
@@ -6964,16 +6964,27 @@ mod tests {
             matches!(outcome, QueryOutcome::EndTurn { .. }),
             "{outcome:?}"
         );
-        assert_eq!(
-            *thinking.lock().unwrap(),
-            vec![Some(10_000), Some(5_000), Some(10_000)]
-        );
-        assert_eq!(*dispatch.lock().unwrap(), vec![false, true, false]);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                *thinking.lock().unwrap(),
+                vec![Some(10_000), Some(5_000), Some(10_000)]
+            );
+            assert_eq!(*dispatch.lock().unwrap(), vec![false, true, false]);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(*thinking.lock().unwrap(), vec![Some(10_000); 3]);
+            assert_eq!(*dispatch.lock().unwrap(), vec![false; 3]);
+        }
         assert_eq!(std::fs::read(root.path().join("target")).unwrap(), b"after");
+        #[cfg(unix)]
         assert_eq!(
             std::fs::read(root.path().join("checker-runs")).unwrap(),
             b"x"
         );
+        #[cfg(not(unix))]
+        assert!(!root.path().join("checker-runs").exists());
     }
 
     #[tokio::test]

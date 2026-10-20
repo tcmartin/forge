@@ -5459,7 +5459,7 @@ pub mod hooks {
         async fn output_overflow_is_rejected_before_unbounded_capture() {
             let entry = HookEntry {
                 command: if cfg!(windows) {
-                    "for /L %i in (1,1,400000) do @<nul set /p =x".to_string()
+                    "for /L %i in (1,1,400000) do @echo x".to_string()
                 } else {
                     "yes x".to_string()
                 },

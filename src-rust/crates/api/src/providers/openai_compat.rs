@@ -1323,6 +1323,7 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("request should connect");
+            super::super::read_loopback_fixture_request(&mut socket).await;
             socket
                 .write_all(response.as_bytes())
                 .await
@@ -1410,6 +1411,7 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("request should connect");
+            super::super::read_loopback_fixture_request(&mut socket).await;
             socket
                 .write_all(response.as_bytes())
                 .await

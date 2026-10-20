@@ -761,17 +761,19 @@ mod tests {
 
     #[test]
     fn task_value_budget_handles_control_character_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_path_buf();
         let process = OwnedProcess {
             id: "bg-control-budget".to_string(),
             command: "printf '\\001'".repeat(10_000),
-            workspace: PathBuf::from("/tmp"),
-            cwd: PathBuf::from("/tmp"),
+            workspace: workspace_path.clone(),
+            cwd: workspace_path.clone(),
             session_id: "control-budget".to_string(),
             created_at: Instant::now(),
             cancel: CancellationToken::new(),
             pending: mutation::register_pending(
                 mutation::MutationScope {
-                    workspace: PathBuf::from("/tmp"),
+                    workspace: workspace_path,
                     session: "background-control-budget".into(),
                 },
                 "test process",

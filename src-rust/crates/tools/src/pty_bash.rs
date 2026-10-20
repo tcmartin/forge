@@ -17,8 +17,10 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 #[cfg(windows)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
+#[cfg(windows)]
+use tokio::process::Command;
 use tracing::debug;
 
 // Unix-only imports used by the shell-state helpers and PTY execution path.

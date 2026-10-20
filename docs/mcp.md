@@ -45,6 +45,35 @@ For servers running as standalone HTTP services. The `url` field is required; `c
 }
 ```
 
+## Host-authorized observation candidates
+
+MCP calls remain serialized unless a user-owned global grant matches the live
+launch source and exact advertised definition. Grants are configured under
+`config.mcpObservationGrants`; project settings cannot add authority.
+Merge this field into the existing global `config` object. The fragment below
+omits its other required fields.
+
+```json
+{
+  "config": {
+    "mcpObservationGrants": [
+      {
+        "version": "forge.mcp-observation-grant.v1",
+        "sourceKey": "<64 lowercase hex characters>",
+        "server": "filesystem",
+        "rawTool": "read_file",
+        "definitionDigest": "<64 lowercase hex characters>"
+      }
+    ]
+  }
+}
+```
+
+Use `/mcp tools --json` or `/mcp tools <server> --json` to inspect bounded,
+candidate-only metadata. The projection reports `exact`, `no_grant`,
+`source_mismatch`, `definition_mismatch`, `stale`, or
+`invalid_configuration`; it does not change permissions or tool scope.
+
 The `type` field defaults to `"stdio"` when omitted.
 
 ---

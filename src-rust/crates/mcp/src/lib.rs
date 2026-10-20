@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use claurst_core::config::{McpServerConfig, McpServerOrigin};
+use claurst_core::crypto_utils::sha256_hex;
 use claurst_core::mcp_templates::TemplateRenderer;
 use claurst_core::types::ToolDefinition;
 use dashmap::DashMap;
@@ -131,6 +132,96 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
         // a trusted one.
         origin: config.origin,
     }
+}
+
+const MCP_LAUNCH_SOURCE_DOMAIN: &[u8] = b"forge.mcp-launch-source.v1";
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+
+fn frame_string(out: &mut Vec<u8>, value: &str) -> bool {
+    let Ok(length) = u32::try_from(value.len()) else {
+        return false;
+    };
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out.len() <= MAX_SOURCE_BYTES
+}
+
+fn frame_option(out: &mut Vec<u8>, value: Option<&str>) -> bool {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            if !frame_string(out, value) {
+                return false;
+            }
+        }
+    }
+    out.len() <= MAX_SOURCE_BYTES
+}
+
+/// Hash the exact immutable launch snapshot handed to a live MCP transport.
+/// Unsupported or over-bounded snapshots intentionally have no identity and
+/// therefore can never satisfy a host observation grant.
+pub fn mcp_launch_source_key(config: &McpServerConfig) -> Option<String> {
+    let server = canonical_mcp_server_name(&config.name);
+    if server.is_empty() || server.len() > 256 {
+        return None;
+    }
+    if !matches!(config.server_type.as_str(), "stdio" | "sse" | "http") {
+        return None;
+    }
+    if config.args.len() > 1024 || config.env.len() > 1024 {
+        return None;
+    }
+    if config
+        .command
+        .as_ref()
+        .is_some_and(|value| value.len() > 16 * 1024)
+        || config
+            .url
+            .as_ref()
+            .is_some_and(|value| value.len() > 16 * 1024)
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(MCP_LAUNCH_SOURCE_DOMAIN);
+    bytes.push(0);
+    if !frame_string(&mut bytes, &server) || !frame_string(&mut bytes, &config.server_type) {
+        return None;
+    }
+    if !frame_option(&mut bytes, config.command.as_deref()) {
+        return None;
+    }
+    let mut args = config.args.iter();
+    let count = u32::try_from(config.args.len()).ok()?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for arg in args.by_ref() {
+        if arg.len() > 64 * 1024 || !frame_string(&mut bytes, arg) {
+            return None;
+        }
+    }
+    if !frame_option(&mut bytes, config.url.as_deref()) {
+        return None;
+    }
+    let mut env: Vec<_> = config.env.iter().collect();
+    env.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    let count = u32::try_from(env.len()).ok()?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for (key, value) in env {
+        if key.len() > 4 * 1024
+            || value.len() > 64 * 1024
+            || !frame_string(&mut bytes, key)
+            || !frame_string(&mut bytes, value)
+        {
+            return None;
+        }
+    }
+    bytes.push(match config.origin {
+        McpServerOrigin::User => 0,
+        McpServerOrigin::Project => 1,
+    });
+    (bytes.len() <= MAX_SOURCE_BYTES).then(|| sha256_hex(&bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,6 +1634,19 @@ impl McpManager {
         self.catalog.checked_snapshot()
     }
 
+    /// Return a live manager-issued launch identity only after all descriptor
+    /// generations and schema fields are revalidated against the owning client.
+    pub fn source_key_for_descriptor(
+        &self,
+        descriptor: &catalog_state::McpToolDescriptor,
+    ) -> Option<String> {
+        let client = self.client_for_name(descriptor.server_name())?;
+        client
+            .catalog_state()
+            .validated_source_key(descriptor)
+            .ok()?
+    }
+
     /// Wait for all configured MCP catalogs to become available after a
     /// notification-triggered refresh.  Dirty sources remain unavailable to
     /// callers until the complete, generation-checked snapshot is ready.
@@ -1987,6 +2091,205 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_source_key_matches_canonical_golden_vector() {
+        let config = McpServerConfig {
+            name: "Demo".into(),
+            command: Some("node".into()),
+            args: vec!["server.js".into()],
+            env: HashMap::from([
+                ("API_TOKEN".into(), "TOKEN_A".into()),
+                ("Z".into(), "9".into()),
+                ("a".into(), "1".into()),
+            ]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        assert_eq!(
+            mcp_launch_source_key(&config).as_deref(),
+            Some("cee7e0847e31fc92b64917a48726f121512556f0d680ddadb80d1fc9ae78d145")
+        );
+    }
+
+    #[test]
+    fn launch_source_key_changes_with_origin_and_effective_environment() {
+        let mut config = McpServerConfig {
+            name: "demo".into(),
+            command: Some("node".into()),
+            args: vec![],
+            env: HashMap::from([("API_TOKEN".into(), "${_CC_SOURCE_IDENTITY}".into())]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        std::env::set_var("_CC_SOURCE_IDENTITY", "TOKEN_A");
+        let expanded_a = expand_server_config(&config);
+        let user = mcp_launch_source_key(&expanded_a).unwrap();
+        std::env::set_var("_CC_SOURCE_IDENTITY", "TOKEN_B");
+        let expanded_b = expand_server_config(&config);
+        assert_ne!(Some(user.clone()), mcp_launch_source_key(&expanded_b));
+        assert_ne!(Some(user), mcp_launch_source_key(&config));
+        config.origin = McpServerOrigin::Project;
+        assert_ne!(
+            mcp_launch_source_key(&expanded_b),
+            mcp_launch_source_key(&config)
+        );
+        std::env::remove_var("_CC_SOURCE_IDENTITY");
+    }
+
+    #[test]
+    fn scoped_source_key_uses_explicit_config_without_inherited_expansion() {
+        let config = McpServerConfig {
+            name: "scoped".into(),
+            command: Some("node".into()),
+            args: vec![],
+            env: HashMap::from([("API_TOKEN".into(), "${_CC_SCOPED_SOURCE}".into())]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        std::env::set_var("_CC_SCOPED_SOURCE", "INHERITED");
+        let explicit = mcp_launch_source_key(&config).unwrap();
+        let expanded = mcp_launch_source_key(&expand_server_config(&config)).unwrap();
+        assert_ne!(explicit, expanded);
+        std::env::remove_var("_CC_SCOPED_SOURCE");
+    }
+
+    #[tokio::test]
+    async fn constructor_failed_spawn_preserves_live_source_identity_for_refresh() {
+        let fixture = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "source-transaction-fixture", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "echo",
+            "description": "source transaction fixture",
+            "inputSchema": {"type": "object"},
+        }]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+        let config_a = McpServerConfig {
+            name: "source-transaction-fixture".into(),
+            command: Some("python3".into()),
+            args: vec!["-u".into(), "-c".into(), fixture.into()],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        let catalog = Arc::new(catalog_state::CatalogState::new());
+        let client = Arc::new(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client::McpClient::connect_stdio_with_catalog(&config_a, Arc::clone(&catalog)),
+            )
+            .await
+            .expect("live source A fixture connection timed out")
+            .expect("live source A fixture connection"),
+        );
+        let outcome: anyhow::Result<()> = async {
+            let descriptor_a = catalog
+                .checked_snapshot()?
+                .descriptors
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("source A descriptor missing"))?;
+            let source_key_a = mcp_launch_source_key(&config_a)
+                .ok_or_else(|| anyhow::anyhow!("source A key missing"))?;
+            if descriptor_a.source_key() != Some(source_key_a.as_str()) {
+                anyhow::bail!("source A descriptor identity mismatch");
+            }
+
+            let mut config_b = config_a.clone();
+            config_b.command =
+                Some("/definitely/missing/forge-mcp-source-transaction-fixture".into());
+            let source_key_b = mcp_launch_source_key(&config_b)
+                .ok_or_else(|| anyhow::anyhow!("source B key missing"))?;
+            let b_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client::McpClient::connect_stdio_with_catalog(&config_b, Arc::clone(&catalog)),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("source B fixture connection timed out"))?;
+            let error = match b_result {
+                Ok(b_client) => {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        b_client.shutdown(),
+                    )
+                    .await;
+                    anyhow::bail!("missing source B executable unexpectedly connected");
+                }
+                Err(error) => error,
+            };
+            if !error
+                .to_string()
+                .contains("failed to spawn rmcp stdio child")
+            {
+                anyhow::bail!("source B failed for an unexpected reason: {error}");
+            }
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.list_tools())
+                .await
+                .map_err(|_| anyhow::anyhow!("source A refresh timed out"))??;
+            let descriptor_after_refresh = catalog
+                .checked_snapshot()?
+                .descriptors
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("refreshed source A descriptor missing"))?;
+            if descriptor_after_refresh.source_key() != Some(source_key_a.as_str()) {
+                anyhow::bail!("source A refresh changed descriptor identity");
+            }
+            let catalog_source_key = catalog
+                .lookup_server(&config_a.name)
+                .ok_or_else(|| anyhow::anyhow!("source A catalog entry missing"))?
+                .source_key();
+            if catalog_source_key != Some(source_key_a.clone()) {
+                anyhow::bail!("source A refresh changed catalog identity");
+            }
+
+            let mut manager = McpManager::new();
+            manager
+                .clients
+                .insert(config_a.name.clone(), Arc::clone(&client));
+            if manager.source_key_for_descriptor(&descriptor_after_refresh)
+                != Some(source_key_a.clone())
+            {
+                anyhow::bail!("manager did not preserve source A identity");
+            }
+            if manager.source_key_for_descriptor(&descriptor_after_refresh) == Some(source_key_b) {
+                anyhow::bail!("manager accepted failed source B identity");
+            }
+            Ok(())
+        }
+        .await;
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+            .await
+            .map_err(|_| anyhow::anyhow!("source A shutdown timed out"))
+            .and_then(|result| result);
+        match (outcome, shutdown) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) => panic!("source transaction regression: {error}"),
+            (Ok(()), Err(error)) => panic!("source A shutdown failed: {error}"),
+            (Err(outcome_error), Err(shutdown_error)) => panic!(
+                "source transaction regression: {outcome_error}; source A shutdown failed: {shutdown_error}"
+            ),
+        }
+    }
 
     // ---- env expansion -----------------------------------------------------
 

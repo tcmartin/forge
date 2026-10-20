@@ -632,11 +632,9 @@ pub fn workspace_stamp_is_current(ctx: &ToolContext, stamp: &WorkspaceMutationSt
 }
 
 fn potential_mutation(tool: &dyn Tool) -> bool {
+    // Permission admission happens before this barrier. Execute permission
+    // remains gated even when the host independently classifies an observation.
     !matches!(tool.effect(), ToolEffect::Observation)
-        || !matches!(
-            tool.permission_level(),
-            PermissionLevel::None | PermissionLevel::ReadOnly
-        )
 }
 
 fn next_epoch(state: &mut ScopeState) -> Result<u64, String> {
@@ -1847,6 +1845,117 @@ mod tests {
         }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             ToolResult::success("observed")
+        }
+    }
+
+    struct ExecuteEffectTool {
+        effect: ToolEffect,
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Tool for ExecuteEffectTool {
+        fn name(&self) -> &str {
+            "ExecuteEffectFixture"
+        }
+        fn description(&self) -> &str {
+            "Exercise independent effect and permission admission"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+        fn effect(&self) -> ToolEffect {
+            self.effect
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            ToolResult::success("executed")
+        }
+    }
+
+    struct DenyExecute;
+
+    impl claurst_core::permissions::PermissionHandler for DenyExecute {
+        fn check_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            assert!(!request.is_read_only);
+            claurst_core::permissions::PermissionDecision::Deny
+        }
+        fn request_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_observation_preserves_permission_gate_without_mutation_bookkeeping() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = allow_all_context(directory.path().to_path_buf());
+        ctx.session_id = format!("execute-observation-{}", Uuid::new_v4());
+        let scope = scope_for_context(&ctx);
+        let calls = Arc::new(AtomicU64::new(0));
+        let tool = ExecuteEffectTool {
+            effect: ToolEffect::Observation,
+            calls: Arc::clone(&calls),
+        };
+        assert!(!LEDGER.lock().contains_key(&scope));
+        let allowed = execute_authorized(&tool, json!({}), &ctx).await;
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(!LEDGER.lock().contains_key(&scope));
+        assert_eq!(current_stamp(&ctx).epoch, 0);
+
+        ctx.permission_handler = Arc::new(DenyExecute);
+        let denied = execute_authorized(&tool, json!({}), &ctx).await;
+        assert!(denied.is_error);
+        assert_eq!(
+            denied.metadata.as_ref().unwrap()["execution_status"],
+            "not_run"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(!LEDGER.lock().contains_key(&scope));
+        assert_eq!(current_stamp(&ctx).epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_unknown_and_mutation_keep_lease_exclusion_and_epochs() {
+        for effect in [ToolEffect::Unknown, ToolEffect::Mutation] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ctx = allow_all_context(directory.path().to_path_buf());
+            ctx.session_id = format!("execute-barrier-{}", Uuid::new_v4());
+            let scope = scope_for_context(&ctx);
+            let calls = Arc::new(AtomicU64::new(0));
+            let tool = ExecuteEffectTool {
+                effect,
+                calls: Arc::clone(&calls),
+            };
+            let lease = admit(&ctx, &tool).unwrap();
+            assert!(matches!(lease, MutationAdmission::Acquired(_)));
+            assert_eq!(current_stamp(&ctx).epoch, 1);
+            let blocked = execute_authorized(&tool, json!({}), &ctx).await;
+            assert!(blocked.is_error);
+            assert_eq!(
+                blocked.metadata.as_ref().unwrap()["execution_status"],
+                "not_run"
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 0);
+            assert_eq!(current_stamp(&ctx).epoch, 1);
+            drop(lease);
+            let allowed = execute_authorized(&tool, json!({}), &ctx).await;
+            assert!(!allowed.is_error, "{}", allowed.content);
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert_eq!(current_stamp(&ctx).epoch, 2);
+            let ledger = LEDGER.lock();
+            assert!(ledger.get(&scope).unwrap().active.is_none());
+            drop(ledger);
+            LEDGER.lock().remove(&scope);
         }
     }
 

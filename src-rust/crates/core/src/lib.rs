@@ -97,8 +97,8 @@ pub mod share_export;
 pub use config::{
     builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
     AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
-    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat,
-    PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
+    ManagedAgentConfig, ManagedAgentPreset, McpObservationGrant, McpServerConfig, McpServerOrigin,
+    OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
 };
 pub use error::{ClaudeError, Result};
 pub use import_config::{
@@ -1108,6 +1108,10 @@ pub mod config {
         pub verbose: bool,
         pub output_format: OutputFormat,
         pub mcp_servers: Vec<McpServerConfig>,
+        /// Exact host assertions for MCP callables allowed to overlap as observations.
+        /// Project settings never contribute to this field during merge.
+        #[serde(default, rename = "mcpObservationGrants")]
+        pub mcp_observation_grants: Vec<McpObservationGrant>,
         #[serde(default)]
         pub lsp_servers: Vec<crate::lsp::LspServerConfig>,
         pub allowed_tools: Vec<String>,
@@ -1291,6 +1295,94 @@ pub mod config {
         /// servers loaded from a repo. See [`McpServerOrigin`].
         #[serde(skip)]
         pub origin: McpServerOrigin,
+    }
+
+    pub const MCP_OBSERVATION_GRANT_VERSION: &str = "forge.mcp-observation-grant.v1";
+    pub const MCP_OBSERVATION_MAX_GRANTS: usize = 128;
+
+    /// A user-owned, source and schema bound assertion for one MCP callable.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct McpObservationGrant {
+        pub version: String,
+        #[serde(rename = "sourceKey")]
+        pub source_key: String,
+        pub server: String,
+        #[serde(rename = "rawTool")]
+        pub raw_tool: String,
+        #[serde(rename = "definitionDigest")]
+        pub definition_digest: String,
+    }
+
+    impl McpObservationGrant {
+        pub fn normalized(&self) -> Self {
+            let mut normalized = self.clone();
+            normalized.server = self.server.trim().to_ascii_lowercase();
+            normalized
+        }
+
+        pub fn validate(&self) -> anyhow::Result<Self> {
+            let normalized = self.normalized();
+            if normalized.version != MCP_OBSERVATION_GRANT_VERSION {
+                anyhow::bail!("invalid MCP observation grant version");
+            }
+            if normalized.server.is_empty() || normalized.raw_tool.is_empty() {
+                anyhow::bail!("MCP observation grant names must be nonempty");
+            }
+            if normalized.server.len() > 256 || normalized.raw_tool.len() > 256 {
+                anyhow::bail!("MCP observation grant name is too long");
+            }
+            for value in [&normalized.server, &normalized.raw_tool] {
+                if value.chars().any(|ch| {
+                    ch.is_control()
+                        || ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '*' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | '?' | '\\'
+                        )
+                }) {
+                    anyhow::bail!("MCP observation grant name contains a forbidden character");
+                }
+            }
+            if !is_lower_hex_64(&normalized.source_key)
+                || !is_lower_hex_64(&normalized.definition_digest)
+            {
+                anyhow::bail!("MCP observation grant digest must be lowercase hexadecimal");
+            }
+            Ok(normalized)
+        }
+    }
+
+    fn is_lower_hex_64(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    impl Config {
+        /// Validate and normalize persisted/programmatic observation grants.
+        /// Invalid state is deliberately represented as `Err` for callers that
+        /// must fail closed without creating authority.
+        pub fn validated_mcp_observation_grants(&self) -> anyhow::Result<Vec<McpObservationGrant>> {
+            if self.mcp_observation_grants.len() > MCP_OBSERVATION_MAX_GRANTS {
+                anyhow::bail!("too many MCP observation grants");
+            }
+            let mut grants = Vec::with_capacity(self.mcp_observation_grants.len());
+            let mut selectors = std::collections::HashSet::new();
+            for grant in &self.mcp_observation_grants {
+                let grant = grant.validate()?;
+                if !selectors.insert((
+                    grant.source_key.clone(),
+                    grant.server.clone(),
+                    grant.raw_tool.clone(),
+                )) {
+                    anyhow::bail!("duplicate MCP observation grant selector");
+                }
+                grants.push(grant);
+            }
+            Ok(grants)
+        }
     }
 
     fn default_mcp_type() -> String {
@@ -1843,13 +1935,23 @@ pub mod config {
         }
 
         fn parse_file(content: &str, path: &Path) -> anyhow::Result<Self> {
-            serde_json::from_str(content).map_err(|error| {
+            let settings: Self = serde_json::from_str(content).map_err(|error| {
                 anyhow::anyhow!(
                     "Failed to parse settings file {}: {}. The file was not modified; fix the JSON and restart Claurst.",
                     path.display(),
                     error
                 )
-            })
+            })?;
+            settings
+                .config
+                .validated_mcp_observation_grants()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Invalid MCP observation grants in {}: {error}",
+                        path.display()
+                    )
+                })?;
+            Ok(settings)
         }
 
         async fn load_from_path(path: &Path) -> anyhow::Result<Self> {
@@ -2035,6 +2137,12 @@ pub mod config {
                         if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
                             let stripped = strip_jsonc_comments(&content);
                             if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                // Project settings are fail-soft. Invalid grant
+                                // state discards the project file and cannot
+                                // contribute host authority.
+                                if s.config.validated_mcp_observation_grants().is_err() {
+                                    return None;
+                                }
                                 // SECURITY: tag every server defined by this
                                 // repository as project-origin so it gets gated
                                 // behind explicit approval before launching.
@@ -2098,6 +2206,9 @@ pub mod config {
                     v.extend(over.config.mcp_servers);
                     v
                 },
+                // Global-only authority: project settings never add or replace
+                // observation grants during hierarchical merge.
+                mcp_observation_grants: base.config.mcp_observation_grants,
                 lsp_servers: {
                     let mut v = base.config.lsp_servers;
                     v.extend(over.config.lsp_servers);
@@ -2567,6 +2678,99 @@ pub mod config {
                 config.resolve_request_timeout_secs("openai"),
                 DEFAULT_REQUEST_TIMEOUT_SECS
             );
+        }
+
+        #[test]
+        fn observation_grants_are_strict_and_normalized() {
+            let grant = McpObservationGrant {
+                version: MCP_OBSERVATION_GRANT_VERSION.into(),
+                source_key: "a".repeat(64),
+                server: "  Demo  ".into(),
+                raw_tool: "read_file".into(),
+                definition_digest: "b".repeat(64),
+            };
+            let config = Config {
+                mcp_observation_grants: vec![grant],
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validated_mcp_observation_grants().unwrap()[0].server,
+                "demo"
+            );
+            let duplicate = Config {
+                mcp_observation_grants: vec![
+                    config.mcp_observation_grants[0].clone(),
+                    config.mcp_observation_grants[0].clone(),
+                ],
+                ..Default::default()
+            };
+            assert!(duplicate.validated_mcp_observation_grants().is_err());
+        }
+
+        #[test]
+        fn observation_grants_roundtrip_with_camel_case_keys() {
+            // Config retains its required fields. Adding this optional field
+            // must not make a sparse Config document valid.
+            assert!(serde_json::from_value::<Config>(serde_json::json!({})).is_err());
+            let mut json = serde_json::to_value(Config::default()).unwrap();
+            json.as_object_mut().unwrap().remove("mcpObservationGrants");
+            let legacy: Config = serde_json::from_value(json.clone()).unwrap();
+            assert!(legacy.mcp_observation_grants.is_empty());
+            let grants = serde_json::json!([{
+                "version": MCP_OBSERVATION_GRANT_VERSION,
+                "sourceKey": "a".repeat(64),
+                "server": "demo",
+                "rawTool": "read_file",
+                "definitionDigest": "b".repeat(64)
+            }]);
+            json["mcpObservationGrants"] = grants.clone();
+            let config: Config = serde_json::from_value(json).unwrap();
+            assert_eq!(config.mcp_observation_grants.len(), 1);
+            assert!(config.validated_mcp_observation_grants().is_ok());
+            let encoded = serde_json::to_value(config).unwrap();
+            assert_eq!(encoded["mcpObservationGrants"], grants);
+            assert!(encoded.get("mcp_observation_grants").is_none());
+        }
+
+        #[test]
+        fn observation_grants_reject_selector_metacharacters_and_whitespace() {
+            for raw_tool in [
+                "read*",
+                "read(file)",
+                "read[file]",
+                "read{file}",
+                "read:file",
+                "read?file",
+                "read\\file",
+                "read file",
+            ] {
+                let config = Config {
+                    mcp_observation_grants: vec![McpObservationGrant {
+                        version: MCP_OBSERVATION_GRANT_VERSION.into(),
+                        source_key: "a".repeat(64),
+                        server: "demo".into(),
+                        raw_tool: raw_tool.into(),
+                        definition_digest: "b".repeat(64),
+                    }],
+                    ..Default::default()
+                };
+                assert!(
+                    config.validated_mcp_observation_grants().is_err(),
+                    "raw tool selector should reject {raw_tool:?}"
+                );
+            }
+
+            let config = Config {
+                mcp_observation_grants: vec![McpObservationGrant {
+                    version: MCP_OBSERVATION_GRANT_VERSION.into(),
+                    source_key: "a".repeat(64),
+                    server: "demo:prod".into(),
+                    raw_tool: "read_file".into(),
+                    definition_digest: "b".repeat(64),
+                }],
+                ..Default::default()
+            };
+            assert!(config.validated_mcp_observation_grants().is_err());
         }
     }
 }

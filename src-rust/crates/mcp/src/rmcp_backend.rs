@@ -348,7 +348,11 @@ impl RmcpClientBackend {
         let server_catalog = catalog
             .server(&config.name)
             .map_err(|error| anyhow::anyhow!(error))?;
-        let connection_generation = server_catalog.begin_connection();
+        // Bind the actual immutable launch snapshot only after transport
+        // construction succeeds. A failed stdio spawn or HTTP/SSE transport
+        // constructor therefore cannot relabel a still-live prior client.
+        let connection_generation =
+            server_catalog.begin_connection_with_source_key(crate::mcp_launch_source_key(config));
         let handler = RmcpNotificationClient::new(
             notifications_tx,
             client_info,

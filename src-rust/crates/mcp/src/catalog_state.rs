@@ -73,6 +73,7 @@ pub struct McpToolDescriptor {
     definition: Arc<ToolDefinition>,
     definition_digest: String,
     definition_bytes: usize,
+    source_key: Option<String>,
 }
 
 impl fmt::Debug for McpToolDescriptor {
@@ -85,6 +86,7 @@ impl fmt::Debug for McpToolDescriptor {
             .field("connection_generation", &self.connection_generation)
             .field("catalog_generation", &self.catalog_generation)
             .field("definition_digest", &self.definition_digest)
+            .field("source_key_present", &self.source_key.is_some())
             .finish()
     }
 }
@@ -127,6 +129,10 @@ impl McpToolDescriptor {
     pub fn definition_bytes(&self) -> usize {
         self.definition_bytes
     }
+
+    pub fn source_key(&self) -> Option<&str> {
+        self.source_key.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +153,7 @@ pub struct CatalogRevisionHeader {
     pub availability: CatalogAvailability,
     pub tool_count: usize,
     pub definition_bytes: usize,
+    pub source_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +171,7 @@ struct ServerState {
     source_identity: Uuid,
     tools: HashMap<String, McpToolDescriptor>,
     definition_bytes: usize,
+    source_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -206,6 +214,7 @@ impl ServerCatalogState {
                 source_identity: Uuid::new_v4(),
                 tools: HashMap::new(),
                 definition_bytes: 0,
+                source_key: None,
             })),
             global_names,
             readiness,
@@ -323,6 +332,14 @@ impl ServerCatalogState {
     /// Start a new transport connection. Descriptors from the previous
     /// connection remain stale even when the server returns identical tools.
     pub fn begin_connection(&self) -> u64 {
+        self.begin_connection_with_source_key(None)
+    }
+
+    /// Atomically start a new transport connection and bind the immutable
+    /// launch identity that was used to construct its transport. Callers must
+    /// invoke this only after transport construction succeeds; a failed spawn
+    /// therefore leaves the prior live source identity untouched.
+    pub(crate) fn begin_connection_with_source_key(&self, source_key: Option<String>) -> u64 {
         let connection_generation = {
             let mut names = lock(&self.global_names);
             let mut state = lock(&self.inner);
@@ -332,6 +349,7 @@ impl ServerCatalogState {
             state.availability = CatalogAvailability::Unavailable;
             state.tools.clear();
             state.definition_bytes = 0;
+            state.source_key = source_key;
             state.connection_generation
         };
         let _ = self.readiness.send(self.catalog_generation());
@@ -355,12 +373,13 @@ impl ServerCatalogState {
         connection_generation: u64,
         tools: &[McpTool],
     ) -> Result<CatalogSnapshot, McpCatalogError> {
-        let (server_name, catalog_generation, source_identity) = {
+        let (server_name, catalog_generation, source_identity, source_key) = {
             let state = lock(&self.inner);
             (
                 state.server_name.clone(),
                 state.catalog_generation,
                 state.source_identity,
+                state.source_key.clone(),
             )
         };
         let descriptors = match build_descriptors(
@@ -368,6 +387,7 @@ impl ServerCatalogState {
             connection_generation,
             catalog_generation,
             source_identity,
+            source_key.as_deref(),
             tools,
         ) {
             Ok(descriptors) => descriptors,
@@ -390,15 +410,20 @@ impl ServerCatalogState {
         connection_generation: u64,
         tools: &[McpTool],
     ) -> Result<CatalogSnapshot, McpCatalogError> {
-        let (server_name, source_identity) = {
+        let (server_name, source_identity, source_key) = {
             let state = lock(&self.inner);
-            (state.server_name.clone(), state.source_identity)
+            (
+                state.server_name.clone(),
+                state.source_identity,
+                state.source_key.clone(),
+            )
         };
         let descriptors = build_descriptors(
             &server_name,
             connection_generation,
             starting_generation,
             source_identity,
+            source_key.as_deref(),
             tools,
         )
         .inspect_err(|_| {
@@ -529,28 +554,53 @@ impl ServerCatalogState {
     }
 
     pub fn validate(&self, descriptor: &McpToolDescriptor) -> Result<(), McpCatalogError> {
-        let state = lock(&self.inner);
-        if state.availability != CatalogAvailability::Available
-            || state.connection_generation != descriptor.connection_generation
-            || state.catalog_generation != descriptor.catalog_generation
-            || state.source_identity != descriptor.source_identity
-            || state.server_name != descriptor.server_name
-        {
-            return Err(McpCatalogError::StaleDescriptor);
-        }
-        let current = state
-            .tools
-            .get(&descriptor.callable_name)
-            .ok_or(McpCatalogError::StaleDescriptor)?;
-        if current.raw_name != descriptor.raw_name
-            || current.callable_name != descriptor.callable_name
-            || current.definition_digest != descriptor.definition_digest
-        {
-            return Err(McpCatalogError::StaleDescriptor);
-        }
-        Ok(())
+        validate_locked(&lock(&self.inner), descriptor)
     }
 
+    /// Validate a descriptor and return the source identity held by the live
+    /// catalog under the same lock. The caller-provided descriptor key is only
+    /// a consistency check and is never used as the authority returned here.
+    pub fn validated_source_key(
+        &self,
+        descriptor: &McpToolDescriptor,
+    ) -> Result<Option<String>, McpCatalogError> {
+        let state = lock(&self.inner);
+        validate_locked(&state, descriptor)?;
+        Ok(state.source_key.clone())
+    }
+
+    pub fn source_key(&self) -> Option<String> {
+        lock(&self.inner).source_key.clone()
+    }
+}
+
+fn validate_locked(
+    state: &ServerState,
+    descriptor: &McpToolDescriptor,
+) -> Result<(), McpCatalogError> {
+    if state.availability != CatalogAvailability::Available
+        || state.connection_generation != descriptor.connection_generation
+        || state.catalog_generation != descriptor.catalog_generation
+        || state.source_identity != descriptor.source_identity
+        || state.server_name != descriptor.server_name
+        || state.source_key != descriptor.source_key
+    {
+        return Err(McpCatalogError::StaleDescriptor);
+    }
+    let current = state
+        .tools
+        .get(&descriptor.callable_name)
+        .ok_or(McpCatalogError::StaleDescriptor)?;
+    if current.raw_name != descriptor.raw_name
+        || current.callable_name != descriptor.callable_name
+        || current.definition_digest != descriptor.definition_digest
+    {
+        return Err(McpCatalogError::StaleDescriptor);
+    }
+    Ok(())
+}
+
+impl ServerCatalogState {
     pub fn snapshot(&self) -> CatalogSnapshot {
         snapshot_locked(&lock(&self.inner))
     }
@@ -869,6 +919,7 @@ fn revision_header_locked(state: &ServerState) -> CatalogRevisionHeader {
         } else {
             0
         },
+        source_key: state.source_key.clone(),
     }
 }
 
@@ -884,6 +935,7 @@ fn build_descriptors(
     connection_generation: u64,
     catalog_generation: u64,
     source_identity: Uuid,
+    source_key: Option<&str>,
     tools: &[McpTool],
 ) -> Result<Vec<McpToolDescriptor>, McpCatalogError> {
     validate_name(server_name)?;
@@ -937,6 +989,7 @@ fn build_descriptors(
             definition: Arc::new(definition),
             definition_digest: sha256_hex(&encoded),
             definition_bytes: encoded.len(),
+            source_key: source_key.map(str::to_owned),
         });
     }
     Ok(descriptors)
@@ -958,7 +1011,8 @@ mod tests {
     fn session_view_keeps_native_identity_and_observes_parent_revocation() {
         let parent = CatalogState::new();
         let server = parent.server("configured").unwrap();
-        server.install_tools(1, &[tool("echo")]).unwrap();
+        let generation = server.begin_connection_with_source_key(Some("parent-source".into()));
+        server.install_tools(generation, &[tool("echo")]).unwrap();
         let session = CatalogState::inherit(Some(&parent));
         assert!(Arc::ptr_eq(
             &server,
@@ -971,6 +1025,8 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(server.validate(&descriptor), Ok(()));
+        assert_eq!(descriptor.source_key(), Some("parent-source"));
+        assert_eq!(server.source_key(), Some("parent-source".into()));
         server.mark_unavailable();
         assert!(session.checked_snapshot().is_err());
         assert_eq!(
@@ -1057,9 +1113,64 @@ mod tests {
         let state = ServerCatalogState::new("server");
         state.install_tools(1, &[tool("echo")]).unwrap();
         let old = state.descriptor("server_echo").unwrap();
-        let generation = state.begin_connection();
+        let generation = state.begin_connection_with_source_key(Some("replacement-source".into()));
         state.install_tools(generation, &[tool("echo")]).unwrap();
         assert_eq!(state.validate(&old), Err(McpCatalogError::StaleDescriptor));
+        let current = state.descriptor("server_echo").unwrap();
+        assert_eq!(current.source_key(), Some("replacement-source"));
+        assert_eq!(
+            state.validated_source_key(&current),
+            Ok(Some("replacement-source".into()))
+        );
+    }
+
+    #[test]
+    fn failed_replacement_does_not_launder_live_source_identity_on_refresh() {
+        let state = ServerCatalogState::new("server");
+        let generation = state.begin_connection_with_source_key(Some("source-a".into()));
+        state.install_tools(generation, &[tool("echo")]).unwrap();
+
+        // A failed B transport never reaches begin_connection, leaving the
+        // live A source identity and descriptors' authority unchanged.
+        let refresh = state.begin_refresh();
+        state
+            .commit_refresh(refresh, generation, &[tool("echo-v2")])
+            .unwrap();
+        let descriptor = state.descriptor("server_echo-v2").unwrap();
+        assert_eq!(descriptor.source_key(), Some("source-a"));
+        assert_eq!(
+            state.validated_source_key(&descriptor),
+            Ok(Some("source-a".into()))
+        );
+    }
+
+    #[test]
+    fn stale_source_key_is_rejected_even_when_schema_is_unchanged() {
+        let state = ServerCatalogState::new("server");
+        let first_generation = state.begin_connection_with_source_key(Some("source-a".into()));
+        state
+            .install_tools(first_generation, &[tool("echo")])
+            .unwrap();
+        let old = state.descriptor("server_echo").unwrap();
+        let second_generation = state.begin_connection_with_source_key(Some("source-b".into()));
+        state
+            .install_tools(second_generation, &[tool("echo")])
+            .unwrap();
+        assert_eq!(state.validate(&old), Err(McpCatalogError::StaleDescriptor));
+    }
+
+    #[test]
+    fn forged_descriptor_source_key_cannot_be_used_as_live_authority() {
+        let state = ServerCatalogState::new("server");
+        let generation = state.begin_connection_with_source_key(Some("live-source".into()));
+        state.install_tools(generation, &[tool("echo")]).unwrap();
+        let mut forged = state.descriptor("server_echo").unwrap();
+        forged.source_key = Some("caller-supplied-source".into());
+        assert_eq!(
+            state.validated_source_key(&forged),
+            Err(McpCatalogError::StaleDescriptor)
+        );
+        assert_eq!(state.source_key(), Some("live-source".into()));
     }
 
     #[test]

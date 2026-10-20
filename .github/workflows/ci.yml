@@ -50,8 +50,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev pkg-config
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
+      - name: Restore cargo registry & build
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -82,3 +83,15 @@ jobs:
         working-directory: src-rust
         continue-on-error: true
         run: cargo fmt --all --check
+
+      # Keep reusable dependencies when a source/test failure stops the job.
+      # Cache scope stays per platform and lockfile, with no secrets or app state.
+      - name: Save cargo registry & build
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

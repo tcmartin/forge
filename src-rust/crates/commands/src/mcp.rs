@@ -7,6 +7,81 @@ use async_trait::async_trait;
 
 pub struct McpCommand;
 
+#[derive(serde::Serialize)]
+struct McpCandidateEnvelope {
+    schema: &'static str,
+    entries: Vec<McpCandidateEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct McpCandidateEntry {
+    canonical_server: String,
+    raw_tool: String,
+    callable_name: String,
+    source_key: Option<String>,
+    definition_digest: String,
+    grant_candidate_effect: &'static str,
+    grant_match_status: &'static str,
+}
+
+/// Project a checked descriptor into the bounded diagnostic status space.
+///
+/// This deliberately has no authority effect: only the query-owned inventory
+/// path can turn the same exact identity into `Observation`.
+fn observation_candidate_status(
+    grants_valid: bool,
+    grants: &[claurst_core::config::McpObservationGrant],
+    source_key: Option<&str>,
+    canonical_server: &str,
+    raw_tool: &str,
+    definition_digest: &str,
+) -> (&'static str, &'static str) {
+    if !grants_valid {
+        return ("unknown", "invalid_configuration");
+    }
+    let Some(source_key) = source_key else {
+        return ("unknown", "stale");
+    };
+    if grants.iter().any(|grant| {
+        grant.source_key == source_key
+            && grant.server == canonical_server
+            && grant.raw_tool == raw_tool
+            && grant.definition_digest == definition_digest
+    }) {
+        return ("observation", "exact");
+    }
+    if grants.iter().any(|grant| {
+        grant.source_key == source_key
+            && grant.server == canonical_server
+            && grant.raw_tool == raw_tool
+    }) {
+        return ("unknown", "definition_mismatch");
+    }
+    if grants
+        .iter()
+        .any(|grant| grant.server == canonical_server && grant.raw_tool == raw_tool)
+    {
+        return ("unknown", "source_mismatch");
+    }
+    ("unknown", "no_grant")
+}
+
+fn encode_candidate_envelope(entries: Vec<McpCandidateEntry>) -> Result<String, &'static str> {
+    if entries.len() > 4096 {
+        return Err("MCP tool candidate limit exceeded.");
+    }
+    let result = McpCandidateEnvelope {
+        schema: "forge.mcp-observation-candidates.v1",
+        entries,
+    };
+    let encoded =
+        serde_json::to_string(&result).map_err(|_| "MCP tool candidate serialization failed.")?;
+    if encoded.len() > 256 * 1024 {
+        return Err("MCP tool candidate output limit exceeded.");
+    }
+    Ok(encoded)
+}
+
 // ---- /mcp ----------------------------------------------------------------
 
 #[async_trait]
@@ -18,13 +93,15 @@ impl SlashCommand for McpCommand {
         "Show MCP server status and manage connections"
     }
     fn help(&self) -> &str {
-        "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
+        "Usage: /mcp [list|status|tools [server] [--json]|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
          MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
            /mcp status                 — detailed connection status for all servers\n\
+           /mcp tools [server]         — list available tools\n\
+           /mcp tools [server] --json  — inspect bounded observation candidates\n\
            /mcp auth <server>          — show OAuth auth instructions for a server\n\
            /mcp connect <server>       — reconnect a disconnected server\n\
            /mcp logs <server>          — show recent errors/logs for a server\n\
@@ -64,8 +141,7 @@ impl SlashCommand for McpCommand {
         // /mcp tools [server-name]
         if first_word == "tools" {
             let rest = sub["tools".len()..].trim();
-            let server_filter = if rest.is_empty() { None } else { Some(rest) };
-            return McpCommand::handle_tools(server_filter, ctx);
+            return McpCommand::handle_tools(rest, ctx);
         }
 
         // /mcp connect <server-name>
@@ -331,7 +407,25 @@ impl McpCommand {
     }
 
     /// Handle `/mcp tools [server]` — list available tools.
-    fn handle_tools(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
+    fn handle_tools(args: &str, ctx: &CommandContext) -> CommandResult {
+        let mut json = false;
+        let mut filter = None;
+        for token in args.split_whitespace() {
+            if token == "--json" {
+                if json {
+                    return CommandResult::Error("Usage: /mcp tools [server] --json".into());
+                }
+                json = true;
+            } else if token.starts_with('-') || filter.is_some() || json {
+                return CommandResult::Error("Usage: /mcp tools [server] --json".into());
+            } else {
+                filter = Some(token);
+            }
+        }
+        if json {
+            return Self::handle_tools_json(filter, ctx);
+        }
+        let server_filter = filter;
         let manager = match ctx.mcp_manager.as_ref() {
             Some(m) => m,
             None => {
@@ -390,6 +484,64 @@ impl McpCommand {
             out.push_str(&format!("  {}\n    {}{}\n", bare, preview, ellipsis));
         }
         CommandResult::Message(out)
+    }
+
+    fn handle_tools_json(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
+        let Some(manager) = ctx.mcp_manager.as_ref() else {
+            return CommandResult::Error("MCP tool candidates unavailable.".into());
+        };
+        let snapshot = match manager.checked_catalog_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return CommandResult::Error("MCP tool candidates unavailable.".into()),
+        };
+        let filter = server_filter.map(|value| value.trim().to_ascii_lowercase());
+        let grants = ctx.config.validated_mcp_observation_grants();
+        let mut entries = Vec::new();
+        for descriptor in snapshot.descriptors {
+            let canonical_server = descriptor.server_name().trim().to_ascii_lowercase();
+            if filter
+                .as_deref()
+                .is_some_and(|value| value != canonical_server.as_str())
+            {
+                continue;
+            }
+            let source_key = manager.source_key_for_descriptor(&descriptor);
+            let (effect, status) = observation_candidate_status(
+                grants.is_ok(),
+                grants.as_deref().unwrap_or(&[]),
+                source_key.as_deref(),
+                &canonical_server,
+                descriptor.raw_name(),
+                descriptor.definition_digest(),
+            );
+            entries.push(McpCandidateEntry {
+                canonical_server,
+                raw_tool: descriptor.raw_name().to_owned(),
+                callable_name: descriptor.callable_name().to_owned(),
+                source_key,
+                definition_digest: descriptor.definition_digest().to_owned(),
+                grant_candidate_effect: effect,
+                grant_match_status: status,
+            });
+        }
+        entries.sort_by(|left, right| {
+            (
+                &left.canonical_server,
+                &left.raw_tool,
+                &left.callable_name,
+                &left.definition_digest,
+            )
+                .cmp(&(
+                    &right.canonical_server,
+                    &right.raw_tool,
+                    &right.callable_name,
+                    &right.definition_digest,
+                ))
+        });
+        match encode_candidate_envelope(entries) {
+            Ok(encoded) => CommandResult::Message(encoded),
+            Err(error) => CommandResult::Error(error.into()),
+        }
     }
 
     /// Handle `/mcp connect <server>` — attempt to reconnect a server.
@@ -706,5 +858,175 @@ impl McpCommand {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(
+        source_key: &str,
+        server: &str,
+        raw_tool: &str,
+        definition_digest: &str,
+    ) -> claurst_core::config::McpObservationGrant {
+        claurst_core::config::McpObservationGrant {
+            version: claurst_core::config::MCP_OBSERVATION_GRANT_VERSION.into(),
+            source_key: source_key.into(),
+            server: server.into(),
+            raw_tool: raw_tool.into(),
+            definition_digest: definition_digest.into(),
+        }
+    }
+
+    fn entry(server: &str, raw_tool: &str) -> McpCandidateEntry {
+        McpCandidateEntry {
+            canonical_server: server.into(),
+            raw_tool: raw_tool.into(),
+            callable_name: format!("{server}_{raw_tool}"),
+            source_key: Some("a".repeat(64)),
+            definition_digest: "b".repeat(64),
+            grant_candidate_effect: "unknown",
+            grant_match_status: "no_grant",
+        }
+    }
+
+    fn context() -> CommandContext {
+        CommandContext {
+            config: claurst_core::config::Config::default(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            messages: Vec::new(),
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "mcp-command-test".into(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+        }
+    }
+
+    #[test]
+    fn candidate_status_is_fail_closed_for_all_grant_states() {
+        let source = "a".repeat(64);
+        let other_source = "c".repeat(64);
+        let digest = "b".repeat(64);
+        let other_digest = "d".repeat(64);
+        let exact = grant(&source, "demo", "read_file", &digest);
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[exact],
+                Some(&source),
+                "demo",
+                "read_file",
+                &digest,
+            ),
+            ("observation", "exact")
+        );
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[grant(&source, "demo", "read_file", &digest)],
+                Some(&source),
+                "demo",
+                "read_file",
+                &other_digest,
+            ),
+            ("unknown", "definition_mismatch")
+        );
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[grant(&other_source, "demo", "read_file", &digest)],
+                Some(&source),
+                "demo",
+                "read_file",
+                &digest,
+            ),
+            ("unknown", "source_mismatch")
+        );
+        assert_eq!(
+            observation_candidate_status(true, &[], Some(&source), "demo", "read_file", &digest,),
+            ("unknown", "no_grant")
+        );
+        assert_eq!(
+            observation_candidate_status(true, &[], None, "demo", "read_file", &digest),
+            ("unknown", "stale")
+        );
+        assert_eq!(
+            observation_candidate_status(false, &[], Some(&source), "demo", "read_file", &digest),
+            ("unknown", "invalid_configuration")
+        );
+    }
+
+    #[test]
+    fn candidate_envelope_has_fixed_schema_keys_and_deterministic_order() {
+        let mut entries = vec![entry("zeta", "write"), entry("alpha", "read")];
+        entries.sort_by(|left, right| {
+            (
+                &left.canonical_server,
+                &left.raw_tool,
+                &left.callable_name,
+                &left.definition_digest,
+            )
+                .cmp(&(
+                    &right.canonical_server,
+                    &right.raw_tool,
+                    &right.callable_name,
+                    &right.definition_digest,
+                ))
+        });
+        let encoded = encode_candidate_envelope(entries).unwrap();
+        assert!(encoded.starts_with(
+            r#"{"schema":"forge.mcp-observation-candidates.v1","entries":[{"canonical_server""#
+        ));
+        assert!(encoded.find("alpha").unwrap() < encoded.find("zeta").unwrap());
+        for key in [
+            "canonical_server",
+            "raw_tool",
+            "callable_name",
+            "source_key",
+            "definition_digest",
+            "grant_candidate_effect",
+            "grant_match_status",
+        ] {
+            assert_eq!(encoded.matches(&format!("\"{key}\"")).count(), 2);
+        }
+    }
+
+    #[test]
+    fn candidate_envelope_enforces_count_and_utf8_byte_bounds() {
+        let too_many = (0..4097)
+            .map(|index| entry("demo", &format!("tool_{index}")))
+            .collect();
+        assert_eq!(
+            encode_candidate_envelope(too_many),
+            Err("MCP tool candidate limit exceeded.")
+        );
+
+        let mut oversized = entry("demo", "read");
+        oversized.raw_tool = "é".repeat(131_000);
+        assert_eq!(
+            encode_candidate_envelope(vec![oversized]),
+            Err("MCP tool candidate output limit exceeded.")
+        );
+    }
+
+    #[test]
+    fn tools_help_and_argument_errors_are_bounded() {
+        let command = McpCommand;
+        assert!(command.help().contains("tools [server] --json"));
+        let ctx = context();
+        for args in ["--unknown", "--json --json", "--json demo", "demo other"] {
+            assert!(matches!(
+                McpCommand::handle_tools(args, &ctx),
+                CommandResult::Error(message) if message == "Usage: /mcp tools [server] --json"
+            ));
+        }
+        assert!(matches!(
+            McpCommand::handle_tools("--json", &ctx),
+            CommandResult::Error(message) if message == "MCP tool candidates unavailable."
+        ));
     }
 }

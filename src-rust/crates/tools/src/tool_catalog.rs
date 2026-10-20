@@ -12,6 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+#[cfg(windows)]
+const WINDOWS_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+
 pub const MAX_CATALOG_ENTRIES: usize = 4096;
 pub const MAX_TOOL_NAME_BYTES: usize = 256;
 pub const MAX_DESCRIPTION_CHARS: usize = 160;
@@ -26,7 +35,7 @@ pub struct ToolCatalogScope {
     workspace: PathBuf,
     workspace_identity: WorkspaceIdentity,
     session_id: String,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[allow(dead_code)]
     workspace_handle: Arc<fs::File>,
 }
@@ -35,9 +44,10 @@ pub struct ToolCatalogScope {
 ///
 /// Unix device/inode pairs detect same-path replacement while remaining
 /// unaffected by ordinary writes inside the directory. Platforms without a
-/// stable standard-library file identity retain the canonical path binding;
-/// their platform-specific identity APIs can be added without weakening the
-/// Unix invariant.
+/// stable standard-library file identity retain the canonical path binding.
+/// Windows scopes also retain a directory handle without delete sharing to
+/// block ordinary replacement for the lifetime of the scope. This does not
+/// claim a Windows volume/file-ID identity proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkspaceIdentity {
     #[cfg(unix)]
@@ -73,7 +83,30 @@ fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>),
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>), ToolCatalogError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .access_mode(0)
+        .share_mode(WINDOWS_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let handle = Arc::new(
+        options
+            .open(path)
+            .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?,
+    );
+    let metadata = handle
+        .metadata()
+        .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
+    if !metadata.is_dir() {
+        return Err(ToolCatalogError::ScopeUnavailable(
+            "catalog workspace is not a directory".to_string(),
+        ));
+    }
+    Ok((WorkspaceIdentity::CanonicalPath, handle))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn workspace_identity(path: &Path) -> Result<WorkspaceIdentity, ToolCatalogError> {
     let metadata = fs::metadata(path)
         .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
@@ -102,9 +135,9 @@ impl ToolCatalogScope {
         let workspace = crate::worktree::workspace_root(ctx)
             .canonicalize()
             .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let (identity, workspace_handle) = workspace_identity(&workspace)?;
-        #[cfg(not(unix))]
+        #[cfg(all(not(unix), not(windows)))]
         let identity = workspace_identity(&workspace)?;
         if ctx.session_id.is_empty() || ctx.session_id.len() > 256 {
             return Err(ToolCatalogError::ScopeUnavailable(
@@ -115,7 +148,7 @@ impl ToolCatalogScope {
             workspace,
             workspace_identity: identity,
             session_id: ctx.session_id.clone(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             workspace_handle,
         })
     }
@@ -640,5 +673,40 @@ mod tests {
         fs::write(workspace.join("edited.txt"), b"ordinary workspace edit")
             .expect("write workspace edit");
         assert!(view.matches_context(&ctx));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_scope_denies_delete_rename_and_reprobes_until_all_clones_drop() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let workspace = root.path().join("workspace");
+        let replacement = root.path().join("replacement");
+        fs::create_dir(&workspace).expect("workspace");
+        let ctx = crate::test_support::allow_all_context(workspace.clone());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(PanicSchemaTool)];
+        let view = ToolCatalogView::from_tools(&ctx, &tools).expect("catalog");
+        let receipt = DiscoveryReceipt::new(&view, vec!["Deferred".to_string()]);
+        let scope_clone = view.scope().clone();
+
+        assert!(view.matches_context(&ctx));
+        fs::write(workspace.join("edited.txt"), b"ordinary workspace edit")
+            .expect("write workspace edit");
+        assert!(view.matches_context(&ctx));
+        assert_eq!(
+            receipt
+                .resolve_names(&view, &ctx)
+                .expect("receipt remains current"),
+            vec!["Deferred".to_string()]
+        );
+        fs::remove_file(workspace.join("edited.txt")).expect("remove child file");
+        assert!(fs::remove_dir(&workspace).is_err());
+        assert!(fs::rename(&workspace, &replacement).is_err());
+
+        drop(receipt);
+        drop(view);
+        assert!(fs::remove_dir(&workspace).is_err());
+        drop(scope_clone);
+        fs::remove_dir(&workspace).expect("scope release permits removal");
+        fs::create_dir(&workspace).expect("replacement workspace");
     }
 }

@@ -9,19 +9,22 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+#[path = "windows_job_object.rs"]
+mod windows_job_object;
 
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cleanup guard for the process group owned by one command invocation.
 ///
 /// Unix launches create a fresh process group whose id is the direct child's
-/// pid.  This makes timeout, cancellation, and dropped futures kill
-/// descendants too. Windows currently only has Tokio's direct-child
-/// `kill_on_drop` guarantee; Job Object cleanup is deliberately left to a
-/// future platform-specific implementation.
+/// pid. Windows launches suspend the child, assign it to a kill-on-close Job
+/// Object, verify membership and the initial thread identity, then resume it.
 pub(crate) struct ProcessGroupGuard {
     #[cfg(unix)]
     pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<windows_job_object::JobObjectGuard>,
     armed: bool,
     ownership_lost: bool,
 }
@@ -36,16 +39,40 @@ impl ProcessGroupGuard {
         }
     }
 
-    #[cfg(windows)]
-    pub(crate) fn new(_: Option<u32>) -> Self {
-        Self {
-            armed: true,
-            ownership_lost: false,
+    pub(crate) fn arm(child: &Child) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            return Ok(Self::new(child.id()));
         }
+        #[cfg(windows)]
+        {
+            return Ok(Self {
+                job: Some(windows_job_object::JobObjectGuard::arm(child)?),
+                armed: true,
+                ownership_lost: false,
+            });
+        }
+        #[allow(unreachable_code)]
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "owned process identity unavailable on this platform",
+        ))
     }
 
     pub(crate) fn disarm(&mut self) {
-        self.armed = false;
+        #[cfg(windows)]
+        {
+            if let Some(job) = self.job.as_mut() {
+                if job.disarm() {
+                    self.armed = false;
+                }
+            }
+            return;
+        }
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
     }
 
     pub(crate) fn kill_now(&mut self) {
@@ -66,10 +93,37 @@ impl ProcessGroupGuard {
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
-        self.armed = false;
+        #[cfg(windows)]
+        if let Some(job) = self.job.as_mut() {
+            job.kill_now();
+            self.ownership_lost |= job.ownership_lost();
+        } else {
+            self.ownership_lost = true;
+        }
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
     }
 
     pub(crate) fn child_running(&mut self) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            let Some(job) = self.job.as_mut() else {
+                self.ownership_lost = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "owned child identity unavailable",
+                ));
+            };
+            return match job.child_running() {
+                Ok(running) => Ok(running),
+                Err(error) => {
+                    self.ownership_lost = true;
+                    Err(error)
+                }
+            };
+        }
         #[cfg(unix)]
         if let Some(pid) = self.pid {
             return match owned_child_state(pid) {
@@ -80,16 +134,23 @@ impl ProcessGroupGuard {
                 }
             };
         }
-        self.ownership_lost = true;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "owned child identity unavailable",
-        ))
+        #[cfg(not(windows))]
+        {
+            self.ownership_lost = true;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "owned child identity unavailable",
+            ))
+        }
     }
 
     pub(crate) async fn confirmed_empty(&self) -> bool {
         if self.ownership_lost {
             return false;
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job.as_ref() {
+            return job.confirmed_empty().await;
         }
         #[cfg(unix)]
         if let Some(pid) = self.pid.filter(|pid| *pid > 0 && *pid <= i32::MAX as u32) {
@@ -177,6 +238,22 @@ pub(crate) enum ProcessCleanup {
     CleanupUnknown,
 }
 
+#[cfg(windows)]
+pub(crate) enum SpawnOwnedError {
+    Spawn(io::Error),
+    Arm { child: Child, error: io::Error },
+}
+
+#[cfg(windows)]
+impl SpawnOwnedError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Spawn(error) => format!("owned child spawn failed: {error}"),
+            Self::Arm { error, .. } => format!("owned job arm failed: {error}"),
+        }
+    }
+}
+
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         self.kill_now();
@@ -189,25 +266,120 @@ pub(crate) fn spawn_owned_argv(
     argv: &[String],
     cwd: &Path,
 ) -> io::Result<(Child, ProcessGroupGuard)> {
-    let Some(program) = argv.first() else {
+    #[cfg(windows)]
+    {
+        let _ = (argv, cwd);
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "formatter command is empty",
+            io::ErrorKind::Unsupported,
+            "direct spawn is unavailable on Windows without the checked owned launch sequence",
         ));
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(program) = argv.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "formatter command is empty",
+            ));
+        };
+        let mut command = Command::new(program);
+        command
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn()?;
+        let group = ProcessGroupGuard::arm(&child)?;
+        return Ok((child, group));
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned direct spawn unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_owned_argv_checked(
+    argv: &[String],
+    cwd: &Path,
+) -> Result<(Child, ProcessGroupGuard), SpawnOwnedError> {
+    spawn_owned_argv_checked_with_stdio(argv, cwd, Stdio::null(), Stdio::piped(), Stdio::piped())
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_owned_argv_checked_with_stdio(
+    argv: &[String],
+    cwd: &Path,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<(Child, ProcessGroupGuard), SpawnOwnedError> {
+    let Some(program) = argv.first() else {
+        return Err(SpawnOwnedError::Spawn(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "owned command is empty",
+        )));
     };
     let mut command = Command::new(program);
     command
         .args(&argv[1..])
         .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .stdin(stdin)
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn()?;
-    let group = ProcessGroupGuard::new(child.id());
-    Ok((child, group))
+    spawn_owned_command_checked(command)
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_owned_command_checked(
+    mut command: Command,
+) -> Result<(Child, ProcessGroupGuard), SpawnOwnedError> {
+    command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
+    let child = command.spawn().map_err(SpawnOwnedError::Spawn)?;
+    match ProcessGroupGuard::arm(&child) {
+        Ok(group) => Ok((child, group)),
+        Err(error) => Err(SpawnOwnedError::Arm { child, error }),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn cleanup_unarmed_child(mut child: Child) -> io::Result<()> {
+    let _ = child.start_kill();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let wait = async {
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    let streams = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                drain(stdout, &mut stdout_bytes),
+                drain(stderr, &mut stderr_bytes),
+            )
+        })
+        .await
+        .ok()
+    };
+    let (wait_result, streams_result) = tokio::join!(wait, streams);
+    let wait_complete = wait_result.is_some();
+    let pipes_closed = matches!(streams_result, Some((Ok(_), Ok(_))));
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!(
+            "job arm failed; bounded direct-child cleanup completed (wait={wait_complete}, pipes={pipes_closed}) but process-tree cleanup remains unknown"
+        ),
+    ))
 }
 
 pub(crate) struct CapturedCommand {
@@ -434,6 +606,245 @@ mod tests {
     use super::*;
     use std::process::Stdio;
     use tokio::process::Command;
+
+    #[cfg(windows)]
+    fn powershell_argv(script: &str) -> Vec<String> {
+        vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script.into(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn checked_spawn(argv: &[String], cwd: &Path) -> (Child, ProcessGroupGuard) {
+        spawn_owned_argv_checked(argv, cwd).unwrap_or_else(|error| panic!("{}", error.message()))
+    }
+
+    #[cfg(windows)]
+    fn windows_process_exists(pid: u32) -> io::Result<bool> {
+        let query = format!(
+            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .status()
+            .map(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_windows_processes_gone(pids: [u32; 2]) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let parent_exists = windows_process_exists(pids[0])?;
+            let descendant_exists = windows_process_exists(pids[1])?;
+            if !parent_exists && !descendant_exists {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned parent or descendant remained after bounded witness polling",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_windows_pid_witness(marker: &Path, parent_pid: u32) -> io::Result<[u32; 2]> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                let mut fields = contents.trim().split(',');
+                let observed_parent = fields.next().and_then(|value| value.trim().parse().ok());
+                let descendant = fields.next().and_then(|value| value.trim().parse().ok());
+                if fields.next().is_none()
+                    && observed_parent == Some(parent_pid)
+                    && descendant.is_some_and(|pid| pid != 0)
+                {
+                    return Ok([parent_pid, descendant.unwrap()]);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned parent and descendant startup witness was not observed",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn capture_windows(
+        argv: &[String],
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> CapturedCommand {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, mut group) = checked_spawn(argv, dir.path());
+        capture_owned_with_cancel(child, timeout, cancel, &mut group)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_direct_completion_proves_empty_job() {
+        let output = capture_windows(
+            &powershell_argv("exit 0"),
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(output.cleanup, ProcessCleanup::ConfirmedClean);
+        assert!(output.status.unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_descendant_cancel_proves_job_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cancel-pids.txt");
+        let marker_literal = marker.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
+        );
+        let argv = powershell_argv(&script);
+        let (child, mut group) = checked_spawn(&argv, dir.path());
+        let parent_pid = child.id().expect("owned parent pid");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                capture_owned_with_cancel(child, Duration::from_secs(30), &cancel, &mut group)
+                    .await
+                    .unwrap()
+            }
+        });
+        let pids = wait_for_windows_pid_witness(&marker, parent_pid)
+            .await
+            .expect("parent and descendant startup witness");
+        cancel.cancel();
+        let output = task.await.unwrap();
+        assert!(output.cancelled);
+        assert_eq!(output.cleanup, ProcessCleanup::ConfirmedClean);
+        wait_for_windows_processes_gone(pids)
+            .await
+            .expect("owned parent and descendant are gone");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_timeout_proves_job_cleanup() {
+        let output = capture_windows(
+            &powershell_argv("Start-Sleep 30"),
+            Duration::from_millis(150),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(output.timed_out);
+        assert_eq!(output.cleanup, ProcessCleanup::ConfirmedClean);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dropped_capture_proves_parent_and_descendant_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("owned-pids.txt");
+        let marker_literal = marker.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
+        );
+        let argv = powershell_argv(&script);
+        let cwd = dir.path().to_path_buf();
+        let (child, mut group) = checked_spawn(&argv, &cwd);
+        let parent_pid = child.id().expect("owned parent pid");
+        let task = tokio::spawn(async move {
+            capture_owned_with_cancel(
+                child,
+                Duration::from_secs(30),
+                &CancellationToken::new(),
+                &mut group,
+            )
+            .await
+        });
+        let pids = wait_for_windows_pid_witness(&marker, parent_pid)
+            .await
+            .expect("parent and descendant pid witness");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_windows_processes_gone(pids),
+        )
+        .await
+        .expect("owned parent and descendant are gone")
+        .expect("process witness query");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_foreign_process_survives_owner_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut foreign, mut foreign_group) =
+            checked_spawn(&powershell_argv("Start-Sleep 30"), dir.path());
+        let marker = dir.path().join("owned-cancel-pids.txt");
+        let marker_literal = marker.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
+        );
+        let (child, mut group) = checked_spawn(&powershell_argv(&script), dir.path());
+        let parent_pid = child.id().expect("owned parent pid");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                capture_owned_with_cancel(child, Duration::from_secs(30), &cancel, &mut group)
+                    .await
+                    .unwrap()
+            }
+        });
+        let pids = wait_for_windows_pid_witness(&marker, parent_pid)
+            .await
+            .expect("owned parent and descendant started");
+        assert!(foreign.try_wait().unwrap().is_none());
+        cancel.cancel();
+        let result = task.await.unwrap();
+        assert!(result.cancelled);
+        assert_eq!(result.cleanup, ProcessCleanup::ConfirmedClean);
+        wait_for_windows_processes_gone(pids)
+            .await
+            .expect("owned parent and descendant are gone");
+        assert!(foreign.try_wait().unwrap().is_none());
+        foreign_group.kill_now();
+        foreign.wait().await.expect("join foreign fixture");
+        assert!(foreign_group.confirmed_empty().await);
+        foreign_group.disarm();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_reaped_child_cannot_be_used_as_pid_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, mut group) = checked_spawn(&powershell_argv("exit 0"), dir.path());
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
+        assert!(!group.child_running().unwrap());
+        group.kill_now();
+        assert!(group.confirmed_empty().await);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_failure_does_not_create_owned_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = vec!["definitely-not-a-real-program-for-r55".into()];
+        assert!(spawn_owned_argv_checked(&argv, dir.path()).is_err());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

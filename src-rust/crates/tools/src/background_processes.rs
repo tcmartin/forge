@@ -6,9 +6,9 @@
 
 #[cfg(test)]
 use crate::command_capture::capture;
-use crate::command_capture::{
-    capture_owned_with_cancel, spawn_owned_argv, ProcessCleanup, ProcessGroupGuard,
-};
+#[cfg(not(windows))]
+use crate::command_capture::spawn_owned_argv;
+use crate::command_capture::{capture_owned_with_cancel, ProcessCleanup, ProcessGroupGuard};
 use crate::evidence::retain_output;
 use crate::mutation::{self, PendingMutationTicket};
 use crate::{ToolContext, ToolResult};
@@ -192,13 +192,60 @@ fn compact_metadata(metadata: Option<&Value>) -> Option<Value> {
     Some(Value::Object(compact))
 }
 
-fn child_for(command: &str, cwd: &Path) -> std::io::Result<(Child, ProcessGroupGuard)> {
-    let argv = if cfg!(windows) {
-        vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
-    } else {
-        vec!["bash".to_string(), "-c".to_string(), command.to_string()]
-    };
-    spawn_owned_argv(&argv, cwd)
+#[derive(Debug)]
+enum ChildLaunchError {
+    Spawn(String),
+    #[cfg(windows)]
+    Arm(String),
+}
+
+impl std::fmt::Display for ChildLaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => formatter.write_str(error),
+            #[cfg(windows)]
+            Self::Arm(error) => formatter.write_str(error),
+        }
+    }
+}
+
+async fn child_for(
+    command: &str,
+    cwd: &Path,
+) -> Result<(Child, ProcessGroupGuard), ChildLaunchError> {
+    #[cfg(windows)]
+    {
+        let mut child_command = tokio::process::Command::new("cmd");
+        child_command
+            .args(["/C", command])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        return match crate::command_capture::spawn_owned_command_checked(child_command) {
+            Ok(pair) => Ok(pair),
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                Err(ChildLaunchError::Spawn(error.to_string()))
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                Err(ChildLaunchError::Arm(format!(
+                    "background Job Object arm failed: {error}; cleanup remains unknown ({cleanup})"
+                )))
+            }
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let argv = vec!["bash".to_string(), "-c".to_string(), command.to_string()];
+        return spawn_owned_argv(&argv, cwd)
+            .map_err(|error| ChildLaunchError::Spawn(error.to_string()));
+    }
+    #[allow(unreachable_code)]
+    Err(ChildLaunchError::Spawn(
+        "background direct spawn unavailable on this platform".to_string(),
+    ))
 }
 
 fn normalized_capture(
@@ -273,7 +320,7 @@ fn cleanup_unknown(mut result: ToolResult, error: Option<String>) -> ToolResult 
 }
 
 async fn run_process(process: Arc<OwnedProcess>, ctx: ToolContext, timeout: Duration) {
-    let result = match child_for(&process.command, &process.cwd) {
+    let result = match child_for(&process.command, &process.cwd).await {
         Ok((child, mut group)) => {
             match capture_owned_with_cancel(child, timeout, &process.cancel, &mut group).await {
                 Ok(captured) => {
@@ -346,10 +393,13 @@ async fn run_process(process: Arc<OwnedProcess>, ctx: ToolContext, timeout: Dura
         }
         Err(error) => {
             let mut cleanup_error = None;
-            if let Err(confirm_error) = process.pending.confirm_terminal() {
-                cleanup_error = Some(confirm_error);
+            let spawn_failed = matches!(error, ChildLaunchError::Spawn(_));
+            if spawn_failed {
+                if let Err(confirm_error) = process.pending.confirm_terminal() {
+                    cleanup_error = Some(confirm_error);
+                }
             }
-            let terminal_cleanup = cleanup_error.is_none();
+            let terminal_cleanup = spawn_failed && cleanup_error.is_none();
             let result = retain_output(
                 &ctx,
                 format!("Failed to spawn background command: {error}"),
@@ -381,14 +431,6 @@ pub fn spawn(
     timeout_ms: u64,
     ctx: &ToolContext,
 ) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        return Err(
-            "Background shell processes are unavailable on Windows until Job Object cleanup is supported"
-                .to_string(),
-        );
-    }
-
     let _registration = PROCESS_REGISTRATION.lock();
     if PROCESSES.len() >= MAX_BACKGROUND_PROCESSES && !evict_oldest_terminal() {
         return Err(format!(
@@ -998,26 +1040,26 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn unavailable_windows_background_launch_leaves_no_task_or_pending_owner() {
+    async fn windows_background_launch_uses_owned_job() {
         let workspace = tempfile::tempdir().unwrap();
         let ctx = test_context(
             workspace.path(),
             &format!("windows-background-unavailable-{}", Uuid::new_v4()),
         );
-        let marker = workspace.path().join("must-not-launch.txt");
+        let marker = workspace.path().join("owned-background.txt");
         assert!(list(&ctx).await.is_empty());
         assert!(!mutation::pending_for_scope(&ctx));
-        let error = spawn(
-            format!("echo forbidden > \"{}\"", marker.display()),
+        let id = spawn(
+            format!("echo owned > \"{}\"", marker.display()),
             workspace.path().into(),
             30_000,
             &ctx,
         )
-        .unwrap_err();
-        assert!(error.contains("unavailable on Windows until Job Object cleanup is supported"));
-        assert!(list(&ctx).await.is_empty());
+        .unwrap();
+        let result = wait_for_terminal(&id, &ctx).await;
+        assert_eq!(result["task"]["status"], "completed");
         assert!(!mutation::pending_for_scope(&ctx));
-        assert!(!marker.exists());
+        assert!(marker.exists());
     }
 
     #[test]
@@ -1035,6 +1077,7 @@ mod tests {
             "printf 'out-middle-🦀'; printf 'err-tail-🦀' >&2; sleep 10",
             Path::new("/tmp"),
         )
+        .await
         .unwrap();
         let captured = capture(child, Duration::from_millis(100)).await.unwrap();
         if captured.timed_out {

@@ -1,7 +1,11 @@
 //! Run a configured file formatter after writes/edits.
 
-use crate::command_capture::{capture_owned_with_cancel, spawn_owned_argv};
+use crate::command_capture::capture_owned_with_cancel;
+#[cfg(not(windows))]
+use crate::command_capture::spawn_owned_argv;
 use crate::evidence::{EvidenceRef, EvidenceStore};
+#[cfg(windows)]
+use crate::mutation;
 use crate::{tool_policy, ToolContext};
 use claurst_core::permissions::PermissionDecision;
 use serde::Serialize;
@@ -108,6 +112,46 @@ async fn run_formatter_argv(
     ctx: &ToolContext,
     timeout: Duration,
 ) -> FormatterOutcome {
+    #[cfg(windows)]
+    let pending = match mutation::register_pending(
+        mutation::scope_for_context(ctx),
+        "configured formatter",
+    ) {
+        Ok(ticket) => ticket,
+        Err(error) => return FormatterOutcome::not_run(error.to_string()),
+    };
+    #[cfg(windows)]
+    let (child, mut group) =
+        match crate::command_capture::spawn_owned_argv_checked(argv, &ctx.working_dir) {
+            Ok(value) => value,
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                let _ = pending.confirm_terminal();
+                return FormatterOutcome {
+                    status: FormatterStatus::Failed,
+                    exit_code: None,
+                    evidence: None,
+                    partial: false,
+                    error: Some(format!("Failed to spawn formatter: {error}")),
+                    timed_out: false,
+                    cancelled: false,
+                };
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                return FormatterOutcome {
+                    status: FormatterStatus::Unknown,
+                    exit_code: None,
+                    evidence: None,
+                    partial: true,
+                    error: Some(format!(
+                        "Formatter ownership failed: {error}; cleanup remains unknown ({cleanup})"
+                    )),
+                    timed_out: false,
+                    cancelled: false,
+                };
+            }
+        };
+    #[cfg(not(windows))]
     let (child, mut group) = match spawn_owned_argv(argv, &ctx.working_dir) {
         Ok(value) => value,
         Err(error) => {
@@ -140,6 +184,39 @@ async fn run_formatter_argv(
         };
     // A formatter is a finite owned operation. Even an exit-0 direct child
     // may have left a redirected descendant in the same process group.
+    #[cfg(windows)]
+    {
+        if captured.cleanup != crate::command_capture::ProcessCleanup::ConfirmedClean {
+            return FormatterOutcome {
+                status: FormatterStatus::Unknown,
+                exit_code: captured
+                    .status
+                    .as_ref()
+                    .and_then(std::process::ExitStatus::code),
+                evidence: None,
+                partial: true,
+                error: Some("Formatter process-tree cleanup remains unknown".into()),
+                timed_out: captured.timed_out,
+                cancelled: captured.cancelled,
+            };
+        }
+        if let Err(error) = pending.confirm_terminal() {
+            return FormatterOutcome {
+                status: FormatterStatus::Unknown,
+                exit_code: captured
+                    .status
+                    .as_ref()
+                    .and_then(std::process::ExitStatus::code),
+                evidence: None,
+                partial: true,
+                error: Some(format!("Formatter pending confirmation failed: {error}")),
+                timed_out: captured.timed_out,
+                cancelled: captured.cancelled,
+            };
+        }
+        group.disarm();
+    }
+    #[cfg(not(windows))]
     group.kill_now();
 
     let partial = captured.partial || captured.timed_out || captured.cancelled;

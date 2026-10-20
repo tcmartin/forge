@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::{
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, RawHandle},
+};
 
 #[cfg(windows)]
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -47,15 +50,19 @@ pub struct ToolCatalogScope {
 ///
 /// Unix device/inode pairs detect same-path replacement while remaining
 /// unaffected by ordinary writes inside the directory. Platforms without a
-/// stable standard-library file identity retain the canonical path binding.
-/// Windows scopes also retain a directory handle without delete sharing to
-/// block ordinary replacement for the lifetime of the scope. This does not
-/// claim a Windows volume/file-ID identity proof.
+/// stable file identity retain the canonical path binding. Windows scopes
+/// compare the volume serial and 128-bit file ID from the retained directory
+/// handle, which also denies delete sharing for the lifetime of the scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkspaceIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
+    #[cfg(not(any(unix, windows)))]
     CanonicalPath,
 }
 
@@ -87,6 +94,25 @@ fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>),
 }
 
 #[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsFileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: RawHandle,
+        information_class: i32,
+        information: *mut std::ffi::c_void,
+        buffer_size: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
 fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>), ToolCatalogError> {
     let mut options = fs::OpenOptions::new();
     // Metadata-only opens do not participate in Windows sharing checks.
@@ -108,7 +134,29 @@ fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>),
             "catalog workspace is not a directory".to_string(),
         ));
     }
-    Ok((WorkspaceIdentity::CanonicalPath, handle))
+    let mut identity = WindowsFileIdInfo::default();
+    // SAFETY: the Arc retains a live directory handle, and the initialized
+    // repr(C) output has the FILE_ID_INFO layout for FileIdInfo (0x12).
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            0x12,
+            (&mut identity as *mut WindowsFileIdInfo).cast(),
+            std::mem::size_of::<WindowsFileIdInfo>() as u32,
+        )
+    };
+    if queried == 0 {
+        return Err(ToolCatalogError::ScopeUnavailable(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok((
+        WorkspaceIdentity::Windows {
+            volume_serial_number: identity.volume_serial_number,
+            file_id: identity.file_id,
+        },
+        handle,
+    ))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -692,6 +740,15 @@ mod tests {
         let view = ToolCatalogView::from_tools(&ctx, &tools).expect("catalog");
         let receipt = DiscoveryReceipt::new(&view, vec!["Deferred".to_string()]);
         let scope_clone = view.scope().clone();
+        let other_workspace = root.path().join("other-workspace");
+        fs::create_dir(&other_workspace).expect("other workspace");
+        let other_ctx = crate::test_support::allow_all_context(other_workspace);
+        let other_scope = ToolCatalogScope::from_context(&other_ctx).expect("other scope");
+        assert_ne!(
+            scope_clone.workspace_identity,
+            other_scope.workspace_identity
+        );
+        assert_eq!(std::mem::size_of::<WindowsFileIdInfo>(), 24);
 
         assert!(view.matches_context(&ctx));
         fs::write(workspace.join("edited.txt"), b"ordinary workspace edit")

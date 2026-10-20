@@ -16,11 +16,7 @@ use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
-#[cfg(windows)]
-use std::process::Stdio;
 use std::time::Duration;
-#[cfg(windows)]
-use tokio::process::Command;
 use tracing::debug;
 
 // Unix-only imports used by the shell-state helpers and PTY execution path.
@@ -547,34 +543,44 @@ async fn run_windows_fallback(
     timeout_ms: u64,
     ctx: &ToolContext,
 ) -> ToolResult {
-    let child = match Command::new("cmd")
-        .arg("/C")
-        .arg(command)
-        .current_dir(effective_cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return not_run_result(format!("Failed to spawn command: {}", e)),
-    };
-
-    let captured =
-        match crate::command_capture::capture_with_cancel(child, timeout_dur, &ctx.cancel_token)
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
+    let argv = vec!["cmd".to_string(), "/C".to_string(), command.to_string()];
+    let (child, mut group) =
+        match crate::command_capture::spawn_owned_argv_checked(&argv, effective_cwd) {
+            Ok(pair) => pair,
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                return not_run_result(format!("Failed to spawn command: {error}"));
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                 return with_command_metadata(
-                    ToolResult::error(format!("Failed to capture command output: {e}")),
+                    ToolResult::error(format!(
+                    "Failed to arm owned command: {error}; cleanup remains unknown ({cleanup:?})"
+                )),
                     "unknown",
                     None,
                     true,
-                )
+                );
             }
         };
+
+    let captured = match crate::command_capture::capture_owned_with_cancel(
+        child,
+        timeout_dur,
+        &ctx.cancel_token,
+        &mut group,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return with_command_metadata(
+                ToolResult::error(format!("Failed to capture command output: {e}")),
+                "unknown",
+                None,
+                true,
+            )
+        }
+    };
     let exit_code = captured.status.and_then(|status| status.code());
     let mut output = String::from_utf8_lossy(&captured.stdout).into_owned();
     if !captured.stderr.is_empty() {
@@ -587,7 +593,10 @@ async fn run_windows_fallback(
     if output.is_empty() {
         output = "(no output)".to_string();
     }
-    if captured.cancelled || captured.error.is_some() {
+    if captured.cancelled
+        || captured.error.is_some()
+        || captured.cleanup != crate::command_capture::ProcessCleanup::ConfirmedClean
+    {
         let reason = captured.error.as_deref().unwrap_or("command cancelled");
         let result = crate::evidence::retain_output(
             ctx,
@@ -1437,5 +1446,132 @@ mod tests {
             target.is_file(),
             "permission denial must preserve the target"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::path::Path;
+
+    struct AllowAllHandler;
+
+    impl claurst_core::permissions::PermissionHandler for AllowAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+
+        fn request_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+    }
+
+    fn allow_all_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: std::sync::Arc::new(AllowAllHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "pty-bash-windows-test".to_string(),
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            trusted_checker_catalog: Default::default(),
+            catalog_view: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn windows_process_exists(pid: u32) -> std::io::Result<bool> {
+        let query = format!(
+            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .status()
+            .map(|status| status.success())
+    }
+
+    async fn wait_for_pid_witness(marker: &Path) -> std::io::Result<[u32; 2]> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                let mut fields = contents.trim().split(',');
+                let parent = fields.next().and_then(|value| value.trim().parse().ok());
+                let descendant = fields.next().and_then(|value| value.trim().parse().ok());
+                if fields.next().is_none() && parent.is_some() && descendant.is_some() {
+                    return Ok([parent.unwrap(), descendant.unwrap()]);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned fallback descendant startup witness was not observed",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_processes_gone(pids: [u32; 2]) -> std::io::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !windows_process_exists(pids[0])? && !windows_process_exists(pids[1])? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned fallback parent or descendant remained after timeout",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn windows_fallback_timeout_kills_owned_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pty-timeout-pids.txt");
+        let marker_literal = marker.display().to_string().replace('\'', "''");
+        let command = format!(
+            "powershell -NoProfile -NonInteractive -Command \"$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value ($PID.ToString()+','+$p.Id); Wait-Process -Id $p.Id\""
+        );
+        let cwd = dir.path().to_path_buf();
+        let ctx = allow_all_context();
+        let task = tokio::spawn(async move {
+            run_windows_fallback(&command, &cwd, Duration::from_millis(500), 500, &ctx).await
+        });
+        let pids = wait_for_pid_witness(&marker)
+            .await
+            .expect("fallback parent and descendant startup witness");
+        let result = task.await.unwrap();
+        assert!(result.is_error, "timeout must return an error result");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["command_status"],
+            "timed_out"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_status"],
+            "unknown"
+        );
+        wait_for_processes_gone(pids)
+            .await
+            .expect("owned fallback parent and descendant are gone");
     }
 }

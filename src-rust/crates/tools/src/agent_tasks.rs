@@ -978,6 +978,22 @@ async fn owned_git_stdout(
     let mut argv = Vec::with_capacity(arguments.len() + 1);
     argv.push(git.to_string_lossy().into_owned());
     argv.extend(arguments.iter().map(|argument| (*argument).to_string()));
+    #[cfg(windows)]
+    let (child, mut group) = {
+        match crate::command_capture::spawn_owned_argv_checked(&argv, cwd) {
+            Ok(pair) => pair,
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                return Err(format!("Could not start Git artifact inventory: {error}"));
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                return Err(format!(
+                    "Could not arm Git artifact inventory: {error}; cleanup remains unknown ({cleanup})"
+                ));
+            }
+        }
+    };
+    #[cfg(not(windows))]
     let (child, mut group) = crate::command_capture::spawn_owned_argv(&argv, cwd)
         .map_err(|error| format!("Could not start Git artifact inventory: {error}"))?;
     let captured = capture_owned_with_cancel(child, ACCEPTANCE_COMMAND_TIMEOUT, cancel, &mut group)
@@ -1100,30 +1116,69 @@ async fn run_acceptance_checker(
     let program = invocation
         .program()
         .ok_or_else(|| "Registered verification interpreter is unavailable".to_string())?;
-    let mut command = Command::new(program);
-    match invocation.shell() {
-        TrustedCheckerShell::Bash => {
-            command.args(["--noprofile", "--norc", "-c"]);
+    #[cfg(windows)]
+    let (child, mut group) = {
+        let mut command = Command::new(program);
+        match invocation.shell() {
+            TrustedCheckerShell::Bash => {
+                command.args(["--noprofile", "--norc", "-c"]);
+            }
+            TrustedCheckerShell::PowerShell => {
+                command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+            }
         }
-        TrustedCheckerShell::PowerShell => {
-            command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+        command
+            .arg(invocation.command())
+            .current_dir(invocation.cwd())
+            .env_clear()
+            .envs(invocation.environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match crate::command_capture::spawn_owned_command_checked(command) {
+            Ok(pair) => pair,
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                return Err(format!(
+                    "Could not start registered parent verification: {error}"
+                ));
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                return Err(format!(
+                    "Could not arm registered parent verification: {error}; cleanup remains unknown ({cleanup})"
+                ));
+            }
         }
-    }
-    command
-        .arg(invocation.command())
-        .current_dir(invocation.cwd())
-        .env_clear()
-        .envs(invocation.environment())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Could not start registered parent verification: {error}"))?;
-    let mut group = ProcessGroupGuard::new(child.id());
+    };
+    #[cfg(not(windows))]
+    let (child, mut group) = {
+        let mut command = Command::new(program);
+        match invocation.shell() {
+            TrustedCheckerShell::Bash => {
+                command.args(["--noprofile", "--norc", "-c"]);
+            }
+            TrustedCheckerShell::PowerShell => {
+                command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+            }
+        }
+        command
+            .arg(invocation.command())
+            .current_dir(invocation.cwd())
+            .env_clear()
+            .envs(invocation.environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("Could not start registered parent verification: {error}"))?;
+        let group = ProcessGroupGuard::new(child.id());
+        (child, group)
+    };
     capture_owned_with_cancel(child, invocation.timeout(), &ctx.cancel_token, &mut group)
         .await
         .map_err(|error| format!("Could not capture registered parent verification: {error}"))

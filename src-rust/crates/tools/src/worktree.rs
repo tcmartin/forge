@@ -855,6 +855,51 @@ impl Tool for ExitWorktreeTool {
 // ---------------------------------------------------------------------------
 
 async fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let (child, mut group) = match crate::command_capture::spawn_owned_command_checked(command)
+        {
+            Ok(pair) => pair,
+            Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                return Err(error.to_string());
+            }
+            Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                return Err(format!(
+                    "Git Job Object arm failed: {error}; cleanup remains unknown ({cleanup})"
+                ));
+            }
+        };
+        let captured = crate::command_capture::capture_owned_with_cancel(
+            child,
+            std::time::Duration::from_secs(30),
+            &tokio_util::sync::CancellationToken::new(),
+            &mut group,
+        )
+        .await
+        .map_err(|error| format!("Git output capture failed: {error}"))?;
+        let capture_complete = !captured.partial
+            && !captured.timed_out
+            && !captured.cancelled
+            && captured.error.is_none();
+        if captured.cleanup != crate::command_capture::ProcessCleanup::ConfirmedClean
+            || !capture_complete
+        {
+            return Err("Git process-tree/output cleanup remains unknown".to_string());
+        }
+        if captured.status.is_some_and(|status| status.success()) {
+            return Ok(String::from_utf8_lossy(&captured.stdout).to_string());
+        }
+        return Err(String::from_utf8_lossy(&captured.stderr).to_string());
+    }
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new("git")

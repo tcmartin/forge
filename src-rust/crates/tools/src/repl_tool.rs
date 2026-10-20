@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(any(not(windows), test))]
+use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -774,8 +776,10 @@ async fn cleanup_spawned_session(
         );
     };
     let wait = timeout(Duration::from_secs(2), child.wait());
-    let (wait_result, _) = tokio::join!(wait, drains);
-    let clean = matches!(wait_result, Ok(Ok(_))) && group.confirmed_empty().await;
+    let drains = timeout(Duration::from_secs(2), drains);
+    let (wait_result, drain_result) = tokio::join!(wait, drains);
+    let pipes_closed = matches!(drain_result, Ok(()));
+    let clean = matches!(wait_result, Ok(Ok(_))) && pipes_closed && group.confirmed_empty().await;
     if clean {
         if let Err(error) = pending.confirm_terminal() {
             return format!("{message}; cleanup remains unknown: {error}");
@@ -874,26 +878,57 @@ async fn get_or_spawn_session(key: &ReplKey) -> Result<Arc<Mutex<ReplSession>>, 
             scope_for_workspace(key.workspace.clone(), key.session.clone()),
             format!("REPL {} interpreter", key.language),
         )?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(&key.execution_root)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return Err(confirm_unspawned_pending(
-                    pending,
-                    format!("Failed to spawn '{program}': {error}"),
-                ));
+        #[cfg(windows)]
+        let (mut child, group) = {
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(program.to_string());
+            argv.extend(args.iter().map(|arg| (*arg).to_string()));
+            match crate::command_capture::spawn_owned_argv_checked_with_stdio(
+                &argv,
+                &key.execution_root,
+                std::process::Stdio::piped(),
+                std::process::Stdio::piped(),
+                std::process::Stdio::piped(),
+            ) {
+                Ok(pair) => pair,
+                Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                    return Err(confirm_unspawned_pending(
+                        pending,
+                        format!("Failed to spawn '{program}': {error}"),
+                    ));
+                }
+                Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                    let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                    return Err(format!(
+                        "Failed to arm REPL interpreter '{program}': {error}; cleanup remains unknown ({cleanup})"
+                    ));
+                }
             }
         };
-        let group = ProcessGroupGuard::new(child.id());
+        #[cfg(not(windows))]
+        let (mut child, group) = {
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .current_dir(&key.execution_root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            command.process_group(0);
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    return Err(confirm_unspawned_pending(
+                        pending,
+                        format!("Failed to spawn '{program}': {error}"),
+                    ));
+                }
+            };
+            let group = ProcessGroupGuard::new(child.id());
+            (child, group)
+        };
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {

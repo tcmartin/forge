@@ -246,34 +246,73 @@ impl Tool for RegisteredChecker {
             let _ = confirm_pending(pending).await;
             return not_run("Registered checker cancelled before process creation");
         }
-        let mut command = Command::new(program);
-        match self.registration.invocation().shell() {
-            TrustedCheckerShell::Bash => {
-                command.args(["--noprofile", "--norc", "-c"]);
+        #[cfg(windows)]
+        let (child, mut group) = {
+            let mut command = Command::new(program);
+            match self.registration.invocation().shell() {
+                TrustedCheckerShell::Bash => {
+                    command.args(["--noprofile", "--norc", "-c"]);
+                }
+                TrustedCheckerShell::PowerShell => {
+                    command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+                }
             }
-            TrustedCheckerShell::PowerShell => {
-                command.args(["-NoProfile", "-NonInteractive", "-Command"]);
-            }
-        }
-        command
-            .arg(self.registration.invocation().command())
-            .current_dir(self.registration.invocation().cwd())
-            .env_clear()
-            .envs(self.registration.invocation().environment())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                let _ = confirm_pending(pending).await;
-                return not_run("Registered checker process could not be started");
+            command
+                .arg(self.registration.invocation().command())
+                .current_dir(self.registration.invocation().cwd())
+                .env_clear()
+                .envs(self.registration.invocation().environment())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            match crate::command_capture::spawn_owned_command_checked(command) {
+                Ok(pair) => pair,
+                Err(crate::command_capture::SpawnOwnedError::Spawn(_)) => {
+                    let _ = confirm_pending(pending).await;
+                    return not_run("Registered checker process could not be started");
+                }
+                Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                    let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                    return ToolResult::error(format!(
+                        "Registered checker ownership failed: {error}; cleanup remains unknown ({cleanup})"
+                    ))
+                    .with_execution_status(crate::ExecutionStatus::Unknown);
+                }
             }
         };
-        let mut group = ProcessGroupGuard::new(child.id());
+        #[cfg(not(windows))]
+        let (child, mut group) = {
+            let mut command = Command::new(program);
+            match self.registration.invocation().shell() {
+                TrustedCheckerShell::Bash => {
+                    command.args(["--noprofile", "--norc", "-c"]);
+                }
+                TrustedCheckerShell::PowerShell => {
+                    command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+                }
+            }
+            command
+                .arg(self.registration.invocation().command())
+                .current_dir(self.registration.invocation().cwd())
+                .env_clear()
+                .envs(self.registration.invocation().environment())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            command.process_group(0);
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(_) => {
+                    let _ = confirm_pending(pending).await;
+                    return not_run("Registered checker process could not be started");
+                }
+            };
+            let group = ProcessGroupGuard::new(child.id());
+            (child, group)
+        };
         let captured = match capture_owned_with_cancel(
             child,
             self.registration.invocation().timeout(),

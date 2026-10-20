@@ -13,6 +13,8 @@
 //   Medium   → requires approval only when ctx.require_confirmation is set
 //   Low      → executes directly
 
+#[cfg(windows)]
+use crate::mutation;
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use claurst_core::ps_classifier::{classify_ps_command, PsRiskLevel};
@@ -343,6 +345,46 @@ impl Tool for PowerShellTool {
         let timeout_ms = params.timeout.min(600_000);
         let timeout_dur = Duration::from_millis(timeout_ms);
 
+        #[cfg(windows)]
+        let pending = match mutation::register_pending(
+            mutation::scope_for_context(ctx),
+            "PowerShell shell",
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => return not_run_result(error.to_string()),
+        };
+
+        #[cfg(windows)]
+        let (child, mut group) = {
+            let mut command = Command::new(exe);
+            command
+                .args(&args)
+                .arg(&params.command)
+                .current_dir(&ctx.working_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            match crate::command_capture::spawn_owned_command_checked(command) {
+                Ok(pair) => pair,
+                Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                    let _ = pending.confirm_terminal();
+                    return not_run_result(format!("Failed to spawn PowerShell: {error}"));
+                }
+                Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                    let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
+                    return with_command_metadata(
+                        ToolResult::error(format!(
+                            "Failed to arm PowerShell ownership: {error}; cleanup remains unknown ({cleanup})"
+                        )),
+                        "unknown",
+                        None,
+                        true,
+                    );
+                }
+            }
+        };
+        #[cfg(not(windows))]
         let child = match Command::new(exe)
             .args(&args)
             .arg(&params.command)
@@ -357,6 +399,26 @@ impl Tool for PowerShellTool {
             Err(e) => return not_run_result(format!("Failed to spawn PowerShell: {}", e)),
         };
 
+        #[cfg(windows)]
+        let captured = match crate::command_capture::capture_owned_with_cancel(
+            child,
+            timeout_dur,
+            &ctx.cancel_token,
+            &mut group,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return with_command_metadata(
+                    ToolResult::error(format!("Failed to capture PowerShell output: {e}")),
+                    "unknown",
+                    None,
+                    true,
+                )
+            }
+        };
+        #[cfg(not(windows))]
         let captured = match crate::command_capture::capture_with_cancel(
             child,
             timeout_dur,
@@ -374,6 +436,27 @@ impl Tool for PowerShellTool {
                 )
             }
         };
+        #[cfg(windows)]
+        {
+            if captured.cleanup != crate::command_capture::ProcessCleanup::ConfirmedClean {
+                return with_command_metadata(
+                    ToolResult::error("PowerShell process-tree cleanup remains unknown"),
+                    "unknown",
+                    None,
+                    true,
+                );
+            }
+            if let Err(error) = pending.confirm_terminal() {
+                return with_command_metadata(
+                    ToolResult::error(format!(
+                        "PowerShell cleanup was clean but pending mutation confirmation failed: {error}"
+                    )),
+                    "unknown",
+                    None,
+                    true,
+                );
+            }
+        }
         retained_capture_result(
             ctx,
             CapturedPowerShellOutput {

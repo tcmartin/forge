@@ -676,6 +676,15 @@ mod tests {
     #[cfg(windows)]
     const WINDOWS_TREE_STARTED_MARKER: &str = "windows-job-object-descendant-started.txt";
 
+    // libtest --exact uses the fully qualified module path.
+    #[cfg(windows)]
+    const WINDOWS_TREE_PARENT_TEST: &str =
+        "command_capture::tests::windows_process_tree_parent_fixture";
+
+    #[cfg(windows)]
+    const WINDOWS_TREE_DESCENDANT_TEST: &str =
+        "command_capture::tests::windows_process_tree_descendant_fixture";
+
     #[cfg(windows)]
     fn windows_tree_fixture_argv(test_name: &str) -> Vec<String> {
         vec![
@@ -798,7 +807,7 @@ mod tests {
         let mut descendant =
             std::process::Command::new(std::env::current_exe().expect("test executable"))
                 .args([
-                    "windows_process_tree_descendant_fixture",
+                    WINDOWS_TREE_DESCENDANT_TEST,
                     "--exact",
                     "--ignored",
                     "--nocapture",
@@ -848,7 +857,7 @@ mod tests {
     async fn windows_descendant_cancel_proves_job_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join(WINDOWS_TREE_MARKER);
-        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
+        let argv = windows_tree_fixture_argv(WINDOWS_TREE_PARENT_TEST);
         let (child, mut group) = checked_spawn(&argv, dir.path());
         let parent_pid = child.id().expect("owned parent pid");
         let cancel = CancellationToken::new();
@@ -890,7 +899,7 @@ mod tests {
     async fn windows_dropped_capture_proves_parent_and_descendant_gone() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join(WINDOWS_TREE_MARKER);
-        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
+        let argv = windows_tree_fixture_argv(WINDOWS_TREE_PARENT_TEST);
         let cwd = dir.path().to_path_buf();
         let (child, mut group) = checked_spawn(&argv, &cwd);
         let parent_pid = child.id().expect("owned parent pid");
@@ -924,7 +933,7 @@ mod tests {
         let (mut foreign, mut foreign_group) =
             checked_spawn(&powershell_argv("Start-Sleep 30"), dir.path());
         let marker = dir.path().join(WINDOWS_TREE_MARKER);
-        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
+        let argv = windows_tree_fixture_argv(WINDOWS_TREE_PARENT_TEST);
         let (child, mut group) = checked_spawn(&argv, dir.path());
         let parent_pid = child.id().expect("owned parent pid");
         let cancel = CancellationToken::new();

@@ -657,24 +657,95 @@ mod tests {
     }
 
     #[cfg(windows)]
+    const MAX_WITNESS_DIAGNOSTIC_BYTES: usize = 4096;
+
+    #[cfg(windows)]
+    fn bounded_witness_bytes(bytes: &[u8]) -> String {
+        let retained = bytes.len().min(MAX_WITNESS_DIAGNOSTIC_BYTES);
+        let mut text = String::from_utf8_lossy(&bytes[..retained]).into_owned();
+        if retained < bytes.len() {
+            text.push_str("...<truncated>");
+        }
+        text
+    }
+
+    #[cfg(windows)]
+    fn read_bounded_witness_file(path: &Path) -> io::Result<Vec<u8>> {
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::with_capacity(MAX_WITNESS_DIAGNOSTIC_BYTES + 1);
+        let mut limited = std::io::Read::take(file, (MAX_WITNESS_DIAGNOSTIC_BYTES + 1) as u64);
+        std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+        if bytes.len() > MAX_WITNESS_DIAGNOSTIC_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "witness marker exceeds bounded diagnostic size",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(windows)]
+    fn bounded_witness_file(path: &Path) -> String {
+        match read_bounded_witness_file(path) {
+            Ok(bytes) => bounded_witness_bytes(&bytes),
+            Err(error) => format!("<unavailable: {error}>"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn capture_witness_diagnostic(output: &CapturedCommand) -> String {
+        format!(
+            "cleanup={:?} status={:?} partial={} timed_out={} cancelled={} error={:?} stdout={:?} stderr={:?}",
+            output.cleanup,
+            output.status,
+            output.partial,
+            output.timed_out,
+            output.cancelled,
+            output.error,
+            bounded_witness_bytes(&output.stdout),
+            bounded_witness_bytes(&output.stderr),
+        )
+    }
+
+    #[cfg(windows)]
     async fn wait_for_windows_pid_witness(marker: &Path, parent_pid: u32) -> io::Result<[u32; 2]> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut last_marker: Option<String> = None;
         loop {
-            if let Ok(contents) = std::fs::read_to_string(marker) {
-                let mut fields = contents.trim().split(',');
-                let observed_parent = fields.next().and_then(|value| value.trim().parse().ok());
-                let descendant = fields.next().and_then(|value| value.trim().parse().ok());
-                if fields.next().is_none()
-                    && observed_parent == Some(parent_pid)
-                    && descendant.is_some_and(|pid| pid != 0)
-                {
-                    return Ok([parent_pid, descendant.unwrap()]);
+            match read_bounded_witness_file(marker) {
+                Ok(bytes) => {
+                    let bytes_for_text = bounded_witness_bytes(&bytes);
+                    match String::from_utf8(bytes) {
+                        Ok(contents) => {
+                            let mut fields = contents.trim().split(',');
+                            let observed_parent =
+                                fields.next().and_then(|value| value.trim().parse().ok());
+                            let descendant =
+                                fields.next().and_then(|value| value.trim().parse().ok());
+                            if fields.next().is_none()
+                                && observed_parent == Some(parent_pid)
+                                && descendant.is_some_and(|pid| pid != 0)
+                            {
+                                return Ok([parent_pid, descendant.unwrap()]);
+                            }
+                            last_marker = Some(format!("<parse error; bytes={bytes_for_text}>"));
+                        }
+                        Err(error) => {
+                            last_marker = Some(format!(
+                                "<utf8 parse error: {error}; bytes={bytes_for_text}>"
+                            ));
+                        }
+                    }
                 }
+                Err(error) => last_marker = Some(format!("<read error: {error}>")),
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "owned parent and descendant startup witness was not observed",
+                    format!(
+                        "owned parent and descendant startup witness was not observed; last marker={}",
+                        last_marker.as_deref().unwrap_or("<not-read>"),
+                    ),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -712,15 +783,17 @@ mod tests {
     async fn windows_descendant_cancel_proves_job_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("cancel-pids.txt");
+        let phase_marker = dir.path().join("cancel-phase.txt");
         let marker_literal = marker.display().to_string().replace('\'', "''");
+        let phase_literal = phase_marker.display().to_string().replace('\'', "''");
         let script = format!(
-            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
+            "$ErrorActionPreference='Stop'; Set-Content -NoNewline -Path '{phase_literal}' -Value \"$PID\"; try {{ $p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru -ErrorAction Stop; Set-Content -NoNewline -Path '{phase_literal}' -Value \"$($p.Id)\"; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id }} catch {{ Set-Content -NoNewline -Path '{phase_literal}' -Value \"error:$($_.Exception.Message)\"; throw }}"
         );
         let argv = powershell_argv(&script);
         let (child, mut group) = checked_spawn(&argv, dir.path());
         let parent_pid = child.id().expect("owned parent pid");
         let cancel = CancellationToken::new();
-        let task = tokio::spawn({
+        let mut task = tokio::spawn({
             let cancel = cancel.clone();
             async move {
                 capture_owned_with_cancel(child, Duration::from_secs(30), &cancel, &mut group)
@@ -728,9 +801,56 @@ mod tests {
                     .unwrap()
             }
         });
-        let pids = wait_for_windows_pid_witness(&marker, parent_pid)
-            .await
-            .expect("parent and descendant startup witness");
+        let witness_started = tokio::time::Instant::now();
+        let witness_result = wait_for_windows_pid_witness(&marker, parent_pid).await;
+        let pids = match witness_result {
+            Ok(pids) => pids,
+            Err(witness_error) => {
+                cancel.cancel();
+                let capture_join = match tokio::time::timeout(Duration::from_secs(5), &mut task)
+                    .await
+                {
+                    Ok(join) => join,
+                    Err(_) => {
+                        // Keep the handle owned through a final bounded abort/join.
+                        // A task that still will not terminate is cleanup-unknown;
+                        // never report the witness failure as a clean result.
+                        task.abort();
+                        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+                            Ok(_) => panic!(
+                                "capture cleanup unknown after bounded abort; phase={:?}; marker={:?}",
+                                bounded_witness_file(&phase_marker),
+                                bounded_witness_file(&marker),
+                            ),
+                            Err(_) => panic!(
+                                "capture cleanup task did not terminate after bounded abort; cleanup unknown; phase={:?}; marker={:?}",
+                                bounded_witness_file(&phase_marker),
+                                bounded_witness_file(&marker),
+                            ),
+                        }
+                    }
+                };
+                let capture = capture_join.unwrap_or_else(|error| {
+                    panic!(
+                        "capture task failed after witness error: {error}; phase={:?}; marker={:?}",
+                        bounded_witness_file(&phase_marker),
+                        bounded_witness_file(&marker),
+                    )
+                });
+                let capture_diagnostic = capture_witness_diagnostic(&capture);
+                assert_eq!(
+                    capture.cleanup,
+                    ProcessCleanup::ConfirmedClean,
+                    "owned cleanup proof failed after witness error: {capture_diagnostic}"
+                );
+                panic!(
+                    "parent and descendant startup witness: {witness_error}; elapsed={:?}; phase={:?}; marker={:?}; capture={capture_diagnostic}",
+                    witness_started.elapsed(),
+                    bounded_witness_file(&phase_marker),
+                    bounded_witness_file(&marker),
+                );
+            }
+        };
         cancel.cancel();
         let output = task.await.unwrap();
         assert!(output.cancelled);

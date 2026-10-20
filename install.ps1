@@ -1,26 +1,36 @@
-# Claurst installer for Windows (PowerShell).
+# Forge installer for Windows (PowerShell).
 #
-# Usage (one-liner):
-#   irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+# Verified local install:
+#   .\install.ps1 -Binary C:\path\to\forge.exe -NoModifyPath
 #
-# Or download and run locally:
-#   Invoke-WebRequest https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 -OutFile install.ps1
-#   .\install.ps1
+# Remote release install (explicit repository required):
+#   .\install.ps1 -Repository owner/repository
 
 [CmdletBinding()]
 param(
     [string]$Version = "",
     [string]$Binary = "",
     [string]$InstallDir = "",
+    [string]$Repository = "",
     [string]$Token = "",
     [switch]$NoModifyPath,
     [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
-
-$App = 'claurst'
-$Repo = 'Kuberwastaken/claurst'
+$App = 'forge'
+$ConnectTimeoutSeconds = 10
+$TotalTimeoutSeconds = 60
+$ArchiveMaxBytes = 128MB
+$ManifestMaxBytes = 1MB
+$ApiMaxBytes = 1MB
+$Repo = if (-not [string]::IsNullOrWhiteSpace($Repository)) {
+    $Repository
+} elseif (-not [string]::IsNullOrWhiteSpace($env:FORGE_RELEASE_REPO)) {
+    $env:FORGE_RELEASE_REPO
+} else {
+    ''
+}
 
 function Write-Info($msg)    { Write-Host $msg }
 function Write-Success($msg) { Write-Host $msg -ForegroundColor Green }
@@ -30,29 +40,28 @@ function Write-Muted($msg)   { Write-Host $msg -ForegroundColor DarkGray }
 
 function Show-Usage {
 @"
-Claurst installer (Windows)
+Forge installer (Windows)
 
 Usage: install.ps1 [options]
 
 Options:
-    -Help                   Show this help
-    -Version <version>      Install a specific version (e.g., 0.1.0)
-    -Binary <path>          Install from a local binary instead of downloading
-    -InstallDir <path>      Override install location (default: %LOCALAPPDATA%\Programs\claurst)
-    -Token <token>          GitHub token for API/downloads (or set GITHUB_TOKEN / GH_TOKEN)
-    -NoModifyPath           Don't add the install dir to user PATH
+    -Help                    Show this help
+    -Binary <path>           Install a local Forge binary
+    -Repository <owner/repo> Download from an explicitly selected GitHub repository
+    -Version <version>       Install a specific remote version (for example, 0.1.0)
+    -InstallDir <path>       Override install location (default: %LOCALAPPDATA%\Programs\forge)
+    -Token <token>           GitHub token for API/downloads (or GITHUB_TOKEN / GH_TOKEN)
+    -NoModifyPath            Do not add the install directory to user PATH
 
 Examples:
-    irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
-    .\install.ps1 -Version 0.1.0
-    .\install.ps1 -Binary C:\path\to\claurst.exe
-    `$env:GITHUB_TOKEN = 'ghp_...'; .\install.ps1
+    .\install.ps1 -Binary C:\path\to\forge.exe -NoModifyPath
+    .\install.ps1 -Repository owner/repository
+    `$env:FORGE_RELEASE_REPO = 'owner/repository'; .\install.ps1 -Version 0.1.0
 "@
 }
 
 if ($Help) { Show-Usage; exit 0 }
 
-# Prefer -Token; otherwise GITHUB_TOKEN, then GH_TOKEN (gh CLI convention).
 if ([string]::IsNullOrEmpty($Token)) {
     if (-not [string]::IsNullOrEmpty($env:GITHUB_TOKEN)) {
         $Token = $env:GITHUB_TOKEN
@@ -61,281 +70,321 @@ if ([string]::IsNullOrEmpty($Token)) {
     }
 }
 
-function Get-GitHubHeaders {
-    $headers = @{
-        'User-Agent' = 'claurst-installer'
-        'Accept'     = 'application/vnd.github+json'
-    }
-    if (-not [string]::IsNullOrEmpty($script:Token)) {
-        $headers['Authorization'] = "Bearer $($script:Token)"
-    }
-    return $headers
-}
-
-# ----- Detect architecture -----
 function Get-Arch {
     $procArch = $env:PROCESSOR_ARCHITECTURE
     if ($null -eq $procArch) { $procArch = '' }
-    switch ($procArch.ToLower()) {
-        'amd64'   { return 'x86_64' }
-        'x86'     { return 'x86_64' }   # rare; ship 64-bit anyway
-        'arm64'   {
-            Write-Warn "ARM64 Windows is not currently supported in releases. Falling back to x86_64."
+    switch ($procArch.ToLowerInvariant()) {
+        'amd64' { return 'x86_64' }
+        'x86'   { return 'x86_64' }
+        'arm64' {
+            Write-Warn 'ARM64 Windows release assets are not configured. Falling back to x86_64.'
             return 'x86_64'
         }
-        default   {
+        default {
             Write-Warn "Unknown architecture '$procArch'. Defaulting to x86_64."
             return 'x86_64'
         }
     }
 }
 
-# ----- Resolve install directory -----
-# Binary location is independent of the claurst data dir. Default to the
-# per-user programs location (%LOCALAPPDATA%\Programs\claurst), falling back to
-# the user profile when LOCALAPPDATA is unavailable.
 if ([string]::IsNullOrEmpty($InstallDir)) {
     if (-not [string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
-        $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\claurst"
+        $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\forge"
     } else {
-        $InstallDir = Join-Path $env:USERPROFILE ".local\bin"
+        $InstallDir = Join-Path $env:USERPROFILE '.local\bin'
     }
 }
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+function Assert-RemoteRepository {
+    if ([string]::IsNullOrWhiteSpace($script:Repo) -or $script:Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+        Write-Err 'Remote installation requires -Repository owner/repository or FORGE_RELEASE_REPO.'
+        throw 'Remote repository is invalid.'
+    }
 }
 
-# ----- Resolve version (latest if not provided) -----
-function Resolve-Version {
-    if (-not [string]::IsNullOrEmpty($script:Version)) {
-        return ($script:Version -replace '^v', '')
+function Normalize-Version([string]$candidate) {
+    $normalized = $candidate -replace '^v', ''
+    if ($normalized -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([+.-][0-9A-Za-z+.-]+)?$') {
+        throw 'Release version is invalid.'
     }
+    return $normalized
+}
+
+function New-ForgeHttpClient {
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('forge-installer')
+    $client.DefaultRequestHeaders.Accept.ParseAdd('application/vnd.github+json')
+    # Authorization is attached per request below; never forward a token to a
+    # redirected release host such as objects.githubusercontent.com.
+    return $client
+}
+
+function Invoke-CappedDownload([string]$Uri, [string]$Destination, [long]$MaxBytes, [string]$Label) {
+    if ($Uri -notmatch '^https://') { throw 'Remote URL must use HTTPS.' }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TotalTimeoutSeconds)
+    $client = New-ForgeHttpClient
+    $response = $null
+    $stream = $null
+    $file = $null
+    $failed = $false
     try {
-        $resp = Invoke-RestMethod -UseBasicParsing `
-            -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-            -Headers (Get-GitHubHeaders)
-        $tag = $resp.tag_name
-        if ([string]::IsNullOrEmpty($tag)) { throw "no tag_name in response" }
-        return ($tag -replace '^v', '')
-    } catch {
-        Write-Err "Failed to fetch latest version from GitHub API: $_"
-        if ([string]::IsNullOrEmpty($script:Token)) {
-            Write-Info "If you hit rate limits or need a private release, set GITHUB_TOKEN or pass -Token."
+        $current = [Uri]$Uri
+        for ($redirects = 0; $redirects -le 5; $redirects++) {
+            if ($current.Scheme -ne 'https') { throw 'Redirected URL must use HTTPS.' }
+            $remaining = ($deadline - [DateTime]::UtcNow).TotalSeconds
+            if ($remaining -le 0) { throw 'Remote request timed out.' }
+            $requestTimeout = [Math]::Min($ConnectTimeoutSeconds, $remaining)
+            $requestCts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($requestTimeout))
+            $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $current)
+            if (-not [string]::IsNullOrEmpty($script:Token) -and
+                ($current.Host -eq 'api.github.com' -or $current.Host -eq 'github.com')) {
+                $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $script:Token)
+            }
+            try {
+                $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $requestCts.Token).GetAwaiter().GetResult()
+            } catch {
+                throw 'Remote request failed.'
+            } finally {
+                $requestCts.Dispose()
+                $request.Dispose()
+            }
+            $status = [int]$response.StatusCode
+            if ($status -ge 300 -and $status -lt 400) {
+                $location = $response.Headers.Location
+                $response.Dispose(); $response = $null
+                if ($null -eq $location -or $redirects -eq 5) { throw 'Remote redirect is invalid.' }
+                $current = [Uri]::new($current, $location)
+                continue
+            }
+            if (-not $response.IsSuccessStatusCode) { throw 'Remote request failed.' }
+            break
         }
-        exit 1
+        if ($null -eq $response -or -not $response.IsSuccessStatusCode) { throw 'Remote request failed.' }
+        $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $file = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buffer = New-Object byte[] 65536
+        [long]$total = 0
+        while ($true) {
+            $remaining = ($deadline - [DateTime]::UtcNow).TotalSeconds
+            if ($remaining -le 0) { throw 'Remote request timed out.' }
+            $readCts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($remaining))
+            try {
+                $read = $stream.ReadAsync($buffer, 0, $buffer.Length, $readCts.Token).GetAwaiter().GetResult()
+            } catch {
+                throw 'Remote request timed out or failed.'
+            } finally {
+                $readCts.Dispose()
+            }
+            if ($read -le 0) { break }
+            $total += $read
+            if ($total -gt $MaxBytes) { throw "$Label exceeded its size limit." }
+            $file.Write($buffer, 0, $read)
+        }
+        $file.Flush($true)
+    } catch {
+        $failed = $true
+        throw [System.InvalidOperationException]::new($Label + ' download failed.')
+    } finally {
+        if ($null -ne $file) { $file.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $client) { $client.Dispose() }
+        if ($failed) { Remove-Item -Force -LiteralPath $Destination -ErrorAction SilentlyContinue }
     }
 }
 
-# ----- Already-installed check -----
+function Resolve-Version {
+    Assert-RemoteRepository
+    if (-not [string]::IsNullOrEmpty($script:Version)) {
+        try { return (Normalize-Version $script:Version) }
+        catch { Write-Err 'Release version is invalid.'; throw [System.InvalidOperationException]::new('Release version is invalid.') }
+    }
+    $latestPath = Join-Path ([System.IO.Path]::GetTempPath()) ('.forge-latest-' + [System.Guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-CappedDownload "https://api.github.com/repos/$script:Repo/releases/latest" $latestPath $ApiMaxBytes 'Latest-version response'
+        $resp = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json
+        if ($null -eq $resp.tag_name -or [string]::IsNullOrEmpty([string]$resp.tag_name)) { throw 'Missing release tag.' }
+        return (Normalize-Version ([string]$resp.tag_name))
+    } catch {
+        Write-Err 'Failed to fetch or validate the latest version.'
+        if ([string]::IsNullOrEmpty($script:Token)) {
+            Write-Info 'Private releases or rate limits may require GITHUB_TOKEN, GH_TOKEN, or -Token.'
+        }
+        throw [System.InvalidOperationException]::new('Latest-version resolution failed.')
+    } finally {
+        Remove-Item -Force -LiteralPath $latestPath -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ChecksumFromManifest([string]$Path, [string]$Archive) {
+    $expected = $null
+    $seen = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ([string]::IsNullOrEmpty($line) -or $line -notmatch '^([0-9A-Fa-f]{64})[ \t]{2}(\*?[^ \t]+)$') {
+            throw 'Checksum manifest is malformed.'
+        }
+        $hash = $Matches[1]
+        $name = $Matches[2].TrimStart('*')
+        if ($seen.ContainsKey($name)) { throw 'Checksum manifest contains duplicate entries.' }
+        $seen[$name] = $true
+        if ($name -eq $Archive) {
+            if ($null -ne $expected) { throw 'Checksum manifest contains duplicate archive entries.' }
+            $expected = $hash
+        }
+    }
+    if ($null -eq $expected) { throw 'Checksum manifest does not list the archive.' }
+    return $expected
+}
+
 function Check-Existing($desiredVersion) {
-    $existing = Get-Command claurst -ErrorAction SilentlyContinue
+    $existing = Get-Command $script:App -ErrorAction SilentlyContinue
     if ($null -eq $existing) { return }
     try {
-        $vline = (& claurst --version) 2>&1 | Select-Object -First 1
+        $vline = (& $script:App --version) 2>&1 | Select-Object -First 1
         $installed = ($vline -split '\s+')[-1]
     } catch {
         $installed = 'unknown'
     }
     if ($installed -eq $desiredVersion) {
         Write-Muted "Version $desiredVersion already installed at $($existing.Source)"
-        Write-Muted "Use -Version to install a different one."
         exit 0
     }
-    Write-Muted "Found existing claurst at $($existing.Source) (v$installed) - upgrading to v$desiredVersion"
-}
-
-# ----- Download & extract -----
-function Download-And-Install($desiredVersion, $arch) {
-    $archive = "claurst-windows-$arch.zip"
-    $url = "https://github.com/$Repo/releases/download/v$desiredVersion/$archive"
-    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claurst-install-" + [System.Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
-
-    $zipPath = Join-Path $tmpRoot $archive
-    $extractDir = Join-Path $tmpRoot "extract"
-    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-
-    Write-Info "Installing claurst v$desiredVersion (windows-$arch)"
-    Write-Muted "Downloading $url"
-    if (-not [string]::IsNullOrEmpty($script:Token)) {
-        Write-Muted "Using GitHub authentication."
-    }
-    $ghHeaders = Get-GitHubHeaders
-    try {
-        # Disable progress UI for a faster, less noisy download.
-        $oldPref = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zipPath -Headers $ghHeaders
-        $ProgressPreference = $oldPref
-    } catch {
-        Write-Err "Download failed: $_"
-        Write-Info ("Check that release v$desiredVersion exists for windows-" + $arch + ":")
-        Write-Info "  https://github.com/$Repo/releases/tag/v$desiredVersion"
-        if ([string]::IsNullOrEmpty($script:Token)) {
-            Write-Info "Private releases require GITHUB_TOKEN / GH_TOKEN or -Token."
-        }
-        Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
-        exit 1
-    }
-
-    # ----- Verify checksum (supply-chain integrity) -----
-    # Fetch SHA256SUMS from the same release and verify the archive before we
-    # extract and run it.  Older releases may not ship SHA256SUMS: warn and
-    # continue so existing installs keep working.  If it IS present and the
-    # hash does NOT match, abort hard.
-    $sumsUrl = "https://github.com/$Repo/releases/download/v$desiredVersion/SHA256SUMS"
-    $sumsPath = Join-Path $tmpRoot 'SHA256SUMS'
-    $haveSums = $false
-    try {
-        $oldPref2 = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsPath -Headers $ghHeaders
-        $ProgressPreference = $oldPref2
-        $haveSums = $true
-    } catch {
-        Write-Warn "Could not fetch SHA256SUMS for v$desiredVersion - skipping checksum verification."
-    }
-
-    if ($haveSums) {
-        # SHA256SUMS lines look like "<hash>  <filename>" (two spaces). Split on
-        # whitespace into at most 2 parts and match on the bare archive name.
-        $expected = $null
-        foreach ($line in (Get-Content $sumsPath)) {
-            $parts = $line.Trim() -split '\s+', 2
-            if ($parts.Count -eq 2 -and $parts[1].Trim().TrimStart('*') -eq $archive) {
-                $expected = $parts[0].Trim()
-                break
-            }
-        }
-        if ([string]::IsNullOrEmpty($expected)) {
-            Write-Warn "No checksum listed for $archive in SHA256SUMS - skipping verification."
-        } else {
-            # Get-FileHash returns uppercase hex; sha256sum emits lowercase, so
-            # compare case-insensitively.
-            $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash
-            if ($actual -ieq $expected) {
-                Write-Muted "Checksum verified."
-            } else {
-                Write-Err "Checksum verification FAILED for $archive"
-                Write-Info "  expected: $expected"
-                Write-Info "  actual:   $actual"
-                Write-Info "The download may be corrupted or tampered with. Aborting."
-                Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
-                exit 1
-            }
-        }
-    }
-
-    Write-Muted "Extracting..."
-    try {
-        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-    } catch {
-        Write-Err "Extract failed: $_"
-        Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
-        exit 1
-    }
-
-    $extractedExe = Join-Path $extractDir 'claurst.exe'
-    if (-not (Test-Path $extractedExe)) {
-        Write-Err "Archive did not contain expected binary 'claurst.exe'"
-        Get-ChildItem -Recurse $extractDir | Format-Table FullName
-        Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
-        exit 1
-    }
-
-    Install-Binary $extractedExe
-    Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
-}
-
-function Install-FromBinary {
-    if (-not (Test-Path $script:Binary)) {
-        Write-Err "Binary not found at $script:Binary"
-        exit 1
-    }
-    Write-Info "Installing claurst from $script:Binary"
-    Install-Binary $script:Binary
+    Write-Muted "Found existing forge at $($existing.Source) (v$installed); installing v$desiredVersion"
 }
 
 function Install-Binary($source) {
-    $target = Join-Path $InstallDir 'claurst.exe'
+    if (-not (Test-Path -LiteralPath $InstallDir)) {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    }
+    $target = Join-Path $InstallDir 'forge.exe'
     $stale = "$target.old"
-
-    # The currently running claurst.exe (if any) holds an exclusive file lock on
-    # Windows.  Swap by renaming the old one aside, then remove it after the
-    # new binary is in place (the lock is on the path that was open).
-    if (Test-Path $target) {
-        if (Test-Path $stale) { Remove-Item -Force $stale -ErrorAction SilentlyContinue }
-        try { Move-Item -Force $target $stale } catch { }
+    $staged = Join-Path $InstallDir ('.forge-install-' + [System.Guid]::NewGuid().ToString('N'))
+    $movedExisting = $false
+    try {
+        Copy-Item -Force -LiteralPath $source -Destination $staged -ErrorAction Stop
+        if (Test-Path -LiteralPath $target) {
+            if (Test-Path -LiteralPath $stale) {
+                Remove-Item -Force -LiteralPath $stale -ErrorAction Stop
+            }
+            Move-Item -Force -LiteralPath $target -Destination $stale -ErrorAction Stop
+            $movedExisting = $true
+        }
+        Move-Item -Force -LiteralPath $staged -Destination $target -ErrorAction Stop
+        if (Test-Path -LiteralPath $stale) {
+            Remove-Item -Force -LiteralPath $stale -ErrorAction SilentlyContinue
+        }
+        Write-Success "Installed: $target"
+    } catch {
+        if ($movedExisting -and -not (Test-Path -LiteralPath $target)) {
+            try {
+                Move-Item -Force -LiteralPath $stale -Destination $target -ErrorAction Stop
+            } catch {
+                Write-Err "Restore the previous binary from $stale."
+            }
+        }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $staged) {
+            Remove-Item -Force -LiteralPath $staged -ErrorAction SilentlyContinue
+        }
     }
-
-    Copy-Item -Force $source $target
-    if (Test-Path $stale) {
-        Remove-Item -Force $stale -ErrorAction SilentlyContinue
-    }
-    Write-Success "Installed: $target"
 }
 
-# ----- PATH modification -----
+function Install-FromBinary {
+    if (-not (Test-Path -LiteralPath $script:Binary -PathType Leaf)) {
+        Write-Err "Binary not found at $script:Binary"
+        exit 1
+    }
+    Write-Info "Installing Forge from $script:Binary"
+    Install-Binary $script:Binary
+}
+
+function Download-And-Install($desiredVersion, $arch) {
+    Assert-RemoteRepository
+    $archive = "forge-windows-$arch.zip"
+    $url = "https://github.com/$script:Repo/releases/download/v$desiredVersion/$archive"
+    $sumsUrl = "https://github.com/$script:Repo/releases/download/v$desiredVersion/SHA256SUMS"
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-install-" + [System.Guid]::NewGuid().ToString('N'))
+    $zipPath = Join-Path $tmpRoot $archive
+    $sumsPath = Join-Path $tmpRoot 'SHA256SUMS'
+    $extractDir = Join-Path $tmpRoot 'extract'
+    try {
+        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+        Write-Info "Installing Forge v$desiredVersion (windows-$arch)"
+        Write-Muted 'Downloading release asset (HTTPS, bounded).'
+        Invoke-CappedDownload $url $zipPath $ArchiveMaxBytes 'Release archive'
+        Invoke-CappedDownload $sumsUrl $sumsPath $ManifestMaxBytes 'Checksum manifest'
+
+        $expected = Get-ChecksumFromManifest $sumsPath $archive
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash
+        if (-not ($actual -ieq $expected)) { throw 'Checksum verification failed.' }
+        Write-Muted 'Checksum verified.'
+
+        try {
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+        } catch {
+            throw 'Archive extraction failed.'
+        }
+        $extractedExe = Join-Path $extractDir 'forge.exe'
+        if (-not (Test-Path -LiteralPath $extractedExe -PathType Leaf)) {
+            throw 'Archive did not contain the expected binary.'
+        }
+        Install-Binary $extractedExe
+    } catch {
+        Write-Err 'Remote installation failed.'
+        throw [System.InvalidOperationException]::new('Remote installation failed.')
+    } finally {
+        # Covers failed download, checksum, extraction, and Install-Binary paths.
+        Remove-Item -Recurse -Force -LiteralPath $tmpRoot -ErrorAction SilentlyContinue
+    }
+}
+
 function Add-ToUserPath {
     if ($NoModifyPath) { return }
-
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($null -eq $current) { $current = '' }
-
-    # Already on PATH?
     $paths = $current -split ';' | Where-Object { $_ -ne '' }
-    foreach ($p in $paths) {
-        if ($p.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')) {
-            Write-Muted "Install dir already on user PATH: $InstallDir"
+    foreach ($path in $paths) {
+        if ($path.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')) {
+            Write-Muted "Install directory already on user PATH: $InstallDir"
             return
         }
     }
-
-    if ([string]::IsNullOrEmpty($current)) {
-        $newPath = $InstallDir
-    } else {
-        $newPath = $InstallDir + ';' + $current
-    }
+    $newPath = if ([string]::IsNullOrEmpty($current)) { $InstallDir } else { $InstallDir + ';' + $current }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-
-    # Make it visible in this session too so claurst --version works immediately.
     $env:Path = $InstallDir + ';' + $env:Path
-
-    Write-Success ("Added " + $InstallDir + " to user PATH")
-    Write-Muted "Open a new terminal for the change to take effect everywhere."
+    Write-Success "Added $InstallDir to user PATH"
 }
 
-# ----- GitHub Actions hint -----
-function GithubPathHint {
+function Write-GitHubPath {
     if ($env:GITHUB_ACTIONS -eq 'true' -and -not [string]::IsNullOrEmpty($env:GITHUB_PATH)) {
         Add-Content -Path $env:GITHUB_PATH -Value $InstallDir
         Write-Info "Added $InstallDir to `$GITHUB_PATH"
     }
 }
 
-# ----- Main flow -----
 if (-not [string]::IsNullOrEmpty($Binary)) {
     Install-FromBinary
 } else {
-    $arch = Get-Arch
-    $desiredVersion = Resolve-Version
-    Check-Existing $desiredVersion
-    Download-And-Install $desiredVersion $arch
+    try {
+        $arch = Get-Arch
+        $desiredVersion = Resolve-Version
+        Check-Existing $desiredVersion
+        Download-And-Install $desiredVersion $arch
+    } catch {
+        exit 1
+    }
 }
 
 Add-ToUserPath
-GithubPathHint
+Write-GitHubPath
 
-Write-Host ""
-Write-Success "claurst is installed!"
-Write-Host ""
-Write-Muted  "Quickstart:"
-Write-Muted  "  # Set an API key"
-Write-Host   "  `$env:ANTHROPIC_API_KEY = 'sk-ant-...'"
-Write-Host   ""
-Write-Muted  "  # Open a new terminal, then:"
-Write-Success "  claurst             "
-Write-Muted  "  # or"
-Write-Success "  claurst -p `"...`"      "
-Write-Host   ""
-Write-Muted  "Docs: https://github.com/$Repo"
+Write-Host ''
+Write-Success 'Forge is installed!'
+Write-Muted 'Quickstart:'
+Write-Success '  forge'
+Write-Success '  forge -p "..."'
+if (-not [string]::IsNullOrEmpty($Repo)) {
+    Write-Muted "Release repository: https://github.com/$Repo"
+}

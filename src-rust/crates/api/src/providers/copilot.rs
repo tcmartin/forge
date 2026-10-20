@@ -19,23 +19,27 @@
 // Env: GITHUB_TOKEN
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
-use claurst_core::types::{ContentBlock, ImageSource, MessageContent, Role, ToolResultContent, UsageInfo};
+use claurst_core::types::{
+    ContentBlock, ImageSource, Message, MessageContent, Role, ToolResultContent, UsageInfo,
+};
 use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent,
-    SystemPromptStyle,
+    StreamEvent, SystemPromptStyle,
 };
+use crate::provider_wire::prepare_provider_json;
 use crate::providers::openai::OpenAiProvider;
 
 // ---------------------------------------------------------------------------
@@ -45,7 +49,9 @@ use crate::providers::openai::OpenAiProvider;
 pub struct CopilotProvider {
     id: ProviderId,
     token: String,
+    base_url: String,
     http_client: reqwest::Client,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl CopilotProvider {
@@ -58,16 +64,40 @@ impl CopilotProvider {
         Self {
             id: ProviderId::new(ProviderId::GITHUB_COPILOT),
             token,
+            base_url: "https://api.githubcopilot.com".to_string(),
             http_client,
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    /// Override the GitHub Copilot-compatible API root.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     pub fn from_env() -> Option<Self> {
         std::env::var("GITHUB_TOKEN").ok().map(Self::new)
     }
 
-    fn base_url() -> &'static str {
-        "https://api.githubcopilot.com"
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn block_has_image(block: &ContentBlock) -> bool {
@@ -195,7 +225,10 @@ impl CopilotProvider {
         };
 
         let major: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        major.parse::<u32>().map(|value| value >= 5).unwrap_or(false)
+        major
+            .parse::<u32>()
+            .map(|value| value >= 5)
+            .unwrap_or(false)
     }
 
     /// Check whether a provider error indicates the model/endpoint is
@@ -205,7 +238,10 @@ impl CopilotProvider {
             err,
             ProviderError::InvalidRequest { .. }
                 | ProviderError::ModelNotFound { .. }
-                | ProviderError::Other { status: Some(400..=499), .. }
+                | ProviderError::Other {
+                    status: Some(400..=499),
+                    ..
+                }
         )
     }
 
@@ -279,6 +315,13 @@ impl CopilotProvider {
         Self::to_responses_input(request)
     }
 
+    /// Translate only conversation messages for Responses adapters that carry
+    /// the system prompt in the top-level `instructions` field. This also lets
+    /// a validated response continuation serialize only its appended suffix.
+    pub fn to_responses_messages_pub(messages: &[Message]) -> Vec<Value> {
+        Self::messages_to_responses_input(messages)
+    }
+
     /// Public re-export of the Responses-API provider-option mapping
     /// (`reasoningEffort`/`reasoningSummary` -> `reasoning`, `textVerbosity` ->
     /// `text.verbosity`, `include`) so `CodexProvider` applies reasoning effort
@@ -300,7 +343,13 @@ impl CopilotProvider {
             }));
         }
 
-        for message in &request.messages {
+        input.extend(Self::messages_to_responses_input(&request.messages));
+        input
+    }
+
+    fn messages_to_responses_input(messages: &[Message]) -> Vec<Value> {
+        let mut input = Vec::new();
+        for message in messages {
             match &message.content {
                 MessageContent::Text(text) => {
                     let role = match &message.role {
@@ -323,14 +372,15 @@ impl CopilotProvider {
                 MessageContent::Blocks(blocks) => match &message.role {
                     Role::User => {
                         let mut message_parts = Vec::new();
-                        let flush_user_content = |input: &mut Vec<Value>, content: &mut Vec<Value>| {
-                            if !content.is_empty() {
-                                input.push(json!({
-                                    "role": "user",
-                                    "content": std::mem::take(content),
-                                }));
-                            }
-                        };
+                        let flush_user_content =
+                            |input: &mut Vec<Value>, content: &mut Vec<Value>| {
+                                if !content.is_empty() {
+                                    input.push(json!({
+                                        "role": "user",
+                                        "content": std::mem::take(content),
+                                    }));
+                                }
+                            };
                         for (index, block) in blocks.iter().enumerate() {
                             if let Some(part) = Self::user_block_to_responses_part(block, index) {
                                 message_parts.push(part);
@@ -456,17 +506,94 @@ impl CopilotProvider {
     /// unreachable or returns empty data.
     fn hardcoded_models(provider_id: &ProviderId) -> Vec<ModelInfo> {
         vec![
-            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384, ..Default::default() },
-            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
-            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
-            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
-            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000, ..Default::default() },
+            ModelInfo {
+                id: ModelId::new("claude-sonnet-4.6"),
+                provider_id: provider_id.clone(),
+                name: "Claude Sonnet 4.6 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("claude-sonnet-4.5"),
+                provider_id: provider_id.clone(),
+                name: "Claude Sonnet 4.5 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("claude-haiku-4.5"),
+                provider_id: provider_id.clone(),
+                name: "Claude Haiku 4.5 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4.1"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4.1 (Copilot)".into(),
+                context_window: 64_000,
+                max_output_tokens: 16_384,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4o"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4o (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4o-mini"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4o Mini (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-5.4"),
+                provider_id: provider_id.clone(),
+                name: "GPT-5.4 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 128_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-5-mini"),
+                provider_id: provider_id.clone(),
+                name: "GPT-5 Mini (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 128_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("o3-mini"),
+                provider_id: provider_id.clone(),
+                name: "o3-mini (Copilot)".into(),
+                context_window: 200_000,
+                max_output_tokens: 100_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("o4-mini"),
+                provider_id: provider_id.clone(),
+                name: "o4-mini (Copilot)".into(),
+                context_window: 200_000,
+                max_output_tokens: 100_000,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gemini-3-flash-preview"),
+                provider_id: provider_id.clone(),
+                name: "Gemini 3 Flash (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 64_000,
+                ..Default::default()
+            },
         ]
     }
 
@@ -504,7 +631,9 @@ impl CopilotProvider {
                         for part in parts {
                             match part.get("type").and_then(|value| value.as_str()) {
                                 Some("output_text") | Some("text") => {
-                                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                                    if let Some(text) =
+                                        part.get("text").and_then(|value| value.as_str())
+                                    {
                                         if !text.is_empty() {
                                             content.push(ContentBlock::Text {
                                                 text: text.to_string(),
@@ -611,16 +740,19 @@ impl CopilotProvider {
         }
         Self::apply_responses_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/responses", Self::base_url());
+        let url = format!("{}/responses", self.base_url());
         let builder = self
             .http_client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
         let builder = self.copilot_request_headers(builder, request);
+        let prepared = prepare_provider_json("copilot", &url, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = builder
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -754,16 +886,19 @@ impl CopilotProvider {
         }
         Self::apply_chat_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/chat/completions", Self::base_url());
+        let url = format!("{}/chat/completions", self.base_url());
 
         let builder = self
             .http_client
             .post(&url)
             .header("Content-Type", "application/json");
         let builder = self.copilot_request_headers(builder, request);
+        let prepared = prepare_provider_json("copilot", &url, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = builder
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -798,7 +933,7 @@ impl CopilotProvider {
     async fn do_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, AdmissionLease), ProviderError> {
         let messages = OpenAiProvider::to_openai_messages_pub(
             &request.messages,
             request.system_prompt.as_ref(),
@@ -827,7 +962,7 @@ impl CopilotProvider {
         }
         Self::apply_chat_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/chat/completions", Self::base_url());
+        let url = format!("{}/chat/completions", self.base_url());
 
         let builder = self
             .http_client
@@ -835,9 +970,12 @@ impl CopilotProvider {
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
         let builder = self.copilot_request_headers(builder, request);
+        let prepared = prepare_provider_json("copilot", &url, true, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let admission = self.acquire_inference().await?;
         let resp = builder
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -853,7 +991,7 @@ impl CopilotProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        Ok(resp)
+        Ok((resp, admission))
     }
 }
 
@@ -875,13 +1013,18 @@ impl LlmProvider for CopilotProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         if Self::use_responses_api(&request.model) {
             match self.send_responses_non_streaming(&request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) if Self::is_responses_api_fallback_candidate(&e) => {
                     // Responses API rejected the model — fall back to Chat Completions.
                     // Some OAuth apps / Copilot plans only expose models via /chat/completions.
-                    debug!(model = %request.model, error = %e, "Responses API rejected, falling back to Chat Completions");
+                    debug!(
+                        error_kind = e.diagnostic_kind(),
+                        status = ?e.diagnostic_status(),
+                        "Responses API rejected, falling back to Chat Completions"
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -894,17 +1037,22 @@ impl LlmProvider for CopilotProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         if Self::use_responses_api(&request.model) {
             match self.send_responses_non_streaming(&request).await {
                 Ok(response) => return Ok(self.stream_synthetic_response(response)),
                 Err(e) if Self::is_responses_api_fallback_candidate(&e) => {
-                    debug!(model = %request.model, error = %e, "Responses API rejected, falling back to Chat Completions");
+                    debug!(
+                        error_kind = e.diagnostic_kind(),
+                        status = ?e.diagnostic_status(),
+                        "Responses API rejected, falling back to Chat Completions"
+                    );
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        let resp = self.do_streaming(&request).await?;
+        let (resp, admission) = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
         // TODO(#228): Copilot speaks the OpenAI-Chat wire format and could reuse
@@ -962,7 +1110,7 @@ impl LlmProvider for CopilotProvider {
                     let chunk_json: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
-                            debug!("Failed to parse Copilot SSE chunk: {}: {}", e, data);
+                            debug!(error_kind = ?e.classify(), "Copilot SSE: invalid JSON event");
                             continue;
                         }
                     };
@@ -1115,14 +1263,15 @@ impl LlmProvider for CopilotProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Try to fetch the live model list from the Copilot API.
-        let url = format!("{}/models", Self::base_url());
+        let url = format!("{}/models", self.base_url());
         let builder = self.http_client.get(&url);
-        let builder = self.copilot_headers(builder)
+        let builder = self
+            .copilot_headers(builder)
             .header("Accept", "application/json");
 
         let resp = builder.send().await;
@@ -1135,12 +1284,13 @@ impl LlmProvider for CopilotProvider {
                     status: None,
                     body: None,
                 })?;
-                let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                    provider: self.id.clone(),
-                    message: format!("Failed to parse models JSON: {}", e),
-                    status: None,
-                    body: Some(text.clone()),
-                })?;
+                let json: Value =
+                    serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("Failed to parse models JSON: {}", e),
+                        status: None,
+                        body: Some(text.clone()),
+                    })?;
 
                 let mut models = Vec::new();
 
@@ -1153,10 +1303,7 @@ impl LlmProvider for CopilotProvider {
 
                 if let Some(arr) = items {
                     for item in arr {
-                        if item
-                            .get("model_picker_enabled")
-                            .and_then(|v| v.as_bool())
-                            == Some(false)
+                        if item.get("model_picker_enabled").and_then(|v| v.as_bool()) == Some(false)
                         {
                             continue;
                         }
@@ -1177,19 +1324,29 @@ impl LlmProvider for CopilotProvider {
                             }
                         }
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                            let name = item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(id);
+                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or(id);
                             let ctx = item
                                 .get("context_window")
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_context_window_tokens"))))
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_prompt_tokens"))))
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits")
+                                            .and_then(|l| l.get("max_context_window_tokens"))
+                                    })
+                                })
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits").and_then(|l| l.get("max_prompt_tokens"))
+                                    })
+                                })
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(128_000) as u32;
                             let max_out = item
                                 .get("max_output_tokens")
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_output_tokens"))))
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits").and_then(|l| l.get("max_output_tokens"))
+                                    })
+                                })
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(16_384) as u32;
                             models.push(ModelInfo {
@@ -1219,7 +1376,7 @@ impl LlmProvider for CopilotProvider {
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
-        let url = format!("{}/models", Self::base_url());
+        let url = format!("{}/models", self.base_url());
         let builder = self.http_client.get(&url);
         let builder = self.copilot_headers(builder);
 
@@ -1245,7 +1402,7 @@ impl LlmProvider for CopilotProvider {
             streaming: true,
             tool_calling: true,
             thinking: false,
-            image_input: true,
+            image_input: false,
             pdf_input: false,
             audio_input: false,
             video_input: false,

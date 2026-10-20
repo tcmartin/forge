@@ -7,6 +7,7 @@
 // streaming JSON objects back into StreamEvents.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -16,12 +17,14 @@ use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamEvent, SystemPromptStyle,
 };
+use crate::provider_wire::prepare_provider_json;
 
 // Re-use OpenAI message transformation helpers since Cohere v2 uses the same
 // messages array shape (role/content/tool_calls/tool_call_id).
@@ -35,7 +38,9 @@ use super::request_options::merge_root_options;
 pub struct CohereProvider {
     id: ProviderId,
     api_key: String,
+    base_url: String,
     http_client: reqwest::Client,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl CohereProvider {
@@ -49,8 +54,32 @@ impl CohereProvider {
         Self {
             id: ProviderId::new(ProviderId::COHERE),
             api_key,
+            base_url: "https://api.cohere.ai/v2".to_string(),
             http_client,
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    /// Override the Cohere-compatible API root.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     /// Construct from the `COHERE_API_KEY` environment variable.
@@ -70,10 +99,7 @@ impl CohereProvider {
     /// Cohere v2 uses the same shape as OpenAI Chat Completions, so we reuse
     /// the OpenAI transformation helper.
     fn build_messages(&self, request: &ProviderRequest) -> Vec<Value> {
-        OpenAiProvider::to_openai_messages_pub(
-            &request.messages,
-            request.system_prompt.as_ref(),
-        )
+        OpenAiProvider::to_openai_messages_pub(&request.messages, request.system_prompt.as_ref())
     }
 
     /// Build the Cohere v2 tools array.  Same shape as OpenAI function tools.
@@ -86,7 +112,11 @@ impl CohereProvider {
         // Cohere error format: {"message": "..."}
         let message = serde_json::from_str::<Value>(body)
             .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| body.to_string());
 
         match status {
@@ -147,13 +177,17 @@ impl CohereProvider {
             body["stop_sequences"] = json!(request.stop_sequences);
         }
         merge_root_options(&mut body, &request.provider_options);
+        let url = format!("{}/chat", self.base_url);
+        let prepared = prepare_provider_json("cohere", &url, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = self
             .http_client
-            .post("https://api.cohere.ai/v2/chat")
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -207,7 +241,9 @@ impl CohereProvider {
                 for item in content_arr {
                     if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            content_blocks.push(ContentBlock::Text { text: text.to_string() });
+                            content_blocks.push(ContentBlock::Text {
+                                text: text.to_string(),
+                            });
                         }
                     }
                 }
@@ -216,7 +252,11 @@ impl CohereProvider {
             // Tool calls
             if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tool_calls {
-                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let name = tc
                         .get("function")
                         .and_then(|f| f.get("name"))
@@ -241,7 +281,9 @@ impl CohereProvider {
         }
 
         if content_blocks.is_empty() {
-            content_blocks.push(ContentBlock::Text { text: String::new() });
+            content_blocks.push(ContentBlock::Text {
+                text: String::new(),
+            });
         }
 
         Ok(ProviderResponse {
@@ -260,7 +302,7 @@ impl CohereProvider {
     async fn do_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, AdmissionLease), ProviderError> {
         let messages = self.build_messages(request);
         let tools = self.build_tools(request);
 
@@ -284,13 +326,17 @@ impl CohereProvider {
             body["stop_sequences"] = json!(request.stop_sequences);
         }
         merge_root_options(&mut body, &request.provider_options);
+        let url = format!("{}/chat", self.base_url);
+        let prepared = prepare_provider_json("cohere", &url, true, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let admission = self.acquire_inference().await?;
         let resp = self
             .http_client
-            .post("https://api.cohere.ai/v2/chat")
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -306,7 +352,7 @@ impl CohereProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        Ok(resp)
+        Ok((resp, admission))
     }
 }
 
@@ -321,9 +367,7 @@ fn map_finish_reason(reason: &str) -> StopReason {
         "MAX_TOKENS" => StopReason::MaxTokens,
         "STOP_SEQUENCE" => StopReason::StopSequence,
         "TOOL_CALL" => StopReason::ToolUse,
-        "ERROR" | "ERROR_TOXIC" | "USER_CANCEL" => {
-            StopReason::Other(reason.to_string())
-        }
+        "ERROR" | "ERROR_TOXIC" | "USER_CANCEL" => StopReason::Other(reason.to_string()),
         other => StopReason::Other(other.to_string()),
     }
 }
@@ -379,6 +423,7 @@ impl LlmProvider for CohereProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         self.create_message_non_streaming(&request).await
     }
 
@@ -387,7 +432,8 @@ impl LlmProvider for CohereProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.do_streaming(&request).await?;
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let (resp, admission) = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
         let model_name = request.model.clone();
 
@@ -443,7 +489,7 @@ impl LlmProvider for CohereProvider {
                     let event: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
-                            debug!("Failed to parse Cohere stream chunk: {}: {}", e, data);
+                            debug!(error_kind = ?e.classify(), "Cohere stream: invalid JSON event");
                             continue;
                         }
                     };
@@ -635,8 +681,8 @@ impl LlmProvider for CohereProvider {
                             return;
                         }
 
-                        other => {
-                            debug!("Unhandled Cohere stream event type: {}", other);
+                        _ => {
+                            debug!("Cohere stream: unhandled event type");
                         }
                     }
                 }
@@ -647,7 +693,7 @@ impl LlmProvider for CohereProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -658,9 +704,10 @@ impl LlmProvider for CohereProvider {
         }
 
         // Lightweight check: list models endpoint.
+        let url = format!("{}/models", self.base_url);
         let resp = self
             .http_client
-            .get("https://api.cohere.ai/v2/models")
+            .get(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await;

@@ -5,7 +5,7 @@
 // fails after some files have already been written, the tool attempts to
 // restore those files from in-memory backups.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{ChildWriterCapability, PermissionLevel, Tool, ToolContext, ToolEffect, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -31,7 +31,9 @@ struct BatchEditInput {
 #[async_trait]
 impl Tool for BatchEditTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_BATCH_EDIT
@@ -46,6 +48,14 @@ impl Tool for BatchEditTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Write
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutation
+    }
+
+    fn child_writer_capability(&self) -> ChildWriterCapability {
+        ChildWriterCapability::ScopedFilesystem
     }
 
     fn input_schema(&self) -> Value {
@@ -226,9 +236,11 @@ impl Tool for BatchEditTool {
                     // rollback in reverse order to preserve original file state
                     for (rb_path, rb_original, rb_new_content) in unique_writings[0..i].iter().rev()
                     {
-                        if let Err(re) =
-                            crate::write_atomic(std::path::Path::new(rb_path), rb_original.as_bytes())
-                                .await
+                        if let Err(re) = crate::write_atomic(
+                            std::path::Path::new(rb_path),
+                            rb_original.as_bytes(),
+                        )
+                        .await
                         {
                             rollback_errors.push(format!("  rollback {}: {}", rb_path, re));
                         } else {

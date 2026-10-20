@@ -71,6 +71,15 @@ impl SseByteDecoder {
         lines
     }
 
+    /// Number of raw bytes retained for an unterminated line.
+    ///
+    /// Provider loops use this to enforce their wire-specific line limits
+    /// before accepting another network chunk. The decoder itself stays
+    /// policy-free because providers have different framing contracts.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Return any bytes buffered but not yet terminated by a `\n`, decoding
     /// them lossily and clearing the buffer.
     ///
@@ -97,6 +106,9 @@ impl SseByteDecoder {
 /// Each provider adapter provides its own `StreamParser` implementation that
 /// knows how to decode the wire format (SSE, JSON Lines, etc.) used by that
 /// provider.
+// async-trait emits a bare `#[must_use]` on its boxed futures;
+// Rust 1.99 Clippy sees the boxed future's own marker and reports a duplicate.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait StreamParser: Send + Sync {
     /// Consume a `reqwest::Response` and produce a pinned stream of
@@ -107,10 +119,7 @@ pub trait StreamParser: Send + Sync {
     async fn parse(
         &self,
         response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,10 +148,8 @@ impl StreamParser for SseStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),
@@ -179,10 +186,8 @@ impl StreamParser for JsonLinesStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),
@@ -216,9 +221,12 @@ mod tests {
     fn partial_line_is_buffered_until_newline() {
         let mut d = SseByteDecoder::new();
         assert!(d.push(b"data: hel").is_empty());
+        assert_eq!(d.buffered_len(), 9);
         assert!(d.push(b"lo wor").is_empty());
+        assert_eq!(d.buffered_len(), 15);
         let lines = d.push(b"ld\n");
         assert_eq!(lines, vec!["data: hello world"]);
+        assert_eq!(d.buffered_len(), 0);
     }
 
     /// A multibyte emoji split across two chunks decodes intact (the core #228
@@ -280,7 +288,10 @@ mod tests {
                 serde_json::from_str(data).expect("valid JSON regardless of split point");
             assert_eq!(v["arguments"]["q"], "café ☕");
         }
-        assert_eq!(assembled, vec!["data: {\"name\":\"search\",\"arguments\":{\"q\":\"café ☕\"}}"]);
+        assert_eq!(
+            assembled,
+            vec!["data: {\"name\":\"search\",\"arguments\":{\"q\":\"café ☕\"}}"]
+        );
     }
 
     /// Multiple complete lines that arrive together are all returned; the split

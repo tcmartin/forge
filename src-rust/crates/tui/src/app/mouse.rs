@@ -1,10 +1,10 @@
 //! Pointer input: mouse events, selection, context menu, paste viewer.
 
+use super::types::{ContextMenuItem, ContextMenuKind, ContextMenuState, FocusTarget};
+use super::App;
 use crate::notifications::NotificationKind;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use tracing::debug;
-use super::App;
-use super::types::{ContextMenuKind, ContextMenuItem, ContextMenuState, FocusTarget};
 
 impl App {
     /// Detect if a click is a double-click based on timing and position.
@@ -15,7 +15,8 @@ impl App {
             (Some(last_time), Some(last_pos)) => {
                 let elapsed = now.duration_since(last_time);
                 let distance = ((current_pos.0 as i32 - last_pos.0 as i32).abs()
-                    + (current_pos.1 as i32 - last_pos.1 as i32).abs()) as u16;
+                    + (current_pos.1 as i32 - last_pos.1 as i32).abs())
+                    as u16;
                 elapsed.as_millis() < 500 && distance <= 5
             }
             _ => false,
@@ -52,7 +53,10 @@ impl App {
         while end + 1 < chars.len() && is_word(chars[end + 1]) {
             end += 1;
         }
-        Some((selectable_area.x + start as u16, selectable_area.x + end as u16))
+        Some((
+            selectable_area.x + start as u16,
+            selectable_area.x + end as u16,
+        ))
     }
 
     /// Find paragraph boundaries (run of non-blank rows) around `row` and
@@ -77,7 +81,11 @@ impl App {
         let mut start = row;
         while start > selectable_area.y {
             let prev = start - 1;
-            if cache.get(&prev).map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if cache
+                .get(&prev)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 break;
             }
             start = prev;
@@ -85,7 +93,11 @@ impl App {
         let mut end = row;
         while end < max_row {
             let next = end + 1;
-            if cache.get(&next).map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if cache
+                .get(&next)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 break;
             }
             end = next;
@@ -102,7 +114,10 @@ impl App {
     fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
         let selectable_area = self.last_selectable_area.get();
         let line_start = selectable_area.y;
-        let line_end = selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1);
+        let line_end = selectable_area
+            .y
+            .saturating_add(selectable_area.height)
+            .saturating_sub(1);
 
         if row >= line_start && row <= line_end {
             Some((row, row))
@@ -182,7 +197,11 @@ impl App {
     }
 
     /// Handle a context menu action.
-    pub(super) fn handle_context_menu_action(&mut self, item: ContextMenuItem, kind: ContextMenuKind) {
+    pub(super) fn handle_context_menu_action(
+        &mut self,
+        item: ContextMenuItem,
+        kind: ContextMenuKind,
+    ) {
         match item {
             ContextMenuItem::Copy => {
                 let text = match kind {
@@ -220,9 +239,12 @@ impl App {
             ContextMenuItem::Fork => {
                 if let ContextMenuKind::Message { message_index } = kind {
                     let branch_point = message_index + 1;
-                    self.prompt_input.replace_text(format!("/fork {}", branch_point));
-                    self.status_message =
-                        Some(format!("Fork at message {} - press Enter to confirm", branch_point));
+                    self.prompt_input
+                        .replace_text(format!("/fork {}", branch_point));
+                    self.status_message = Some(format!(
+                        "Fork at message {} - press Enter to confirm",
+                        branch_point
+                    ));
                 }
             }
         }
@@ -275,7 +297,8 @@ impl App {
         }
         let target_row = scroll + (row - text_start_y) as usize;
         let target_col = col.saturating_sub(rect.x + 2) as usize;
-        self.prompt_input.set_cursor_at_visual(target_row, target_col, width);
+        self.prompt_input
+            .set_cursor_at_visual(target_row, target_col, width);
         // Clicking a [Pasted text #N ...] placeholder opens the read-only
         // viewer so the body can be read without splicing it into the
         // prompt; Alt+E remains the in-place expansion for editing.
@@ -350,15 +373,29 @@ impl App {
         if matches!(mouse_event.kind, MouseEventKind::Moved) {
             if let Some(menu) = self.context_menu_state.as_mut() {
                 let items = Self::context_menu_items(menu.kind);
-                let item_labels: Vec<&str> = items.iter().map(|i| match i {
-                    ContextMenuItem::Copy => "Copy",
-                    ContextMenuItem::Fork => "Fork new chat",
-                }).collect();
-                let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                let item_labels: Vec<&str> = items
+                    .iter()
+                    .map(|i| match i {
+                        ContextMenuItem::Copy => "Copy",
+                        ContextMenuItem::Fork => "Fork new chat",
+                    })
+                    .collect();
+                let menu_width =
+                    (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
                 let menu_height = items.len() as u16 + 2;
                 let screen = self.last_msg_area.get();
-                let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
-                let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                let menu_x = menu.x.min(
+                    screen
+                        .x
+                        .saturating_add(screen.width)
+                        .saturating_sub(menu_width + 1),
+                );
+                let menu_y = menu.y.min(
+                    screen
+                        .y
+                        .saturating_add(screen.height)
+                        .saturating_sub(menu_height + 1),
+                );
                 let inner_y = menu_y + 1;
                 let col = mouse_event.column;
                 let row = mouse_event.row;
@@ -395,11 +432,14 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
-                        self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                        self.connect_dialog
+                            .contains(mouse_event.column, mouse_event.row)
                     } else if self.import_config_picker.visible {
-                        self.import_config_picker.contains(mouse_event.column, mouse_event.row)
+                        self.import_config_picker
+                            .contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
-                        self.command_palette.contains(mouse_event.column, mouse_event.row)
+                        self.command_palette
+                            .contains(mouse_event.column, mouse_event.row)
                     } else {
                         // Other dialogs (model_picker, settings, export, etc.) —
                         // treat any click as "inside" to prevent accidental dismiss.
@@ -412,7 +452,8 @@ impl App {
                         if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
                         } else if self.import_config_picker.visible {
-                            self.import_config_picker.handle_mouse_click(mouse_event.row);
+                            self.import_config_picker
+                                .handle_mouse_click(mouse_event.row);
                         } else if self.command_palette.visible {
                             self.command_palette.handle_mouse_click(mouse_event.row);
                         }
@@ -425,14 +466,22 @@ impl App {
                 }
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
-                    if self.connect_dialog.visible { self.connect_dialog.move_up(); }
-                    else if self.import_config_picker.visible { self.import_config_picker.move_up(); }
-                    else if self.command_palette.visible { self.command_palette.move_up(); }
+                    if self.connect_dialog.visible {
+                        self.connect_dialog.move_up();
+                    } else if self.import_config_picker.visible {
+                        self.import_config_picker.move_up();
+                    } else if self.command_palette.visible {
+                        self.command_palette.move_up();
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.connect_dialog.visible { self.connect_dialog.move_down(); }
-                    else if self.import_config_picker.visible { self.import_config_picker.move_down(); }
-                    else if self.command_palette.visible { self.command_palette.move_down(); }
+                    if self.connect_dialog.visible {
+                        self.connect_dialog.move_down();
+                    } else if self.import_config_picker.visible {
+                        self.import_config_picker.move_down();
+                    } else if self.command_palette.visible {
+                        self.command_palette.move_down();
+                    }
                 }
                 _ => {}
             }
@@ -498,16 +547,30 @@ impl App {
                 // Must replicate the same position clamping as the renderer.
                 if let Some(menu) = self.context_menu_state {
                     let items = Self::context_menu_items(menu.kind);
-                    let item_labels: Vec<&str> = items.iter().map(|i| match i {
-                        ContextMenuItem::Copy => "Copy",
-                        ContextMenuItem::Fork => "Fork new chat",
-                    }).collect();
-                    let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                    let item_labels: Vec<&str> = items
+                        .iter()
+                        .map(|i| match i {
+                            ContextMenuItem::Copy => "Copy",
+                            ContextMenuItem::Fork => "Fork new chat",
+                        })
+                        .collect();
+                    let menu_width =
+                        (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
                     let menu_height = items.len() as u16 + 2; // +2 for border
-                    // Clamp to screen bounds (same as render_context_menu)
+                                                              // Clamp to screen bounds (same as render_context_menu)
                     let screen = self.last_msg_area.get();
-                    let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
-                    let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                    let menu_x = menu.x.min(
+                        screen
+                            .x
+                            .saturating_add(screen.width)
+                            .saturating_sub(menu_width + 1),
+                    );
+                    let menu_y = menu.y.min(
+                        screen
+                            .y
+                            .saturating_add(screen.height)
+                            .saturating_sub(menu_height + 1),
+                    );
                     let col = mouse_event.column;
                     let row = mouse_event.row;
                     // Inner area starts 1 past the border
@@ -519,7 +582,8 @@ impl App {
                     {
                         let clicked_index = (row - inner_y) as usize;
                         if clicked_index < items.len() {
-                            self.context_menu_state.as_mut().unwrap().selected_index = clicked_index;
+                            self.context_menu_state.as_mut().unwrap().selected_index =
+                                clicked_index;
                             self.execute_context_menu_item();
                             return;
                         }
@@ -532,13 +596,15 @@ impl App {
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
-                let in_input = input_area.width > 0 && input_area.height > 0
+                let in_input = input_area.width > 0
+                    && input_area.height > 0
                     && mouse_event.row >= input_area.y
                     && mouse_event.row < input_area.y.saturating_add(input_area.height)
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
+                let in_selectable = selectable_area.width > 0
+                    && selectable_area.height > 0
                     && mouse_event.row >= selectable_area.y
                     && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
                     && mouse_event.column >= selectable_area.x
@@ -592,7 +658,9 @@ impl App {
                             self.click_count = 0; // Reset for next click sequence
                         } else {
                             // Double-click: select word
-                            if let Some((start, end)) = self.find_word_boundaries(current_pos.0, current_pos.1) {
+                            if let Some((start, end)) =
+                                self.find_word_boundaries(current_pos.0, current_pos.1)
+                            {
                                 self.selection_anchor = Some((start, current_pos.1));
                                 self.selection_focus = Some((end, current_pos.1));
                             }
@@ -621,12 +689,18 @@ impl App {
                 if self.selection_anchor.is_some() {
                     let selectable_area = self.last_selectable_area.get();
                     if selectable_area.width > 0 && selectable_area.height > 0 {
-                        let clamped_col = mouse_event.column
-                            .max(selectable_area.x)
-                            .min(selectable_area.x.saturating_add(selectable_area.width).saturating_sub(1));
-                        let clamped_row = mouse_event.row
-                            .max(selectable_area.y)
-                            .min(selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1));
+                        let clamped_col = mouse_event.column.max(selectable_area.x).min(
+                            selectable_area
+                                .x
+                                .saturating_add(selectable_area.width)
+                                .saturating_sub(1),
+                        );
+                        let clamped_row = mouse_event.row.max(selectable_area.y).min(
+                            selectable_area
+                                .y
+                                .saturating_add(selectable_area.height)
+                                .saturating_sub(1),
+                        );
                         self.selection_focus = Some((clamped_col, clamped_row));
                         self.click_count = 0; // Reset on drag to prevent further double-clicks
                     }
@@ -654,5 +728,4 @@ impl App {
             _ => {}
         }
     }
-
 }

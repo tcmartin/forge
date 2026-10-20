@@ -11,24 +11,42 @@ pub struct ReviewCommand;
 
 #[async_trait]
 impl SlashCommand for ReviewCommand {
-    fn name(&self) -> &str { "review" }
-    fn description(&self) -> &str { "Review code changes via LLM and optionally post to GitHub PR" }
+    fn name(&self) -> &str {
+        "review"
+    }
+    fn description(&self) -> &str {
+        "Review code changes via LLM and optionally post to GitHub PR"
+    }
     fn help(&self) -> &str {
-        "Usage: /review [base-ref]\n\n\
+        "Usage: /review [base-ref] [--post]\n\n\
          Runs `git diff <base>...HEAD` (or `git diff --cached` when no base is given),\n\
          sends the diff to the LLM for a structured review, then optionally posts the\n\
-         review as a comment to the associated GitHub PR.\n\n\
-         GitHub posting requires:\n\
+         review as a comment to the associated GitHub PR when --post is given.\n\n\
+         Explicit --post requires:\n\
            GITHUB_TOKEN  — a personal access token with repo scope\n\
            CLAUDE_PR_NUMBER — the PR number (auto-detected from `git remote` if absent)\n\n\
          Examples:\n\
            /review            # diff of staged changes\n\
            /review main       # diff from main..HEAD\n\
-           /review origin/main"
+           /review origin/main\n\
+           /review main --post # publish the generated review to GitHub"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let base = args.trim();
+        let options = match ReviewOptions::parse(args) {
+            Ok(options) => options,
+            Err(error) => return CommandResult::Error(error),
+        };
+        let token = if options.post {
+            std::env::var("GITHUB_TOKEN").ok()
+        } else {
+            None
+        };
+        let github_token = match options.posting_token(token.as_deref()) {
+            Ok(token) => token.map(str::to_owned),
+            Err(error) => return CommandResult::Error(error),
+        };
+        let base = options.base.as_deref().unwrap_or("");
 
         // ------------------------------------------------------------------
         // 1. Collect the diff
@@ -56,10 +74,7 @@ impl SlashCommand for ReviewCommand {
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    return CommandResult::Error(format!(
-                        "git diff failed: {}",
-                        stderr.trim()
-                    ));
+                    return CommandResult::Error(format!("git diff failed: {}", stderr.trim()));
                 }
                 Err(e) => return CommandResult::Error(format!("Failed to run git: {}", e)),
             }
@@ -99,17 +114,8 @@ impl SlashCommand for ReviewCommand {
             )
         };
 
-        // Truncate diff to a sensible size for the LLM (≈ 100 k chars).
-        const MAX_DIFF_CHARS: usize = 100_000;
-        let diff_for_llm = if diff.len() > MAX_DIFF_CHARS {
-            format!(
-                "{}\n\n[... diff truncated at {} chars ...]",
-                &diff[..MAX_DIFF_CHARS],
-                MAX_DIFF_CHARS
-            )
-        } else {
-            diff.clone()
-        };
+        const MAX_DIFF_BYTES: usize = 100_000;
+        let diff_for_llm = review_diff_preview(&diff, MAX_DIFF_BYTES);
 
         // ------------------------------------------------------------------
         // 3. Call the LLM for a structured PR review
@@ -145,7 +151,17 @@ impl SlashCommand for ReviewCommand {
             file_summary, diff_for_llm
         );
 
+        let wire_budget =
+            match request_budget::command_wire_budget(&ctx.config, provider.id(), &model, 4096) {
+                Ok(budget) => budget,
+                Err(error) => {
+                    return CommandResult::Error(format!("Invalid review context budget: {error}"))
+                }
+            };
+        let budget_notice = request_budget::fallback_notice(&wire_budget);
+
         let request = claurst_api::ProviderRequest {
+            wire_budget: Some(wire_budget),
             model,
             messages: vec![Message::user(review_prompt)],
             system_prompt: Some(claurst_api::SystemPrompt::Text(
@@ -161,6 +177,9 @@ impl SlashCommand for ReviewCommand {
             stop_sequences: vec![],
             thinking: None,
             provider_options: serde_json::Value::Object(Default::default()),
+            cache_scope: None,
+            response_continuation: None,
+            dispatch: None,
         };
 
         let review_text = match provider.create_message(request).await {
@@ -179,7 +198,6 @@ impl SlashCommand for ReviewCommand {
         // ------------------------------------------------------------------
         // 4. Optionally post to GitHub PR
         // ------------------------------------------------------------------
-        let github_token = std::env::var("GITHUB_TOKEN").ok();
         let mut github_post_result: Option<String> = None;
 
         if let Some(ref token) = github_token {
@@ -192,10 +210,7 @@ impl SlashCommand for ReviewCommand {
             if let Some(pr_num) = pr_number {
                 // Determine owner/repo from git remote
                 if let Some((owner, repo)) = detect_github_owner_repo(&repo_root) {
-                    let comment_body = format!(
-                        "## Claurst Code Review\n\n{}\n\n---\n*Generated by [Claurst](https://claude.ai/claude-code)*",
-                        review_text
-                    );
+                    let comment_body = format!("## Forge Code Review\n\n{}", review_text);
 
                     let url = format!(
                         "https://api.github.com/repos/{}/{}/issues/{}/comments",
@@ -206,7 +221,7 @@ impl SlashCommand for ReviewCommand {
                     let post_result = http
                         .post(&url)
                         .header("Authorization", format!("Bearer {}", token))
-                        .header("User-Agent", "claurst/1.0")
+                        .header("User-Agent", "forge/1.0")
                         .header("Accept", "application/vnd.github+json")
                         .json(&serde_json::json!({ "body": comment_body }))
                         .send()
@@ -222,14 +237,11 @@ impl SlashCommand for ReviewCommand {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let body = resp.text().await.unwrap_or_default();
-                            github_post_result = Some(format!(
-                                "\nGitHub API returned {}: {}",
-                                status, body
-                            ));
+                            github_post_result =
+                                Some(format!("\nGitHub API returned {}: {}", status, body));
                         }
                         Err(e) => {
-                            github_post_result =
-                                Some(format!("\nFailed to post to GitHub: {}", e));
+                            github_post_result = Some(format!("\nFailed to post to GitHub: {}", e));
                         }
                     }
                 } else {
@@ -252,6 +264,10 @@ impl SlashCommand for ReviewCommand {
         // 5. Compose and return the final output
         // ------------------------------------------------------------------
         let mut output = format!("## Code Review\n\n{}\n\n{}", file_summary, review_text);
+
+        if let Some(note) = budget_notice {
+            output.push_str(&format!("\n\n{note}"));
+        }
 
         if let Some(ref note) = github_post_result {
             output.push_str(note);
@@ -335,4 +351,105 @@ fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReviewOptions {
+    base: Option<String>,
+    post: bool,
+}
+
+impl ReviewOptions {
+    fn parse(args: &str) -> Result<Self, String> {
+        let mut options = Self::default();
+        for arg in args.split_whitespace() {
+            match arg {
+                "--post" if !options.post => options.post = true,
+                "--post" => return Err("Pass --post only once.".into()),
+                flag if flag.starts_with('-') => {
+                    return Err(format!(
+                        "Unknown review option: {flag}. Usage: /review [base-ref] [--post]"
+                    ))
+                }
+                base if options.base.is_none() => options.base = Some(base.to_owned()),
+                _ => {
+                    return Err(
+                        "Provide at most one review base ref. Usage: /review [base-ref] [--post]"
+                            .into(),
+                    )
+                }
+            }
+        }
+        Ok(options)
+    }
+
+    fn posting_token<'a>(&self, token: Option<&'a str>) -> Result<Option<&'a str>, String> {
+        if !self.post {
+            return Ok(None);
+        }
+        token
+            .filter(|token| !token.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| "Publishing with --post requires GITHUB_TOKEN.".into())
+    }
+}
+
+fn review_diff_preview(diff: &str, max_bytes: usize) -> String {
+    if diff.len() <= max_bytes {
+        return diff.to_string();
+    }
+    let mut end = max_bytes;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[... diff truncated at {} UTF-8 bytes ...]",
+        &diff[..end],
+        end
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_preview_keeps_unicode_boundary_and_truthful_byte_count() {
+        let diff = "ab雪after";
+        let preview = review_diff_preview(diff, 3);
+        assert_eq!(preview, "ab\n\n[... diff truncated at 2 UTF-8 bytes ...]");
+        assert_eq!(review_diff_preview("small", 100), "small");
+        assert_eq!(
+            review_diff_preview("雪", 0),
+            "\n\n[... diff truncated at 0 UTF-8 bytes ...]"
+        );
+    }
+
+    #[test]
+    fn publication_requires_explicit_post_even_with_credentials() {
+        let local = ReviewOptions::parse("main").unwrap();
+        assert_eq!(local.posting_token(Some("test-token")).unwrap(), None);
+        let post = ReviewOptions::parse("--post origin/main").unwrap();
+        assert_eq!(post.base.as_deref(), Some("origin/main"));
+        assert_eq!(
+            post.posting_token(Some("test-token")).unwrap(),
+            Some("test-token")
+        );
+        assert!(post.posting_token(None).is_err());
+        assert!(post.posting_token(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn invalid_review_arguments_fail_before_git_or_inference() {
+        for args in [
+            "--unknown",
+            "main other",
+            "--post --post",
+            "--post=true",
+            "-R",
+        ] {
+            assert!(ReviewOptions::parse(args).is_err(), "{args}");
+        }
+        assert_eq!(ReviewOptions::parse("").unwrap(), ReviewOptions::default());
+    }
 }

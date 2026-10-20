@@ -1,10 +1,12 @@
 /// Plugin hook execution — ported from `loadPluginHooks.ts`.
 ///
 /// Hooks let plugins run shell commands in response to lifecycle events.
-/// This module defines the data model and the synchronous dispatch helper.
+/// This module defines the data model and bounded asynchronous dispatch.
 use crate::manifest::{HookEventKind, PluginHookMatcher, PluginHooksConfig};
+use claurst_core::hooks::{HookCancellation, HookContext, HookEnvironment};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Registered hook set
@@ -82,7 +84,10 @@ pub fn parse_hooks_value(value: &serde_json::Value) -> Option<PluginHooksConfig>
             .and_then(|d| d.as_str())
             .map(String::from);
         let events = parse_hooks_events_map(inner)?;
-        return Some(PluginHooksConfig { description, events });
+        return Some(PluginHooksConfig {
+            description,
+            events,
+        });
     }
 
     // Fall back: the whole value is the events map.
@@ -153,76 +158,73 @@ pub enum HookOutcome {
 // Hook runner
 // ---------------------------------------------------------------------------
 
-/// Execute a single `RegisteredHook` by spawning its shell command.
-///
-/// `event_json` is the JSON payload that will be written to the child's stdin.
-///
-/// This is a synchronous wrapper around `std::process::Command`.  For
-/// real-world async usage the caller should spawn a blocking task.
-pub fn run_hook_sync(hook: &RegisteredHook, event_json: &str) -> HookOutcome {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = match Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-        .args(if cfg!(windows) {
-            vec!["/C", &hook.command]
-        } else {
-            vec!["-c", &hook.command]
-        })
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("CLAUDE_PLUGIN_ROOT", &hook.plugin_root)
-        .env("CLAUDE_PLUGIN_NAME", &hook.plugin_name)
-        .spawn()
+fn plugin_environment<'a>(
+    hook: &'a RegisteredHook,
+    additional: &'a [(&'a str, &'a str)],
+) -> Result<Vec<HookEnvironment<'a>>, String> {
+    let mut environment = Vec::with_capacity(additional.len() + 2);
+    for (name, value) in [
+        ("CLAUDE_PLUGIN_ROOT", hook.plugin_root.as_str()),
+        ("CLAUDE_PLUGIN_NAME", hook.plugin_name.as_str()),
+    ]
+    .into_iter()
+    .chain(additional.iter().copied())
     {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!(
-                "Plugin '{}' hook '{}' failed to start: {}",
-                hook.plugin_name, hook.command, e
-            );
-            tracing::warn!("{}", msg);
-            return HookOutcome::Error(msg);
-        }
-    };
-
-    // Write event JSON to stdin, ignoring errors (child may not read it).
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(event_json.as_bytes());
+        environment.push(HookEnvironment::new(name, value).map_err(|error| {
+            format!(
+                "Plugin '{}' hook environment rejected: {error}",
+                hook.plugin_name
+            )
+        })?);
     }
+    Ok(environment)
+}
 
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            let msg = format!(
-                "Plugin '{}' hook '{}' wait error: {}",
-                hook.plugin_name, hook.command, e
-            );
-            tracing::warn!("{}", msg);
-            return HookOutcome::Error(msg);
-        }
+async fn run_registered_hook_core<'a>(
+    hook: &RegisteredHook,
+    context: &HookContext,
+    working_dir: &Path,
+    cancel: &HookCancellation,
+    additional_environment: &'a [(&'a str, &'a str)],
+) -> Result<claurst_core::hooks::HookOutcome, String> {
+    let environment = plugin_environment(hook, additional_environment)?;
+    let entry = claurst_core::config::HookEntry {
+        command: hook.command.clone(),
+        tool_filter: hook.matcher.clone(),
+        blocking: hook.blocking,
     };
+    Ok(claurst_core::hooks::run_hook_with_environment(
+        &entry,
+        context,
+        working_dir,
+        cancel,
+        &environment,
+    )
+    .await)
+}
 
-    if output.status.success() {
-        HookOutcome::Allow
-    } else if hook.blocking {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let msg = format!(
-            "Plugin '{}' blocked operation (exit {}): {}",
-            hook.plugin_name,
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        );
-        tracing::info!("{}", msg);
-        HookOutcome::Deny(msg)
-    } else {
-        tracing::debug!(
-            "Plugin '{}' hook exited {} (non-blocking)",
-            hook.plugin_name,
-            output.status.code().unwrap_or(-1)
-        );
-        HookOutcome::Allow
+/// Execute one plugin hook through core's bounded async supervisor.
+pub async fn run_registered_hook(
+    hook: &RegisteredHook,
+    context: &HookContext,
+    working_dir: &Path,
+    cancel: &HookCancellation,
+    additional_environment: &[(&str, &str)],
+) -> HookOutcome {
+    match run_registered_hook_core(hook, context, working_dir, cancel, additional_environment).await
+    {
+        Err(reason) => HookOutcome::Error(reason),
+        Ok(claurst_core::hooks::HookOutcome::Allowed)
+        | Ok(claurst_core::hooks::HookOutcome::Modified(_)) => HookOutcome::Allow,
+        Ok(claurst_core::hooks::HookOutcome::Blocked(reason))
+        | Ok(claurst_core::hooks::HookOutcome::Vetoed(reason)) => HookOutcome::Deny(reason),
+        Ok(claurst_core::hooks::HookOutcome::Failed(reason)) => {
+            tracing::debug!(plugin = %hook.plugin_name, %reason, "non-blocking plugin hook failed");
+            HookOutcome::Allow
+        }
+        Ok(claurst_core::hooks::HookOutcome::SupervisionFailed(reason)) => {
+            HookOutcome::Error(reason)
+        }
     }
 }
 
@@ -238,13 +240,37 @@ pub fn event_key(kind: &HookEventKind) -> String {
 /// Dispatch PostToolUse hooks for a completed tool call.
 ///
 /// Mirrors the TS plugin hook dispatch path in src/plugins/hooks.ts.
-/// All matching hooks run concurrently; results are collected.
+/// All matching hooks run through the shared bounded supervisor; results are
+/// collected in registry order.
 /// Non-blocking: non-zero exit logs a warning but doesn't fail the tool call.
 pub async fn dispatch_post_tool_hooks(
     registry: &HookRegistry,
     tool_name: &str,
     tool_input_json: &str,
     tool_result_json: &str,
+) -> Vec<String> {
+    dispatch_post_tool_hooks_with_cancel(
+        registry,
+        tool_name,
+        tool_input_json,
+        tool_result_json,
+        false,
+        PathBuf::from("."),
+        HookCancellation::new(),
+    )
+    .await
+}
+
+/// Dispatch PostToolUse hooks through the bounded supervisor with the query's
+/// working directory and cancellation signal.
+pub async fn dispatch_post_tool_hooks_with_cancel(
+    registry: &HookRegistry,
+    tool_name: &str,
+    tool_input_json: &str,
+    tool_result_json: &str,
+    is_error: bool,
+    working_dir: PathBuf,
+    cancel: HookCancellation,
 ) -> Vec<String> {
     let event_name = event_key(&HookEventKind::PostToolUse);
 
@@ -264,63 +290,49 @@ pub async fn dispatch_post_tool_hooks(
         return Vec::new();
     }
 
-    let tool_name = tool_name.to_string();
-    let tool_input = tool_input_json.to_string();
-    let tool_result = tool_result_json.to_string();
-
-    let mut tasks = Vec::new();
-    for hook in matching_hooks {
-        let tn = tool_name.clone();
-        let ti = tool_input.clone();
-        let tr = tool_result.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            run_post_tool_hook(&hook.command, &tn, &ti, &tr)
-        });
-        tasks.push(task);
-    }
-
+    let context = HookContext {
+        event: "PostToolUse".to_string(),
+        tool_name: Some(tool_name.to_string()),
+        tool_input: serde_json::from_str(tool_input_json).ok(),
+        tool_output: Some(tool_result_json.to_string()),
+        is_error: Some(is_error),
+        session_id: None,
+    };
+    let additional_environment = [
+        ("CLAUDE_TOOL_NAME", tool_name),
+        ("CLAUDE_TOOL_INPUT", tool_input_json),
+        ("CLAUDE_TOOL_RESULT", tool_result_json),
+    ];
     let mut outputs = Vec::new();
-    for task in tasks {
-        if let Ok(Ok(output)) = task.await {
-            if !output.is_empty() {
-                outputs.push(output);
+    for hook in matching_hooks {
+        match run_registered_hook_core(
+            &hook,
+            &context,
+            &working_dir,
+            &cancel,
+            &additional_environment,
+        )
+        .await
+        {
+            Ok(claurst_core::hooks::HookOutcome::Modified(output)) if !output.trim().is_empty() => {
+                outputs.push(output.trim().to_string())
             }
+            Ok(claurst_core::hooks::HookOutcome::SupervisionFailed(reason)) => {
+                tracing::warn!(plugin = %hook.plugin_name, %reason, "PostToolUse hook supervision failed");
+            }
+            Err(reason) => {
+                tracing::warn!(plugin = %hook.plugin_name, %reason, "PostToolUse hook environment rejected");
+            }
+            Ok(claurst_core::hooks::HookOutcome::Blocked(reason))
+            | Ok(claurst_core::hooks::HookOutcome::Vetoed(reason))
+            | Ok(claurst_core::hooks::HookOutcome::Failed(reason)) => {
+                tracing::debug!(plugin = %hook.plugin_name, %reason, "PostToolUse hook returned non-success");
+            }
+            Ok(claurst_core::hooks::HookOutcome::Allowed)
+            | Ok(claurst_core::hooks::HookOutcome::Modified(_)) => {}
         }
     }
     outputs
-}
-
-/// Run a single PostToolUse hook command synchronously.
-fn run_post_tool_hook(
-    command: &str,
-    tool_name: &str,
-    tool_input_json: &str,
-    tool_result_json: &str,
-) -> Result<String, std::io::Error> {
-    let output = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-        .args(if cfg!(windows) {
-            vec!["/C", command]
-        } else {
-            vec!["-c", command]
-        })
-        .env("CLAUDE_TOOL_NAME", tool_name)
-        .env("CLAUDE_TOOL_INPUT", tool_input_json)
-        .env("CLAUDE_TOOL_RESULT", tool_result_json)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(
-            tool_name,
-            command,
-            exit_code = output.status.code().unwrap_or(-1),
-            stderr = %stderr,
-            "PostToolUse hook returned non-zero exit"
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(stdout.trim().to_string())
 }
 
 /// Simple glob pattern matching: `*` matches any sequence of chars.
@@ -369,5 +381,36 @@ mod tests {
         });
         let config = parse_hooks_value(&raw).unwrap();
         assert!(config.events.contains_key("Stop"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_post_runner_preserves_plugin_and_tool_environment() {
+        let mut registry = HookRegistry::new();
+        registry.insert(
+            HookEventKind::PostToolUse.to_string(),
+            vec![RegisteredHook {
+                command: "printf '%s|%s|%s|%s|%s' \"$CLAUDE_PLUGIN_ROOT\" \"$CLAUDE_PLUGIN_NAME\" \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_INPUT\" \"$CLAUDE_TOOL_RESULT\"".to_string(),
+                matcher: None,
+                blocking: false,
+                plugin_root: "/plugin/root".to_string(),
+                plugin_name: "fixture".to_string(),
+                plugin_source: "fixture@user".to_string(),
+            }],
+        );
+        let output = dispatch_post_tool_hooks_with_cancel(
+            &registry,
+            "Bash",
+            "{\"arg\":1}",
+            "tool-result",
+            false,
+            PathBuf::from("."),
+            HookCancellation::new(),
+        )
+        .await;
+        assert_eq!(
+            output,
+            vec!["/plugin/root|fixture|Bash|{\"arg\":1}|tool-result".to_string()]
+        );
     }
 }

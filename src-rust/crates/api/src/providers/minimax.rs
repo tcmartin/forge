@@ -2,21 +2,24 @@
 // Minimax requires API key in Authorization header without Bearer prefix.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
 use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
-use reqwest::{Client, header};
+use reqwest::{header, Client};
 use serde_json::Value;
 
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
+use crate::provider_wire::prepare_json_checked;
 use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest, ThinkingConfig};
 
 use super::message_normalization::normalize_anthropic_messages;
@@ -27,6 +30,7 @@ pub struct MinimaxProvider {
     api_base: String,
     service_tier: Option<String>,
     id: ProviderId,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl MinimaxProvider {
@@ -34,7 +38,11 @@ impl MinimaxProvider {
         let api_base = std::env::var("MINIMAX_BASE_URL")
             .unwrap_or_else(|_| claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE.to_string());
         let mut headers = header::HeaderMap::new();
-        headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
+        headers.insert(
+            "X-Api-Key",
+            header::HeaderValue::from_str(&api_key)
+                .expect("unable to parse api key for http header"),
+        );
         let http_client = Client::builder()
             .default_headers(headers)
             .timeout(crate::request_timeout())
@@ -47,7 +55,24 @@ impl MinimaxProvider {
             api_base,
             service_tier: None,
             id: ProviderId::new(ProviderId::MINIMAX),
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     pub fn with_base_url(mut self, api_base: impl Into<String>) -> Self {
@@ -66,10 +91,8 @@ impl MinimaxProvider {
 
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
         let normalized_messages = normalize_anthropic_messages(&request.messages);
-        let api_messages: Vec<ApiMessage> = normalized_messages
-            .iter()
-            .map(ApiMessage::from)
-            .collect();
+        let api_messages: Vec<ApiMessage> =
+            normalized_messages.iter().map(ApiMessage::from).collect();
 
         let api_tools: Option<Vec<ApiToolDefinition>> = if request.tools.is_empty() {
             None
@@ -103,14 +126,14 @@ impl MinimaxProvider {
         if request.model.eq_ignore_ascii_case("MiniMax-M3") && request.thinking.is_some() {
             builder = builder.thinking(ThinkingConfig::adaptive());
         }
+        if let Some(budget) = request.wire_budget.clone() {
+            builder = builder.wire_budget(budget);
+        }
 
         builder.build()
     }
 
-    fn build_request_body(
-        &self,
-        request: &ProviderRequest,
-    ) -> Result<Value, serde_json::Error> {
+    fn build_request_body(&self, request: &ProviderRequest) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(Self::build_request(request))?;
         if let Some(service_tier) = &self.service_tier {
             body["service_tier"] = Value::String(service_tier.clone());
@@ -136,7 +159,11 @@ impl MinimaxProvider {
                 let id = value.get("message")?.get("id")?.as_str()?.to_string();
                 let model = value.get("message")?.get("model")?.as_str()?.to_string();
                 let usage = UsageInfo {
-                    input_tokens: value.get("message")?.get("usage")?.get("input_tokens")?.as_u64()?,
+                    input_tokens: value
+                        .get("message")?
+                        .get("usage")?
+                        .get("input_tokens")?
+                        .as_u64()?,
                     output_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
@@ -153,7 +180,11 @@ impl MinimaxProvider {
                     },
                     "tool_use" => {
                         let id = value.get("content_block")?.get("id")?.as_str()?.to_string();
-                        let name = value.get("content_block")?.get("name")?.as_str()?.to_string();
+                        let name = value
+                            .get("content_block")?
+                            .get("name")?
+                            .as_str()?
+                            .to_string();
                         ContentBlock::ToolUse {
                             id,
                             name,
@@ -164,7 +195,10 @@ impl MinimaxProvider {
                     _ => return None,
                 };
 
-                Some(StreamEvent::ContentBlockStart { index, content_block })
+                Some(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                })
             }
             "content_block_delta" => {
                 let index = value.get("index")?.as_u64()? as usize;
@@ -184,8 +218,15 @@ impl MinimaxProvider {
                         Some(StreamEvent::SignatureDelta { index, signature })
                     }
                     "input_json_delta" => {
-                        let partial_json = value.get("delta")?.get("partial_json")?.as_str()?.to_string();
-                        Some(StreamEvent::InputJsonDelta { index, partial_json })
+                        let partial_json = value
+                            .get("delta")?
+                            .get("partial_json")?
+                            .as_str()?
+                            .to_string();
+                        Some(StreamEvent::InputJsonDelta {
+                            index,
+                            partial_json,
+                        })
                     }
                     _ => None,
                 }
@@ -195,31 +236,37 @@ impl MinimaxProvider {
                 Some(StreamEvent::ContentBlockStop { index })
             }
             "message_delta" => {
-                let stop_reason = value.get("delta")?
+                let stop_reason = value
+                    .get("delta")?
                     .get("stop_reason")?
                     .as_str()
                     .map(Self::map_stop_reason);
 
-                let usage = value.get("delta")?.get("usage")
-                    .and_then(|u| {
-                        Some(UsageInfo {
-                            input_tokens: u.get("input_tokens")?.as_u64()?,
-                            output_tokens: u.get("output_tokens")?.as_u64()?,
-                            cache_creation_input_tokens: u.get("cache_creation_input_tokens")?.as_u64().unwrap_or(0),
-                            cache_read_input_tokens: u.get("cache_read_input_tokens")?.as_u64().unwrap_or(0),
-                        })
-                    });
+                let usage = value.get("delta")?.get("usage").and_then(|u| {
+                    Some(UsageInfo {
+                        input_tokens: u.get("input_tokens")?.as_u64()?,
+                        output_tokens: u.get("output_tokens")?.as_u64()?,
+                        cache_creation_input_tokens: u
+                            .get("cache_creation_input_tokens")?
+                            .as_u64()
+                            .unwrap_or(0),
+                        cache_read_input_tokens: u
+                            .get("cache_read_input_tokens")?
+                            .as_u64()
+                            .unwrap_or(0),
+                    })
+                });
 
-                Some(StreamEvent::MessageDelta {
-                    stop_reason,
-                    usage,
-                })
+                Some(StreamEvent::MessageDelta { stop_reason, usage })
             }
             "message_stop" => Some(StreamEvent::MessageStop),
             "error" => {
                 let error_type = value.get("error")?.get("type")?.as_str()?.to_string();
                 let message = value.get("error")?.get("message")?.as_str()?.to_string();
-                Some(StreamEvent::Error { error_type, message })
+                Some(StreamEvent::Error {
+                    error_type,
+                    message,
+                })
             }
             "ping" => None,
             _ => None,
@@ -241,6 +288,7 @@ impl LlmProvider for MinimaxProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         let mut stream = self.create_message_stream(request).await?;
 
         let mut id = String::from("unknown");
@@ -282,7 +330,10 @@ impl LlmProvider for MinimaxProvider {
                             }
                         }
                         StreamEvent::MessageStop => break,
-                        StreamEvent::Error { error_type, message } => {
+                        StreamEvent::Error {
+                            error_type,
+                            message,
+                        } => {
                             return Err(ProviderError::StreamError {
                                 provider: self.id.clone(),
                                 message: format!("[{}] {}", error_type, message),
@@ -311,6 +362,7 @@ impl LlmProvider for MinimaxProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         let body = self
             .build_request_body(&request)
             .map_err(|e| ProviderError::Other {
@@ -324,6 +376,10 @@ impl LlmProvider for MinimaxProvider {
         let api_key = self.api_key.clone();
         let http_client = self.http_client.clone();
         let provider_id = self.id.clone();
+        let prepared =
+            prepare_json_checked("minimax", &url, true, &body, request.wire_budget.as_ref())
+                .map_err(|error| ProviderError::budget(provider_id.clone(), error))?;
+        let admission = self.acquire_inference().await?;
 
         let resp = http_client
             .post(&url)
@@ -331,7 +387,7 @@ impl LlmProvider for MinimaxProvider {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -409,7 +465,7 @@ impl LlmProvider for MinimaxProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -421,7 +477,7 @@ impl LlmProvider for MinimaxProvider {
             streaming: true,
             tool_calling: true,
             thinking: true,
-            image_input: true,
+            image_input: false,
             pdf_input: false,
             audio_input: false,
             video_input: false,
@@ -435,10 +491,19 @@ impl LlmProvider for MinimaxProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn request(model: &str, thinking: bool) -> ProviderRequest {
+        let wire_budget = crate::WireBudget::finite(
+            1_000_000,
+            900_000,
+            100_000,
+            4_000_000,
+            crate::MediaAccounting::None,
+        )
+        .expect("test wire budget");
         ProviderRequest {
             model: model.to_string(),
             messages: Vec::new(),
@@ -451,6 +516,10 @@ mod tests {
             stop_sequences: Vec::new(),
             thinking: thinking.then(|| ThinkingConfig::enabled(4096)),
             provider_options: serde_json::json!({}),
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: Some(wire_budget),
+            dispatch: None,
         }
     }
 
@@ -471,7 +540,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have an address");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
         let capture = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("request should connect");
             let mut raw_request = Vec::new();
@@ -533,6 +604,123 @@ mod tests {
         );
         let body: Value = serde_json::from_str(body).expect("body should be JSON");
         assert_eq!(body["service_tier"], serde_json::json!("priority"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_body_matches_loopback_bytes_and_hash() {
+        let request = request("MiniMax-M3", false);
+        let provider = MinimaxProvider::new("test-key".to_string())
+            .with_base_url("http://127.0.0.1:1/anthropic");
+        let body = provider
+            .build_request_body(&request)
+            .expect("request body should serialize");
+        let expected = prepare_json_checked(
+            "minimax",
+            "http://127.0.0.1:1/anthropic/v1/messages",
+            true,
+            &body,
+            request.wire_budget.as_ref(),
+        )
+        .expect("wire preflight should succeed");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let mut length = None;
+            loop {
+                let count = socket.read(&mut buf).await.expect("read");
+                assert!(count > 0);
+                raw.extend_from_slice(&buf[..count]);
+                if length.is_none() {
+                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&raw[..end]).expect("headers");
+                        length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                (name.eq_ignore_ascii_case("content-length"))
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .map(|size| end + 4 + size);
+                    }
+                }
+                if length.is_some_and(|size| raw.len() >= size) {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("write");
+            raw
+        });
+
+        let provider = provider.with_base_url(format!("http://{address}/anthropic"));
+        let _ = provider
+            .create_message_stream(request)
+            .await
+            .expect("request");
+        let raw = capture.await.expect("capture");
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("body");
+        let wire = &raw[header_end + 4..];
+        assert_eq!(wire, expected.bytes());
+        assert_eq!(
+            expected.wire_sha256,
+            hex::encode(sha2::Sha256::digest(wire))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_budget_rejects_before_any_http_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let mut request = request("MiniMax-M3", false);
+        request.wire_budget = None;
+        let provider = MinimaxProvider::new("test-key".to_string())
+            .with_base_url(format!("http://{address}/anthropic"));
+        let error = match provider.create_message_stream(request).await {
+            Ok(_) => panic!("missing budget should reject before transport"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ProviderError::BudgetExceeded { error, .. } if matches!(*error, crate::WireBudgetError::MissingBudget))
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn typed_media_rejects_before_transport_preparation() {
+        let mut request = request("MiniMax-M3", false);
+        request.messages = vec![claurst_core::types::Message::user_blocks(vec![
+            ContentBlock::Image {
+                source: claurst_core::types::ImageSource {
+                    source_type: "base64".into(),
+                    media_type: Some("image/png".into()),
+                    data: Some("abc".into()),
+                    url: None,
+                },
+            },
+        ])];
+        let body = MinimaxProvider::new("test-key".to_string())
+            .build_request_body(&request)
+            .expect("body");
+        assert!(matches!(
+            prepare_json_checked(
+                "minimax",
+                "http://127.0.0.1:1",
+                true,
+                &body,
+                request.wire_budget.as_ref()
+            ),
+            Err(crate::WireBudgetError::UnsupportedMedia)
+        ));
     }
 
     #[test]

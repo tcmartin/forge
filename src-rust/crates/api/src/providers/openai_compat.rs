@@ -5,6 +5,7 @@
 // extra headers, and per-provider behavioural quirks via the builder API.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -15,12 +16,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error_handling::parse_error_response;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
+    SystemPromptStyle,
 };
+use crate::provider_wire::prepare_provider_json;
 
 // Re-use the message transformation helpers from openai.rs.
 use super::openai::OpenAiProvider;
@@ -107,6 +110,7 @@ pub struct OpenAiCompatProvider {
     extra_headers: Vec<(String, String)>,
     quirks: ProviderQuirks,
     http_client: reqwest::Client,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +165,24 @@ impl OpenAiCompatProvider {
             extra_headers: Vec::new(),
             quirks: ProviderQuirks::default(),
             http_client,
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     /// Set an API key that will be sent as `Authorization: Bearer <key>`.
@@ -171,11 +192,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Append a custom header sent on every request.
-    pub fn with_header(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
         self
     }
@@ -191,9 +208,7 @@ impl OpenAiCompatProvider {
     /// Keep any native API host in sync with the OpenAI-compatible base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        if self.quirks.ollama_native_host.is_some()
-            || self.quirks.lm_studio_native_host.is_some()
-        {
+        if self.quirks.ollama_native_host.is_some() || self.quirks.lm_studio_native_host.is_some() {
             let native_host = self
                 .base_url
                 .trim_end_matches('/')
@@ -266,20 +281,11 @@ impl OpenAiCompatProvider {
     fn apply_fix_tool_user_sequence(messages: &mut Vec<Value>) {
         let mut i = 0;
         while i + 1 < messages.len() {
-            let current_is_tool = messages[i]
-                .get("role")
-                .and_then(|v| v.as_str())
-                == Some("tool");
-            let next_is_user = messages[i + 1]
-                .get("role")
-                .and_then(|v| v.as_str())
-                == Some("user");
+            let current_is_tool = messages[i].get("role").and_then(|v| v.as_str()) == Some("tool");
+            let next_is_user = messages[i + 1].get("role").and_then(|v| v.as_str()) == Some("user");
 
             if current_is_tool && next_is_user {
-                messages.insert(
-                    i + 1,
-                    json!({ "role": "assistant", "content": "Done." }),
-                );
+                messages.insert(i + 1, json!({ "role": "assistant", "content": "Done." }));
                 i += 2; // skip past the inserted message and the user message
             } else {
                 i += 1;
@@ -306,11 +312,7 @@ impl OpenAiCompatProvider {
         // Only providers with requires_reasoning_roundtrip=true need this.
         if self.quirks.requires_reasoning_roundtrip {
             if let Some(ref field) = self.quirks.reasoning_field {
-                Self::inject_reasoning_for_tool_turns(
-                    &mut messages,
-                    &request.messages,
-                    field,
-                );
+                Self::inject_reasoning_for_tool_turns(&mut messages, &request.messages, field);
             }
         }
 
@@ -380,8 +382,7 @@ impl OpenAiCompatProvider {
             if reasoning_idx >= reasoning_texts.len() {
                 break;
             }
-            let is_assistant =
-                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            let is_assistant = msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
             let has_tool_calls = msg
                 .get("tool_calls")
                 .and_then(|tc| tc.as_array())
@@ -407,8 +408,7 @@ impl OpenAiCompatProvider {
     /// validation while preserving semantics.
     fn ensure_content_not_null(messages: &mut [Value]) {
         for msg in messages.iter_mut() {
-            let is_assistant =
-                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            let is_assistant = msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
             if !is_assistant {
                 continue;
             }
@@ -429,10 +429,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Attach the authorization header if an API key is configured.
-    fn apply_auth(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(key) = &self.api_key {
             builder.header("Authorization", format!("Bearer {}", key))
         } else {
@@ -441,10 +438,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Attach all configured extra headers.
-    fn apply_extra_headers(
-        &self,
-        mut builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_extra_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         for (name, value) in &self.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -498,9 +492,12 @@ impl OpenAiCompatProvider {
             .header("Content-Type", "application/json");
         let builder = self.apply_auth(builder);
         let builder = self.apply_extra_headers(builder);
+        let prepared = prepare_provider_json(self.id.to_string(), &url, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = builder
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -522,13 +519,12 @@ impl OpenAiCompatProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse response JSON: {}", e),
-                status: Some(status),
-                body: Some(text.clone()),
-            })?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to parse response JSON: {}", e),
+            status: Some(status),
+            body: Some(text.clone()),
+        })?;
 
         OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
     }
@@ -540,7 +536,7 @@ impl OpenAiCompatProvider {
     async fn do_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, AdmissionLease), ProviderError> {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
@@ -581,9 +577,12 @@ impl OpenAiCompatProvider {
             .header("Accept", "text/event-stream");
         let builder = self.apply_auth(builder);
         let builder = self.apply_extra_headers(builder);
+        let prepared = prepare_provider_json(self.id.to_string(), &url, true, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let admission = self.acquire_inference().await?;
         let resp = builder
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -599,7 +598,7 @@ impl OpenAiCompatProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        Ok(resp)
+        Ok((resp, admission))
     }
 
     // -----------------------------------------------------------------------
@@ -619,14 +618,17 @@ impl OpenAiCompatProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let tags_url = format!("{}/api/tags", ollama_host.trim_end_matches('/'));
 
-        let resp = self.http_client.get(&tags_url).send().await.map_err(|e| {
-            ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Ollama /api/tags request failed: {}", e),
-                status: None,
-                body: None,
-            }
-        })?;
+        let resp =
+            self.http_client
+                .get(&tags_url)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Ollama /api/tags request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
 
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| ProviderError::Other {
@@ -724,10 +726,7 @@ impl OpenAiCompatProvider {
                 if !seen.insert(instance.id.clone()) {
                     continue;
                 }
-                let context_window = instance
-                    .config
-                    .context_length
-                    .unwrap_or(max_context);
+                let context_window = instance.config.context_length.unwrap_or(max_context);
                 discovered.push(ModelInfo {
                     id: ModelId::new(instance.id),
                     provider_id: provider_id.clone(),
@@ -775,10 +774,7 @@ impl OpenAiCompatProvider {
         // Extract parameter size from model_info.
         let param_size = json
             .get("model_info")
-            .and_then(|mi| {
-                mi.get("general.parameter_count")
-                    .and_then(|v| v.as_u64())
-            })
+            .and_then(|mi| mi.get("general.parameter_count").and_then(|v| v.as_u64()))
             .unwrap_or(0);
 
         // Extract num_ctx from the modelfile parameters or model_info.
@@ -793,9 +789,7 @@ impl OpenAiCompatProvider {
             .get("model_info")
             .and_then(|mi| mi.get("general.basename").and_then(|v| v.as_str()))
             .unwrap_or("");
-        let is_coder = is_coder_by_name
-            || family.contains("code")
-            || family.contains("coder");
+        let is_coder = is_coder_by_name || family.contains("code") || family.contains("coder");
 
         (num_ctx, max_output, is_coder, param_size)
     }
@@ -916,6 +910,7 @@ impl LlmProvider for OpenAiCompatProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         if self.has_no_key() {
             // Providers that have no key set are considered unconfigured.
             // We allow the call to proceed in case the provider genuinely needs
@@ -930,7 +925,8 @@ impl LlmProvider for OpenAiCompatProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.do_streaming(&request).await?;
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let (resp, admission) = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
         let reasoning_field = self.quirks.reasoning_field.clone();
 
@@ -1009,7 +1005,7 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -1020,10 +1016,7 @@ impl LlmProvider for OpenAiCompatProvider {
             return self.discover_models_ollama_native(ollama_host).await;
         }
         if let Some(ref lm_studio_host) = self.quirks.lm_studio_native_host {
-            if let Some(models) = self
-                .discover_models_lm_studio_native(lm_studio_host)
-                .await
-            {
+            if let Some(models) = self.discover_models_lm_studio_native(lm_studio_host).await {
                 return Ok(models);
             }
         }
@@ -1052,13 +1045,12 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models JSON: {}", e),
-                status: Some(status),
-                body: Some(text),
-            })?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to parse models JSON: {}", e),
+            status: Some(status),
+            body: Some(text),
+        })?;
 
         let data = match json.get("data").and_then(|d| d.as_array()) {
             Some(d) => d,
@@ -1076,9 +1068,8 @@ impl LlmProvider for OpenAiCompatProvider {
                     name: id.to_string(),
                     context_window: match id {
                         "gpt-5" | "gpt-5.4" | "gpt-5.2" | "gpt-5-mini" | "gpt-5-nano"
-                        | "gpt-5-chat-latest"
-                        | "gpt-5.2-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-mini"
-                        | "gpt-5.1-codex-max" => 400_000,
+                        | "gpt-5-chat-latest" | "gpt-5.2-codex" | "gpt-5.1-codex"
+                        | "gpt-5.1-codex-mini" | "gpt-5.1-codex-max" => 400_000,
                         "o3" | "o3-mini" | "o4-mini" => 200_000,
                         _ => 128_000,
                     },
@@ -1144,7 +1135,7 @@ impl LlmProvider for OpenAiCompatProvider {
             streaming: true,
             tool_calling: true,
             thinking: self.quirks.reasoning_field.is_some(),
-            image_input: true,
+            image_input: false,
             pdf_input: false,
             audio_input: false,
             video_input: false,
@@ -1158,7 +1149,39 @@ impl LlmProvider for OpenAiCompatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    fn stream_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "fixture-model".to_string(),
+            messages: Vec::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: Some(
+                crate::WireBudget::finite(
+                    1_000_000,
+                    900_000,
+                    100_000,
+                    4_000_000,
+                    crate::MediaAccounting::None,
+                )
+                .expect("test wire budget"),
+            ),
+            dispatch: None,
+        }
+    }
 
     #[test]
     fn mistral_tool_ids_match_opencode_style() {
@@ -1274,5 +1297,152 @@ mod tests {
             Some("http://192.0.2.20:1234"),
         );
         assert!(provider.quirks.include_usage_in_stream);
+    }
+
+    #[tokio::test]
+    async fn loopback_stream_consumes_trailing_usage_after_tool_finish() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let body = concat!(
+            r#"data: {"id":"fixture","model":"fixture-model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should write");
+        });
+
+        let provider =
+            OpenAiCompatProvider::new("fixture", "Fixture", format!("http://{address}/v1"))
+                .with_api_key("fixture-key".to_string());
+        let mut stream = provider
+            .create_message_stream(stream_request())
+            .await
+            .expect("loopback stream should start");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("loopback stream should decode"));
+        }
+        server.await.expect("server should finish");
+
+        let tool_start = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ContentBlockStart {
+                        index: 1,
+                        content_block: ContentBlock::ToolUse { id, name, .. }
+                    } if id == "call_1" && name == "lookup"
+                )
+            })
+            .expect("tool call should start");
+        let args = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StreamEvent::InputJsonDelta { index: 1, partial_json } if partial_json == "{\"city\":"
+                )
+            })
+            .expect("tool arguments should stream");
+        let tool_stop = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ContentBlockStop { index: 1 }))
+            .expect("tool call should stop");
+        let usage = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StreamEvent::MessageDelta {
+                        stop_reason: None,
+                        usage: Some(usage),
+                    } if usage.input_tokens == 5 && usage.output_tokens == 2
+                )
+            })
+            .expect("trailing usage should be emitted");
+        let terminal_count = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::MessageStop))
+            .count();
+
+        assert!(tool_start < args && args < tool_stop && tool_stop < usage);
+        assert_eq!(terminal_count, 1, "stream should have one terminal event");
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[tokio::test]
+    async fn loopback_eof_before_usage_keeps_partial_usage_zero() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let body = concat!(
+            r#"data: {"id":"fixture","model":"fixture-model","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should write");
+        });
+
+        let provider =
+            OpenAiCompatProvider::new("fixture", "Fixture", format!("http://{address}/v1"))
+                .with_api_key("fixture-key".to_string());
+        let mut stream = provider
+            .create_message_stream(stream_request())
+            .await
+            .expect("loopback stream should start");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("clean EOF should not be a stream error"));
+        }
+        server.await.expect("server should finish");
+
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event,
+                StreamEvent::MessageDelta {
+                    usage: Some(usage), ..
+                } if usage.total_input() > 0 || usage.output_tokens > 0
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::MessageStop))
+                .count(),
+            1
+        );
     }
 }

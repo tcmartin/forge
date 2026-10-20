@@ -10,17 +10,13 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
+use crate::{context_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
-use claurst_core::tasks::{BackgroundTask, global_registry};
+use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tracing::debug;
 
 // Unix-only imports used by the shell-state helpers and PTY execution path.
@@ -46,10 +42,47 @@ struct BashInput {
     timeout: u64,
     #[serde(default)]
     run_in_background: bool,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 fn default_timeout() -> u64 {
     120_000
+}
+
+/// Attach typed process outcome fields without replacing retained evidence or
+/// metadata already produced by the tool.
+fn with_command_metadata(
+    mut result: ToolResult,
+    command_status: &str,
+    exit_code: Option<i32>,
+    partial: bool,
+) -> ToolResult {
+    let mut metadata = match result.metadata.take() {
+        Some(Value::Object(metadata)) => metadata,
+        Some(other) => Map::from_iter([("tool_metadata".into(), other)]),
+        None => Map::new(),
+    };
+    metadata.insert(
+        "command_status".into(),
+        Value::String(command_status.into()),
+    );
+    metadata.insert(
+        "exit_code".into(),
+        exit_code.map_or(Value::Null, Value::from),
+    );
+    metadata.insert("partial".into(), Value::Bool(partial));
+    result.metadata = Some(Value::Object(metadata));
+    result
+}
+
+fn not_run_result(message: impl Into<String>) -> ToolResult {
+    with_command_metadata(
+        ToolResult::error(message).with_execution_status(crate::ExecutionStatus::NotRun),
+        "not_run",
+        None,
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +105,15 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
             let key = line[..eq].to_string();
             let val = line[eq + 1..].to_string();
             if !key.starts_with('_')
-                && !["SHLVL", "BASH_LINENO", "BASH_SOURCE", "FUNCNAME", "PIPESTATUS", "OLDPWD"]
-                    .contains(&key.as_str())
+                && ![
+                    "SHLVL",
+                    "BASH_LINENO",
+                    "BASH_SOURCE",
+                    "FUNCNAME",
+                    "PIPESTATUS",
+                    "OLDPWD",
+                ]
+                .contains(&key.as_str())
             {
                 env_vars.insert(key, val);
             }
@@ -85,10 +125,9 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
 
 #[cfg(unix)]
 fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
-    let re = Regex::new(
-        r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#,
-    )
-    .unwrap();
+    let re =
+        Regex::new(r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#)
+            .unwrap();
     let mut map = HashMap::new();
     for cap in re.captures_iter(command) {
         let key = cap[1].to_string();
@@ -144,110 +183,29 @@ fn apply_restored_env(cmd: &mut portable_pty::CommandBuilder, env_vars: &HashMap
 }
 
 // ---------------------------------------------------------------------------
-// Background execution (identical to bash.rs — no PTY needed for background)
+// Background execution (no PTY needed for detached commands)
 // ---------------------------------------------------------------------------
 
-async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> ToolResult {
-    let task_name = format!("bg: {}", &command[..command.len().min(60)]);
-    let mut task = BackgroundTask::new(&task_name);
-    task.pid = None;
-    let task_id = global_registry().register(task);
-    let task_id_clone = task_id.clone();
-    let command_clone = command.clone();
-
-    tokio::spawn(async move {
-        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            // kill_on_drop: when the timeout drops this future the child must die
-            // with it, otherwise a timed-out background command leaks (#220).
-            let child = if cfg!(windows) {
-                Command::new("cmd")
-                    .arg("/C")
-                    .arg(&command_clone)
-                    .current_dir(&cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-            } else {
-                Command::new("bash")
-                    .arg("-c")
-                    .arg(&command_clone)
-                    .current_dir(&cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-            };
-
-            match child {
-                Ok(mut c) => {
-                    if let Some(pid) = c.id() {
-                        global_registry().set_pid(&task_id_clone, pid);
-                    }
-                    let stdout = c.stdout.take();
-                    let stderr = c.stderr.take();
-                    if let Some(out) = stdout {
-                        let mut lines = BufReader::new(out).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry().append_output(&task_id_clone, &line);
-                        }
-                    }
-                    if let Some(err) = stderr {
-                        let mut lines = BufReader::new(err).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry()
-                                .append_output(&task_id_clone, &format!("STDERR: {}", line));
-                        }
-                    }
-                    match c.wait().await {
-                        Ok(status) if status.success() => {
-                            global_registry().complete(&task_id_clone);
-                        }
-                        Ok(status) => {
-                            let code = status.code().unwrap_or(-1);
-                            global_registry().update_status(
-                                &task_id_clone,
-                                claurst_core::tasks::TaskStatus::Failed(format!(
-                                    "exit code {}",
-                                    code
-                                )),
-                            );
-                        }
-                        Err(e) => {
-                            global_registry().update_status(
-                                &task_id_clone,
-                                claurst_core::tasks::TaskStatus::Failed(e.to_string()),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    global_registry().update_status(
-                        &task_id_clone,
-                        claurst_core::tasks::TaskStatus::Failed(e.to_string()),
-                    );
-                }
-            }
-        })
-        .await;
-
-        if result.is_err() {
-            global_registry().update_status(
-                &task_id_clone,
-                claurst_core::tasks::TaskStatus::Failed(format!(
-                    "timed out after {}ms",
-                    timeout_ms
-                )),
-            );
-        }
-    });
-
-    ToolResult::success(format!(
+async fn run_in_background(
+    command: String,
+    cwd: PathBuf,
+    timeout_ms: u64,
+    ctx: &ToolContext,
+) -> ToolResult {
+    let task_id = match crate::background_processes::spawn(command.clone(), cwd, timeout_ms, ctx) {
+        Ok(task_id) => task_id,
+        Err(error) => return not_run_result(error),
+    };
+    let mut result = ToolResult::success(format!(
         "Command started in background.\nTask ID: {}\nCommand: {}",
         task_id, command
-    ))
+    ));
+    result = with_command_metadata(result, "running", None, true);
+    if let Some(Value::Object(metadata)) = result.metadata.as_mut() {
+        metadata.insert("background".into(), Value::Bool(true));
+        metadata.insert("task_id".into(), Value::String(task_id));
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +223,7 @@ fn strip_ansi(s: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next(); // consume '['
-                    // CSI: consume parameter + intermediate bytes, stop at final byte
+                                  // CSI: consume parameter + intermediate bytes, stop at final byte
                     for c in &mut chars {
                         if c.is_ascii_alphabetic() || c == '@' {
                             break;
@@ -313,11 +271,12 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(unix)]
 enum PtyOutcome {
     /// The command finished; carries (raw PTY output, exit code).
-    Completed(String, i32),
+    Completed(String, Option<i32>, bool),
     /// The command exceeded its timeout. The child has been KILLED (#220).
-    TimedOut,
+    TimedOut(String),
+    Cancelled(String),
     /// The PTY could not be set up / the command could not be spawned.
-    Failed(String),
+    Failed(String, bool),
 }
 
 /// Guard that guarantees the PTY child is killed if the running future is
@@ -336,7 +295,10 @@ struct PtyKillGuard {
 #[cfg(unix)]
 impl PtyKillGuard {
     fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) -> Self {
-        Self { killer, armed: true }
+        Self {
+            killer,
+            armed: true,
+        }
     }
 
     /// The command finished on its own — there is nothing left to kill.
@@ -369,8 +331,9 @@ async fn run_in_pty(
     working_dir: &str,
     env_vars: &HashMap<String, String>,
     timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> PtyOutcome {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let pty_system = native_pty_system();
 
@@ -381,7 +344,7 @@ async fn run_in_pty(
         pixel_height: 0,
     }) {
         Ok(p) => p,
-        Err(e) => return PtyOutcome::Failed(format!("Failed to open PTY: {}", e)),
+        Err(e) => return PtyOutcome::Failed(format!("Failed to open PTY: {}", e), false),
     };
 
     let mut cmd = CommandBuilder::new("bash");
@@ -392,20 +355,21 @@ async fn run_in_pty(
 
     let child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
-        Err(e) => return PtyOutcome::Failed(format!("Failed to spawn in PTY: {}", e)),
+        Err(e) => return PtyOutcome::Failed(format!("Failed to spawn in PTY: {}", e), false),
     };
+
+    // Arm cleanup immediately after spawn, including reader setup failures.
+    let mut guard = PtyKillGuard::new(child.clone_killer());
 
     // Grab the reader *before* dropping slave so the fd stays valid.
     let reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
-        Err(e) => return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e)),
+        Err(e) => return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e), true),
     };
 
     // A killer handle cloned from the child. This is how a timed-out or
     // cancelled command is explicitly KILLED (portable_pty does not kill on
     // drop, so without this the child would orphan) (#220).
-    let killer = child.clone_killer();
-
     // Drop slave after spawn — once the child's controlling terminal is gone,
     // the master side will see EOF when the child exits.
     drop(pair.slave);
@@ -416,7 +380,7 @@ async fn run_in_pty(
     // reap the child there so we can return its exit code. drive_pty_child stops
     // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
     // which a detached grandchild would hold open forever (#184).
-    let read_handle = tokio::task::spawn_blocking(move || {
+    let mut read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
         let result = drive_pty_child(child, reader, master_fd);
         // Keep the master fd alive until reading + reaping is complete.
@@ -426,22 +390,36 @@ async fn run_in_pty(
 
     // Kill-on-drop guard: if this future is dropped mid-command (turn cancelled)
     // the guard fires and kills the child instead of leaking it (#220).
-    let mut guard = PtyKillGuard::new(killer);
-
-    match tokio::time::timeout(timeout, read_handle).await {
-        Ok(Ok((output, exit_code))) => {
+    let interrupted = tokio::select! {
+        biased;
+        result = tokio::time::timeout(timeout, &mut read_handle) => Some(result),
+        _ = cancel.cancelled() => None,
+    };
+    let was_cancelled = interrupted.is_none();
+    match interrupted {
+        Some(Ok(Ok((output, exit_code, partial)))) => {
             guard.disarm();
-            PtyOutcome::Completed(output, exit_code)
+            PtyOutcome::Completed(output, exit_code, partial)
         }
-        Ok(Err(e)) => {
-            guard.disarm();
-            PtyOutcome::Failed(format!("PTY read thread panicked: {}", e))
+        Some(Ok(Err(e))) => {
+            guard.kill_now();
+            PtyOutcome::Failed(format!("PTY read thread panicked: {}", e), true)
         }
-        Err(_) => {
-            // Timed out: explicitly KILL the child so it can't linger as an
+        Some(Err(_)) | None => {
+            let cancelled = was_cancelled;
+            // Interrupted: explicitly KILL the child so it can't linger as an
             // orphan (#220). The read thread then observes the exit and finishes.
             guard.kill_now();
-            PtyOutcome::TimedOut
+            let partial = match tokio::time::timeout(Duration::from_secs(2), &mut read_handle).await
+            {
+                Ok(Ok((output, _, _))) => output,
+                _ => String::new(),
+            };
+            if cancelled {
+                PtyOutcome::Cancelled(partial)
+            } else {
+                PtyOutcome::TimedOut(partial)
+            }
         }
     }
 }
@@ -490,13 +468,13 @@ fn drive_pty_child(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut reader: Box<dyn std::io::Read + Send>,
     master_fd: Option<std::os::unix::io::RawFd>,
-) -> (String, i32) {
+) -> (String, Option<i32>, bool) {
     use std::io::Read;
 
-    let mut output = String::new();
+    let mut output = Vec::new();
     let mut buf = [0u8; 4096];
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let mut total = 0usize;
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+    let mut partial = false;
 
     // Set once the direct child has exited. We then drain any already-buffered
     // pty output and stop — we never block waiting for EOF that a detached
@@ -515,12 +493,11 @@ fn drive_pty_child(
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: every pty writer (incl. the child) is gone
                 Ok(n) => {
-                    total += n;
-                    if total > MAX_BYTES {
-                        output.push_str("\n[output truncated at 2 MB limit]");
-                        break;
-                    }
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let retained = n.min(MAX_BYTES.saturating_sub(output.len()));
+                    output.extend_from_slice(&buf[..retained]);
+                    partial |= retained < n;
+                    // Keep draining after the capture limit. Stopping reads can
+                    // deadlock a still-running child on a full PTY buffer.
                     continue; // keep draining while bytes remain
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -545,11 +522,13 @@ fn drive_pty_child(
         }
     }
 
-    let exit_code = match child.wait() {
-        Ok(status) => status.exit_code() as i32,
-        Err(_) => -1,
-    };
-    (output, exit_code)
+    let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+    // Decode once; a UTF-8 character may span arbitrary reader chunks.
+    (
+        String::from_utf8_lossy(&output).into_owned(),
+        exit_code,
+        partial,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -562,95 +541,100 @@ async fn run_windows_fallback(
     effective_cwd: &PathBuf,
     timeout_dur: Duration,
     timeout_ms: u64,
+    ctx: &ToolContext,
 ) -> ToolResult {
-    let mut child = match Command::new("cmd")
+    let child = match Command::new("cmd")
         .arg("/C")
         .arg(command)
         .current_dir(effective_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
+        Err(e) => return not_run_result(format!("Failed to spawn command: {}", e)),
     };
 
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    let result = tokio::time::timeout(timeout_dur, async {
-        let mut stdout_lines = Vec::new();
-        let mut stderr_lines = Vec::new();
-
-        if let Some(stdout) = stdout_handle {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stdout_lines.push(line);
+    let captured =
+        match crate::command_capture::capture_with_cancel(child, timeout_dur, &ctx.cancel_token)
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return with_command_metadata(
+                    ToolResult::error(format!("Failed to capture command output: {e}")),
+                    "unknown",
+                    None,
+                    true,
+                )
             }
+        };
+    let exit_code = captured.status.and_then(|status| status.code());
+    let mut output = String::from_utf8_lossy(&captured.stdout).into_owned();
+    if !captured.stderr.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
         }
-        if let Some(stderr) = stderr_handle {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stderr_lines.push(line);
-            }
-        }
-        let status = child.wait().await;
-        (stdout_lines, stderr_lines, status)
-    })
-    .await;
-
-    match result {
-        Ok((stdout_lines, stderr_lines, status)) => {
-            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            let mut output = String::new();
-            if !stdout_lines.is_empty() {
-                output.push_str(&stdout_lines.join("\n"));
-            }
-            if !stderr_lines.is_empty() {
-                if !output.is_empty() {
-                    output.push('\n');
-                }
-                output.push_str("STDERR:\n");
-                output.push_str(&stderr_lines.join("\n"));
-            }
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            truncate_output(output, exit_code)
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
-        }
+        output.push_str("STDERR:\n");
+        output.push_str(&String::from_utf8_lossy(&captured.stderr));
     }
+    if output.is_empty() {
+        output = "(no output)".to_string();
+    }
+    if captured.cancelled || captured.error.is_some() {
+        let reason = captured.error.as_deref().unwrap_or("command cancelled");
+        let result = crate::evidence::retain_output(
+            ctx,
+            format!("Command capture incomplete: {reason}\n{output}"),
+            true,
+            true,
+        )
+        .with_execution_status(crate::ExecutionStatus::Unknown);
+        return with_command_metadata(result, "cancelled", None, true);
+    }
+    if captured.timed_out {
+        let result = crate::evidence::retain_output(
+            ctx,
+            format!("Command timed out after {timeout_ms}ms; capture incomplete\n{output}"),
+            true,
+            true,
+        )
+        .with_execution_status(crate::ExecutionStatus::Unknown);
+        return with_command_metadata(result, "timed_out", None, true);
+    }
+    let status = if exit_code.is_some() {
+        "completed"
+    } else {
+        "unknown"
+    };
+    let result = truncate_output(output, exit_code, captured.partial, ctx);
+    with_command_metadata(result, status, exit_code, captured.partial)
 }
 
 // ---------------------------------------------------------------------------
 // Shared output truncation helper
 // ---------------------------------------------------------------------------
 
-fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
-    const MAX_OUTPUT_LEN: usize = 100_000;
-    if output.len() > MAX_OUTPUT_LEN {
-        let half = MAX_OUTPUT_LEN / 2;
-        let start = output[..half].to_string();
-        let end = output[output.len() - half..].to_string();
-        output = format!(
-            "{}\n\n... ({} characters truncated) ...\n\n{}",
-            start,
-            output.len() - MAX_OUTPUT_LEN,
-            end
-        );
-    }
-
-    if exit_code != 0 {
-        ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
+fn truncate_output(
+    output: String,
+    exit_code: Option<i32>,
+    partial: bool,
+    ctx: &ToolContext,
+) -> ToolResult {
+    let output = if partial {
+        format!("[Capture incomplete: stream capture limit reached]\n{output}")
     } else {
-        ToolResult::success(output)
-    }
+        output
+    };
+    let is_error = exit_code != Some(0);
+    let output = match exit_code {
+        Some(code) if code != 0 => format!("Command exited with code {code}\n{output}"),
+        Some(_) => output,
+        None => format!("Command exit status unavailable\n{output}"),
+    };
+    crate::evidence::retain_output(ctx, output, is_error, partial)
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +644,9 @@ fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
 #[async_trait]
 impl Tool for PtyBashTool {
     // Gates itself: calls `ctx.check_permission*` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_BASH
@@ -676,6 +662,15 @@ impl Tool for PtyBashTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Execute
+    }
+
+    fn native_bash_execution_witness(
+        &self,
+        tool_id: &str,
+        result: &ToolResult,
+        emitted_result: &str,
+    ) -> Option<crate::NativeBashExecutionWitness> {
+        crate::NativeBashExecutionWitness::from_trusted_result(tool_id, result, emitted_result)
     }
 
     fn input_schema(&self) -> Value {
@@ -697,6 +692,10 @@ impl Tool for PtyBashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run command in the background"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call. Relative paths resolve against the workspace. Does not change the regular shell's working directory."
                 }
             },
             "required": ["command"]
@@ -706,8 +705,15 @@ impl Tool for PtyBashTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: BashInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return not_run_result(format!("Invalid input: {}", e)),
         };
+        let cwd_override = params.cwd.as_deref().map(|path| ctx.resolve_path(path));
+        if cwd_override.as_ref().is_some_and(|path| !path.is_dir()) {
+            return not_run_result("The requested command working directory does not exist");
+        }
+        if let Err(error) = crate::deletion_intent::authorize_bash_command(&params.command) {
+            return not_run_result(error);
+        }
 
         // Permission check
         let reason = params
@@ -724,12 +730,12 @@ impl Tool for PtyBashTool {
             std::path::PathBuf::from(&params.command),
             false,
         ) {
-            return ToolResult::error(e.to_string());
+            return not_run_result(e.to_string());
         }
 
         // Security classifier — block Critical-risk commands unconditionally.
         if classify_bash_command(&params.command) == BashRiskLevel::Critical {
-            return ToolResult::error(format!(
+            return not_run_result(format!(
                 "Command blocked: classified as Critical risk by the bash security classifier.\n\
                  Refusing to execute: {}",
                 params.command
@@ -738,28 +744,43 @@ impl Tool for PtyBashTool {
 
         let timeout_ms = params.timeout.min(600_000);
         let timeout_dur = Duration::from_millis(timeout_ms);
-        let shell_state_arc = session_shell_state(&ctx.session_id);
+        let shell_state_arc = context_shell_state(ctx);
 
         // ── Background path ──────────────────────────────────────────────────
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
-                state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
+                cwd_override
+                    .clone()
+                    .or_else(|| state.cwd.clone())
+                    .unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms).await;
+            return run_in_background(params.command, cwd, timeout_ms, ctx).await;
         }
 
-        debug!(command = %params.command, "Executing bash command via PTY");
+        debug!(
+            command_bytes = params.command.len(),
+            "Executing bash command via PTY"
+        );
 
         // ── Windows path (no PTY — use cmd.exe fallback) ─────────────────────
         #[cfg(windows)]
         {
             let effective_cwd = {
                 let state = shell_state_arc.lock();
-                state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
+                cwd_override
+                    .clone()
+                    .or_else(|| state.cwd.clone())
+                    .unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_windows_fallback(&params.command, &effective_cwd, timeout_dur, timeout_ms)
-                .await;
+            return run_windows_fallback(
+                &params.command,
+                &effective_cwd,
+                timeout_dur,
+                timeout_ms,
+                ctx,
+            )
+            .await;
         }
 
         // ── Unix PTY path ────────────────────────────────────────────────────
@@ -770,7 +791,9 @@ impl Tool for PtyBashTool {
             // environment (never its argv) — see `apply_restored_env` (#211).
             let (script, restored_env, working_dir_str) = {
                 let state = shell_state_arc.lock();
-                let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
+                let mut call_state = ShellState::new();
+                call_state.cwd = cwd_override.clone().or_else(|| state.cwd.clone());
+                let script = build_wrapper_script(&params.command, &call_state, &ctx.working_dir);
                 let restored_env = state.env_vars.clone();
                 let wd = ctx.working_dir.to_string_lossy().into_owned();
                 (script, restored_env, wd)
@@ -778,16 +801,22 @@ impl Tool for PtyBashTool {
 
             // run_in_pty owns the timeout so it can KILL the child when it fires
             // (a bare outer timeout would just drop the future and orphan it) (#220).
-            let outcome = run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur).await;
+            let outcome = run_in_pty(
+                &script,
+                &working_dir_str,
+                &restored_env,
+                timeout_dur,
+                &ctx.cancel_token,
+            )
+            .await;
 
             match outcome {
-                PtyOutcome::Completed(raw_output, exit_code) => {
+                PtyOutcome::Completed(raw_output, exit_code, partial) => {
                     // Strip ANSI escape codes from PTY output
                     let cleaned = strip_ansi(&raw_output);
 
                     // Split into user-visible lines and state block
-                    let all_lines: Vec<String> =
-                        cleaned.lines().map(|l| l.to_string()).collect();
+                    let all_lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
 
                     let sentinel_pos = all_lines
                         .iter()
@@ -800,11 +829,11 @@ impl Tool for PtyBashTool {
 
                     // Update persistent shell state
                     if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(state_lines)
-                        {
+                        if let Some((new_cwd, env_delta)) = parse_shell_state_block(state_lines) {
                             let mut state = shell_state_arc.lock();
-                            state.cwd = Some(new_cwd);
+                            if cwd_override.is_none() {
+                                state.cwd = Some(new_cwd);
+                            }
                             for (k, v) in env_delta {
                                 state.env_vars.insert(k, v);
                             }
@@ -827,13 +856,45 @@ impl Tool for PtyBashTool {
                         output = "(no output)".to_string();
                     }
 
-                    truncate_output(output, exit_code)
+                    let status = if exit_code.is_some() {
+                        "completed"
+                    } else {
+                        "unknown"
+                    };
+                    let result = truncate_output(output, exit_code, partial, ctx);
+                    with_command_metadata(result, status, exit_code, partial)
                 }
-                PtyOutcome::Failed(e) => {
-                    ToolResult::error(format!("PTY execution failed: {}", e))
+                PtyOutcome::Failed(e, spawned) => with_command_metadata(
+                    ToolResult::error(format!("PTY execution failed: {}", e)),
+                    if spawned { "unknown" } else { "not_run" },
+                    None,
+                    false,
+                ),
+                PtyOutcome::Cancelled(raw_output) => {
+                    let cleaned = strip_ansi(&raw_output);
+                    let output = cleaned.split(SHELL_STATE_SENTINEL).next().unwrap_or("");
+                    let result = crate::evidence::retain_output(
+                        ctx,
+                        format!("Command cancelled; capture incomplete\n{output}"),
+                        true,
+                        true,
+                    )
+                    .with_execution_status(crate::ExecutionStatus::Unknown);
+                    with_command_metadata(result, "cancelled", None, true)
                 }
-                PtyOutcome::TimedOut => {
-                    ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+                PtyOutcome::TimedOut(raw_output) => {
+                    let cleaned = strip_ansi(&raw_output);
+                    let output = cleaned.split(SHELL_STATE_SENTINEL).next().unwrap_or("");
+                    let result = crate::evidence::retain_output(
+                        ctx,
+                        format!(
+                            "Command timed out after {timeout_ms}ms; capture incomplete\n{output}"
+                        ),
+                        true,
+                        true,
+                    )
+                    .with_execution_status(crate::ExecutionStatus::Unknown);
+                    with_command_metadata(result, "timed_out", None, true)
                 }
             }
         }
@@ -847,6 +908,71 @@ impl Tool for PtyBashTool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_witness_is_bounded_and_hashes_emitted_utf8() {
+        let cases = [
+            ("completed", Some(0), false, true),
+            ("completed", Some(7), false, true),
+            ("completed", None, false, true),
+            ("completed", Some(0), true, true),
+            ("cancelled", None, true, true),
+            ("timed_out", None, true, true),
+            ("not_run", None, false, true),
+            ("unknown", None, false, true),
+        ];
+        for (status, exit_code, partial, expected) in cases {
+            let result = ToolResult::success("native display").with_metadata(json!({
+                "command_status": status,
+                "exit_code": exit_code,
+                "partial": partial,
+                "private_command": "must not cross the event boundary",
+            }));
+            assert_eq!(
+                PtyBashTool
+                    .native_bash_execution_witness("call-1", &result, "native display")
+                    .is_some(),
+                expected
+            );
+        }
+
+        let result = ToolResult::success("native display").with_metadata(json!({
+            "command_status": "completed",
+            "exit_code": 0,
+            "partial": false,
+        }));
+        let witness = PtyBashTool
+            .native_bash_execution_witness("call-1", &result, "native display")
+            .expect("valid native metadata should produce a witness");
+        assert_eq!(witness.tool_id, "call-1");
+        assert_eq!(
+            witness.displayed_result_sha256,
+            claurst_core::crypto_utils::sha256_hex(b"native display")
+        );
+        assert!(PtyBashTool
+            .native_bash_execution_witness("call-1", &result, "forged display")
+            .is_some_and(|witness| witness.displayed_result_sha256
+                == claurst_core::crypto_utils::sha256_hex(b"forged display")));
+
+        let malformed = [
+            json!({"command_status":"running","exit_code":null,"partial":true}),
+            json!({"command_status":"completed","exit_code":1.5,"partial":false}),
+            json!({"command_status":"completed","exit_code":0,"partial":"false"}),
+            json!("forged metadata"),
+        ];
+        for metadata in malformed {
+            let result = ToolResult::success("native display").with_metadata(metadata);
+            assert!(PtyBashTool
+                .native_bash_execution_witness("call-1", &result, "native display")
+                .is_none());
+        }
+        assert!(PtyBashTool
+            .native_bash_execution_witness("", &result, "native display")
+            .is_none());
+        assert!(PtyBashTool
+            .native_bash_execution_witness(&"x".repeat(257), &result, "native display")
+            .is_none());
+    }
     use std::ffi::OsStr;
 
     /// #211: restored env values (secrets) must NOT be baked into the wrapper
@@ -858,9 +984,10 @@ mod tests {
         state
             .env_vars
             .insert("SECRET".to_string(), "topsecret".to_string());
-        state
-            .env_vars
-            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "aws-argv-leak".to_string());
+        state.env_vars.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "aws-argv-leak".to_string(),
+        );
 
         let base = PathBuf::from("/tmp");
         let script = build_wrapper_script("echo hi", &state, &base);
@@ -933,6 +1060,24 @@ mod tests {
         }
     }
 
+    struct DenyAllHandler;
+
+    impl claurst_core::permissions::PermissionHandler for DenyAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Deny
+        }
+
+        fn request_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Deny
+        }
+    }
+
     fn allow_all_context() -> ToolContext {
         ToolContext {
             working_dir: std::env::temp_dir(),
@@ -953,6 +1098,8 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            trusted_checker_catalog: Default::default(),
+            catalog_view: None,
         }
     }
 
@@ -1029,13 +1176,11 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let result =
-            tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
         let elapsed = started.elapsed();
 
-        let result = result.expect(
-            "execute hung waiting on the detached grandchild's pty (regression of #184)",
-        );
+        let result = result
+            .expect("execute hung waiting on the detached grandchild's pty (regression of #184)");
         assert!(
             !result.is_error,
             "command should have succeeded, got: {}",
@@ -1050,6 +1195,243 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "execute should return promptly after the direct child exits, took {:?}",
             elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn large_unicode_output_retains_missing_middle_and_failure_tail() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        let command = "awk 'BEGIN { for (i=0; i<20000; i++) { if(i==10000) print \"distinctive-middle-fact\"; print \"🦀abcdefgh\" } print \"tail-failure\" }'; exit 7";
+        let result = PtyBashTool.execute(json!({"command":command}), &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.len() < 34_000);
+        assert!(result.content.contains("tail-failure"));
+        assert!(!result.content.contains("distinctive-middle-fact"));
+        assert!(!result.content.contains('\u{fffd}'));
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["command_status"], "completed");
+        assert_eq!(metadata["exit_code"], 7);
+        assert_eq!(metadata["partial"], false);
+        let id = metadata["evidence"]["id"].as_str().unwrap();
+        let (reference, original) = crate::evidence::EvidenceStore::for_context(&ctx)
+            .unwrap()
+            .read(id)
+            .unwrap();
+        assert!(!reference.partial);
+        assert!(original.starts_with("Command exited with code 7"));
+        assert!(original.contains("distinctive-middle-fact"));
+        assert!(original.contains("tail-failure"));
+        assert!(!original.contains('\u{fffd}'));
+        assert!(!original.contains(SHELL_STATE_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn successful_foreground_run_reports_typed_completion() {
+        let ctx = allow_all_context();
+        let result = PtyBashTool
+            .execute(json!({"command": "printf 'ok\\n'"}), &ctx)
+            .await;
+
+        assert!(!result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["command_status"], "completed");
+        assert_eq!(metadata["exit_code"], 0);
+        assert_eq!(metadata["partial"], false);
+        assert!(metadata.get("evidence").is_some());
+    }
+
+    #[tokio::test]
+    async fn background_run_reports_running_without_completion() {
+        let ctx = allow_all_context();
+        let result = PtyBashTool
+            .execute(
+                json!({"command": "sleep 1", "run_in_background": true}),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["command_status"], "running");
+        assert_eq!(metadata["exit_code"], Value::Null);
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["background"], true);
+        let task_id = metadata["task_id"].as_str().unwrap();
+        crate::background_processes::stop(task_id, &ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_foreground_input_is_typed_not_run() {
+        let ctx = allow_all_context();
+        let result = PtyBashTool.execute(json!({"timeout": "bad"}), &ctx).await;
+
+        assert!(result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["command_status"], "not_run");
+        assert_eq!(metadata["exit_code"], Value::Null);
+        assert_eq!(metadata["partial"], false);
+    }
+    #[tokio::test]
+    async fn timeout_retains_partial_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        let result = PtyBashTool
+            .execute(
+                json!({
+                    "command": "printf 'partial-before-timeout🦀\\n'; sleep 10",
+                    "timeout": 150u64,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"));
+        let id = result.metadata.as_ref().unwrap()["evidence"]["id"]
+            .as_str()
+            .unwrap();
+        let (reference, original) = crate::evidence::EvidenceStore::for_context(&ctx)
+            .unwrap()
+            .read(id)
+            .unwrap();
+        assert!(reference.partial);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_status"],
+            "unknown"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["command_status"],
+            "timed_out"
+        );
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], Value::Null);
+        assert!(original.contains("partial-before-timeout🦀"));
+        assert!(!original.contains(SHELL_STATE_SENTINEL));
+    }
+    #[tokio::test]
+    async fn cooperative_cancel_retains_partial_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        let ready = workspace.path().join("cancel-ready");
+        let trigger = ctx.cancel_token.clone();
+        let cancellation = async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            trigger.cancel();
+        };
+        let execution = PtyBashTool.execute(
+            json!({
+                "command":"printf 'captured-before-cancel🦀\\n'; touch cancel-ready; sleep 10",
+            }),
+            &ctx,
+        );
+        let (result, ()) = tokio::join!(execution, cancellation);
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_status"],
+            "unknown"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["command_status"],
+            "cancelled"
+        );
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], Value::Null);
+        let id = result.metadata.as_ref().unwrap()["evidence"]["id"]
+            .as_str()
+            .unwrap();
+        let (reference, text) = crate::evidence::EvidenceStore::for_context(&ctx)
+            .unwrap()
+            .read(id)
+            .unwrap();
+        assert!(reference.partial);
+        assert!(text.contains("captured-before-cancel🦀"));
+    }
+
+    #[tokio::test]
+    async fn neutral_filename_mention_does_not_authorize_deletion() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("reportfixture.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        let authorization = crate::deletion_intent::DeletionAuthorization::from_user_text(
+            "Inspect reportfixture.txt and tell me its length.",
+        );
+
+        let result = crate::deletion_intent::with_deletion_authorization(
+            authorization,
+            PtyBashTool.execute(json!({"command": "rm -- reportfixture.txt"}), &ctx),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.execution_status(),
+            Some(crate::ExecutionStatus::NotRun)
+        );
+        assert!(target.is_file(), "neutral mention must preserve the target");
+    }
+
+    #[tokio::test]
+    async fn explicit_target_bound_intent_preserves_allowed_deletion() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("authorizedfixture.txt");
+        std::fs::write(&target, "delete").unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        let authorization = crate::deletion_intent::DeletionAuthorization::from_user_text(
+            "Please delete authorizedfixture.txt.",
+        );
+
+        let result = crate::deletion_intent::with_deletion_authorization(
+            authorization,
+            PtyBashTool.execute(json!({"command": "rm -- authorizedfixture.txt"}), &ctx),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(!target.exists(), "authorized deletion should reach Bash");
+    }
+
+    #[tokio::test]
+    async fn explicit_intent_does_not_bypass_permission_denial() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("deniedfixture.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let mut ctx = allow_all_context();
+        ctx.working_dir = workspace.path().into();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        ctx.permission_handler = std::sync::Arc::new(DenyAllHandler);
+        let authorization = crate::deletion_intent::DeletionAuthorization::from_user_text(
+            "Please delete deniedfixture.txt.",
+        );
+
+        let result = crate::deletion_intent::with_deletion_authorization(
+            authorization,
+            PtyBashTool.execute(json!({"command": "rm -- deniedfixture.txt"}), &ctx),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.execution_status(),
+            Some(crate::ExecutionStatus::NotRun)
+        );
+        assert!(
+            target.is_file(),
+            "permission denial must preserve the target"
         );
     }
 }

@@ -1,10 +1,10 @@
 //! Provider/model/config management and import-config flow.
 
-use claurst_core::config::{Config, Settings};
+use super::App;
 use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::import_config_dialog::ImportConfigDialogState;
 use crate::model_picker::ModelPickerState;
-use super::App;
+use claurst_core::config::{Config, Settings};
 
 /// Return the environment variable name for a given provider ID.
 #[allow(dead_code)]
@@ -113,67 +113,398 @@ pub(super) fn import_config_picker_items() -> Vec<SelectItem> {
 
 pub(super) fn provider_picker_items() -> Vec<SelectItem> {
     vec![
-        SelectItem { id: "free".into(), title: "Free Mode".into(), description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "anthropic-oauth".into(), title: "Anthropic (Claude Pro/Max)".into(), description: "(subscription — browser login; draws from extra-usage)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
-        SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Local inference + cloud models".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "opencode-go".into(), title: "OpenCode Go".into(), description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "opencode-zen".into(), title: "OpenCode Zen".into(), description: "Free models + paid · Nemotron · Ring · MiniMax · DeepSeek".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "synthetic".into(), title: "Synthetic.dev".into(), description: "Hosted open weights".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "routing".into(), title: "routing.run".into(), description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "neuralwatt".into(), title: "NeuralWatt".into(), description: "Hosted open weights - energy-efficient".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
-        SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "Local inference server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
-        SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "Reasoning and coding models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "Hosted Mistral models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "Open model hosting".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "Command models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "xai".into(), title: "xAI".into(), description: "Grok models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "Enterprise OpenAI deployments".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "Enterprise foundation models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "Enterprise Google models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "Gateway for multiple providers".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI gateway and observability".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "Hosted community models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "nvidia".into(), title: "NVIDIA".into(), description: "Hosted NVIDIA models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "alibaba".into(), title: "Alibaba".into(), description: "Qwen and hosted models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "moonshotai".into(), title: "Moonshot AI".into(), description: "Hosted Moonshot models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "zhipuai".into(), title: "Zhipu AI".into(), description: "Hosted GLM models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "minimax".into(), title: "MiniMax".into(), description: "Anthropic-compatible (M3)".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+        SelectItem {
+            id: "free".into(),
+            title: "Free Mode".into(),
+            description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(),
+            category: "Popular".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "openai".into(),
+            title: "OpenAI".into(),
+            description: "(API key)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "openai-codex".into(),
+            title: "OpenAI Codex".into(),
+            description: "(ChatGPT Plus/Pro — browser login)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "github-copilot".into(),
+            title: "GitHub Copilot".into(),
+            description: "(GitHub subscription or token)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "google".into(),
+            title: "Google".into(),
+            description: "(API key)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "anthropic".into(),
+            title: "Anthropic".into(),
+            description: "(API key)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "anthropic-oauth".into(),
+            title: "Anthropic (Claude Pro/Max)".into(),
+            description: "(subscription — browser login; draws from extra-usage)".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "custom-openai".into(),
+            title: "Custom OpenAI-Compatible".into(),
+            description: "Custom URL + API key".into(),
+            category: "Advanced".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "openrouter".into(),
+            title: "OpenRouter".into(),
+            description: "100+ models with one key".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "vercel".into(),
+            title: "Vercel AI Gateway".into(),
+            description: "Gateway for AI SDK models".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "groq".into(),
+            title: "Groq".into(),
+            description: "Fast hosted inference".into(),
+            category: "Popular".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "ollama".into(),
+            title: "Ollama".into(),
+            description: "Local inference + cloud models".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "zai".into(),
+            title: "Z.AI".into(),
+            description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "opencode-go".into(),
+            title: "OpenCode Go".into(),
+            description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "opencode-zen".into(),
+            title: "OpenCode Zen".into(),
+            description: "Free models + paid · Nemotron · Ring · MiniMax · DeepSeek".into(),
+            category: "Popular".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "synthetic".into(),
+            title: "Synthetic.dev".into(),
+            description: "Hosted open weights".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "routing".into(),
+            title: "routing.run".into(),
+            description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "neuralwatt".into(),
+            title: "NeuralWatt".into(),
+            description: "Hosted open weights - energy-efficient".into(),
+            category: "Popular".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "cerebras".into(),
+            title: "Cerebras".into(),
+            description: "Fast hosted inference".into(),
+            category: "Other".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "sambanova".into(),
+            title: "SambaNova".into(),
+            description: "Fast hosted inference".into(),
+            category: "Other".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "lmstudio".into(),
+            title: "LM Studio".into(),
+            description: "Local model server".into(),
+            category: "Other".into(),
+            badge: Some("LOCAL".into()),
+        },
+        SelectItem {
+            id: "llamacpp".into(),
+            title: "llama.cpp".into(),
+            description: "Local inference server".into(),
+            category: "Other".into(),
+            badge: Some("LOCAL".into()),
+        },
+        SelectItem {
+            id: "deepseek".into(),
+            title: "DeepSeek".into(),
+            description: "Reasoning and coding models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "mistral".into(),
+            title: "Mistral".into(),
+            description: "Hosted Mistral models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "togetherai".into(),
+            title: "Together AI".into(),
+            description: "Open model hosting".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "perplexity".into(),
+            title: "Perplexity".into(),
+            description: "Search-augmented models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "cohere".into(),
+            title: "Cohere".into(),
+            description: "Command models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "xai".into(),
+            title: "xAI".into(),
+            description: "Grok models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "deepinfra".into(),
+            title: "DeepInfra".into(),
+            description: "Hosted open models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "azure".into(),
+            title: "Azure OpenAI".into(),
+            description: "Enterprise OpenAI deployments".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "amazon-bedrock".into(),
+            title: "AWS Bedrock".into(),
+            description: "Enterprise foundation models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "google-vertex".into(),
+            title: "Google Vertex AI".into(),
+            description: "Enterprise Google models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "sap-ai-core".into(),
+            title: "SAP AI Core".into(),
+            description: "Enterprise AI platform".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "gitlab".into(),
+            title: "GitLab Duo".into(),
+            description: "AI in GitLab".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "cloudflare-ai-gateway".into(),
+            title: "Cloudflare AI Gateway".into(),
+            description: "Gateway for multiple providers".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "cloudflare-workers-ai".into(),
+            title: "Cloudflare Workers AI".into(),
+            description: "Edge AI inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "helicone".into(),
+            title: "Helicone".into(),
+            description: "AI gateway and observability".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "huggingface".into(),
+            title: "Hugging Face".into(),
+            description: "Hosted community models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "nvidia".into(),
+            title: "NVIDIA".into(),
+            description: "Hosted NVIDIA models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "alibaba".into(),
+            title: "Alibaba".into(),
+            description: "Qwen and hosted models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "venice".into(),
+            title: "Venice AI".into(),
+            description: "Privacy-first AI".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "moonshotai".into(),
+            title: "Moonshot AI".into(),
+            description: "Hosted Moonshot models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "zhipuai".into(),
+            title: "Zhipu AI".into(),
+            description: "Hosted GLM models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "siliconflow".into(),
+            title: "SiliconFlow".into(),
+            description: "Hosted open models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "nebius".into(),
+            title: "Nebius".into(),
+            description: "Cloud inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "novita".into(),
+            title: "Novita".into(),
+            description: "Cloud inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "minimax".into(),
+            title: "MiniMax".into(),
+            description: "Anthropic-compatible (M3)".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "ovhcloud".into(),
+            title: "OVHcloud".into(),
+            description: "EU-hosted AI".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "scaleway".into(),
+            title: "Scaleway".into(),
+            description: "EU cloud AI".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "vultr".into(),
+            title: "Vultr".into(),
+            description: "Cloud inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "baseten".into(),
+            title: "Baseten".into(),
+            description: "Model serving".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "friendli".into(),
+            title: "Friendli".into(),
+            description: "Serverless inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "upstage".into(),
+            title: "Upstage".into(),
+            description: "Hosted Upstage models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "stepfun".into(),
+            title: "StepFun".into(),
+            description: "Hosted reasoning models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "fireworks".into(),
+            title: "Fireworks AI".into(),
+            description: "Fast inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
     ]
 }
 
 impl App {
     pub fn open_import_config_picker(&mut self) {
-        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_picker =
+            DialogSelectState::new("Import config", import_config_picker_items());
         self.import_config_picker.open();
     }
 
@@ -242,7 +573,11 @@ impl App {
         crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
     }
 
-    pub(super) fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+    pub(super) fn open_model_picker_for_provider(
+        &mut self,
+        provider_id: &str,
+        title: Option<String>,
+    ) {
         self.dismiss_error_notifications();
 
         let cache_path = dirs::cache_dir()
@@ -294,7 +629,12 @@ impl App {
         );
     }
 
-    pub(super) fn activate_provider(&mut self, provider_id: String, provider_name: String, status_prefix: &str) {
+    pub(super) fn activate_provider(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        status_prefix: &str,
+    ) {
         let picker_title = provider_name.clone();
         self.fast_mode = false;
         self.set_provider_default(provider_id.clone());
@@ -306,7 +646,10 @@ impl App {
 
     pub(super) fn persist_custom_provider_base_url(&self, base_url: &str) {
         let mut settings = Settings::load_sync().unwrap_or_default();
-        let entry = settings.providers.entry("custom-openai".to_string()).or_default();
+        let entry = settings
+            .providers
+            .entry("custom-openai".to_string())
+            .or_default();
         entry.api_base = Some(base_url.to_string());
         entry.enabled = true;
         let _ = settings.save_sync();
@@ -416,14 +759,17 @@ impl App {
         self.provider_registry = provider_registry;
         self.model_registry = claurst_api::ModelRegistry::new();
         // Re-layer user metadata overrides (issue #309) onto the fresh registry.
-        self.model_registry.apply_model_overrides(&self.config.model_overrides);
+        self.model_registry
+            .apply_model_overrides(&self.config.model_overrides);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
-        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_picker =
+            DialogSelectState::new("Import config", import_config_picker_items());
         self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
-        self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
+        self.custom_provider_dialog =
+            crate::custom_provider_dialog::CustomProviderDialogState::new();
         self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
@@ -437,5 +783,4 @@ impl App {
         self.status_message = Some(status_message);
         self.clear_prompt();
     }
-
 }

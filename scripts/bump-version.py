@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Stamp a new Claurst version into every canonical source.
+"""Stamp a new Forge version into every canonical source.
 
 Usage: scripts/bump-version.py vMAJOR.MINOR.PATCH
 
 Touches:
   - src-rust/Cargo.toml                 workspace.package.version
-  - src-rust/Cargo.lock                 12 claurst* workspace package entries
+  - src-rust/Cargo.lock                 internal claurst* workspace package entries
   - npm/package.json                    version field
   - README.md                           shields.io badge (text + alt) + Beta callout
   - docs/index.md                       **Version:** line
-  - docs/installation.md                "claurst X.Y.Z" sample output
   - src-rust/crates/acp/registry-template/agent.json
                                         version field + 5 release download URLs
 
@@ -95,7 +94,7 @@ def main() -> None:
         count=1,
     )
 
-    # 2. Cargo.lock — every claurst* workspace package
+    # 2. Cargo.lock — internal crate names intentionally retain claurst* compatibility
     bump_cargo_lock(version)
 
     # 3. npm/package.json
@@ -119,15 +118,7 @@ def main() -> None:
         count=1,
     )
 
-    # 6. docs/installation.md — sample output line ("claurst X.Y.Z")
-    replace(
-        ROOT / "docs" / "installation.md",
-        r"^claurst \d+\.\d+\.\d+$",
-        f"claurst {version}",
-        count=1,
-    )
-
-    # 7. ACP registry template — version field + 5 release download URLs
+    # 6. ACP registry template — version field + release download URLs
     agent = ROOT / "src-rust" / "crates" / "acp" / "registry-template" / "agent.json"
     text = agent.read_text(encoding="utf-8")
     text, n_v = re.subn(r'"version": "\d+\.\d+\.\d+"', f'"version": "{version}"', text, count=1)

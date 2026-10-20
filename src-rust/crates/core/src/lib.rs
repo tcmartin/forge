@@ -11,22 +11,28 @@
 // return domain-specific types, not the std `FromStr` trait.
 #![allow(clippy::should_implement_trait)]
 
+pub mod dispatch;
+
 // Branded provider / model identifier newtypes.
 pub mod provider_id;
-pub use provider_id::{ProviderId, ModelId};
+pub use provider_id::{ModelId, ProviderId};
 
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
+mod session_fork;
 pub mod session_storage;
 
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
-pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
+pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).
 pub mod attachments;
 
 // Git utilities (T4-3).
 pub mod git_utils;
+
+// Bounded typed media descriptors and ingress validation.
+pub mod media;
 
 // Credential storage for provider API keys and OAuth tokens.
 pub mod auth_store;
@@ -36,18 +42,20 @@ pub use auth_store::{AuthStore, StoredCredential};
 pub mod device_code;
 
 // Utility modules ported from src/utils/
+pub mod auto_mode;
+pub mod crypto_utils;
+pub mod format_utils;
+pub mod spinner;
+pub mod status_notices;
 pub mod token_budget;
 pub mod truncate;
-pub mod format_utils;
-pub mod crypto_utils;
-pub mod status_notices;
-pub mod auto_mode;
-pub mod spinner;
-pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sample_completion_verb};
+pub use spinner::{
+    sample_completion_verb, sample_spinner_verb, SPINNER_VERBS, TURN_COMPLETION_VERBS,
+};
 
 // Remote session sync and cloud session API (T3-1, T3-2).
-pub mod remote_session;
 pub mod cloud_session;
+pub mod remote_session;
 
 // AGENTS.md hierarchical memory loading (T4-1).
 pub mod claudemd;
@@ -63,8 +71,10 @@ pub mod snapshot;
 
 // Per-session durable objectives (/goal feature).
 pub mod goal;
-pub use goal::{Goal, GoalError, GoalStatus, GoalStore, MAX_GOAL_TURNS, MAX_OBJECTIVE_CHARS,
-               goal_continuation_message, goal_kickoff_message, goal_system_prompt_addendum, goals_enabled};
+pub use goal::{
+    goal_continuation_message, goal_kickoff_message, goal_system_prompt_addendum, goals_enabled,
+    Goal, GoalError, GoalStatus, GoalStore, MAX_GOAL_TURNS, MAX_OBJECTIVE_CHARS,
+};
 
 // Feature flag management via GrowthBook.
 pub mod feature_flags;
@@ -74,7 +84,7 @@ pub mod mcp_templates;
 
 // IDE environment detection (VS Code, Cursor, JetBrains, …).
 pub mod ide;
-pub use ide::{IdeKind, detect_ide};
+pub use ide::{detect_ide, IdeKind};
 
 // Background update checker — compares running version against GitHub releases.
 pub mod update_check;
@@ -84,29 +94,36 @@ pub use update_check::{check_for_updates, UpdateInfo};
 pub mod share_export;
 
 // Re-export commonly used types at the crate root
+pub use config::{
+    builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
+    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat,
+    PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
+};
 pub use error::{ClaudeError, Result};
+pub use import_config::{
+    build_import_preview, execute_import, summarize_import_result, ClaudeMdPreview,
+    ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction,
+    PreviewField, SettingsPreview,
+};
 pub use types::{
-    ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
+    CitationsConfig, ContentBlock, DocumentSource, ImageSource, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
-pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
-pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
 pub use cost::CostTracker;
-pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
+pub use history::ConversationSession;
 pub use paths::claurst_home;
 pub use permissions::{
-    AutoPermissionHandler, InteractivePermissionHandler,
-    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
-    PermissionAction, PermissionDecision, PermissionHandler,
-    PermissionLevel, PermissionManager, PermissionRequest,
+    format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
+    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler, PermissionAction,
+    PermissionDecision, PermissionHandler, PermissionLevel, PermissionManager, PermissionRequest,
     PermissionRule, PermissionScope, SerializedPermissionRule,
-    format_permission_reason,
 };
+pub use skill_discovery::{discover_skills, parse_skill_file, DiscoveredSkill};
 
 // ---------------------------------------------------------------------------
 // error module
@@ -147,6 +164,22 @@ pub mod error {
         #[error("Context window exceeded")]
         ContextWindowExceeded,
 
+        /// Rejected locally before an inference HTTP request. Query planning
+        /// may omit optional history; transport retries must never handle it.
+        #[error("Preflight estimate: {input_tokens} input tokens and {wire_bytes} request bytes; limits are {input_limit_tokens} input tokens and {wire_byte_limit} bytes (context {context_limit_tokens}, output reserve {output_reserve_tokens}, source {budget_source}). Reduce this request or configure a larger finite limit.")]
+        RequestBudgetExceeded {
+            input_tokens: u64,
+            input_limit_tokens: u64,
+            wire_bytes: u64,
+            wire_byte_limit: u64,
+            context_limit_tokens: u64,
+            output_reserve_tokens: u64,
+            budget_source: String,
+        },
+
+        #[error("Inference dispatch denied: {0}")]
+        InferenceDispatchDenied(crate::dispatch::DispatchDenied),
+
         #[error("Max tokens reached")]
         MaxTokensReached,
 
@@ -184,6 +217,50 @@ pub mod error {
                 self,
                 ClaudeError::ContextWindowExceeded | ClaudeError::MaxTokensReached
             )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ClaudeError;
+
+        #[test]
+        fn preflight_budget_failure_is_not_a_transport_or_compaction_retry() {
+            let error = ClaudeError::RequestBudgetExceeded {
+                input_tokens: 28_001,
+                input_limit_tokens: 28_000,
+                wire_bytes: 100_001,
+                wire_byte_limit: 100_000,
+                context_limit_tokens: 32_000,
+                output_reserve_tokens: 4_000,
+                budget_source: "unknown_fallback".into(),
+            };
+            assert!(!error.is_retryable());
+            assert!(!error.is_context_limit());
+            let display = error.to_string();
+            for numeric_metadata in [
+                "28001",
+                "28000",
+                "100001",
+                "100000",
+                "32000",
+                "4000",
+                "unknown_fallback",
+            ] {
+                assert!(display.contains(numeric_metadata));
+            }
+        }
+
+        #[test]
+        fn dispatch_denial_is_not_retryable_or_a_context_limit() {
+            let error =
+                ClaudeError::InferenceDispatchDenied(crate::dispatch::DispatchDenied::InFlight);
+            assert!(!error.is_retryable());
+            assert!(!error.is_context_limit());
+            assert_eq!(
+                error.to_string(),
+                "Inference dispatch denied: dispatch denied: in flight"
+            );
         }
     }
 }
@@ -474,7 +551,10 @@ pub mod types {
         }
 
         /// Create a user message representing a `!`-prefixed local shell command with output.
-        pub fn user_local_command_output(command: impl Into<String>, output: impl Into<String>) -> Self {
+        pub fn user_local_command_output(
+            command: impl Into<String>,
+            output: impl Into<String>,
+        ) -> Self {
             Self {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::UserLocalCommandOutput {
@@ -664,7 +744,7 @@ pub mod config {
     }
 
     fn default_file_injection_max_size() -> usize {
-        100  // 100 KB
+        100 // 100 KB
     }
 
     /// Default total request timeout (seconds) when the user has not configured
@@ -803,8 +883,6 @@ pub mod config {
         FixedCaps { manager_usd: f64, executor_usd: f64 },
     }
 
-    
-
     /// Configuration for manager-executor agent architecture.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ManagedAgentConfig {
@@ -827,8 +905,12 @@ pub mod config {
         pub executor_isolation: bool,
     }
 
-    fn default_executor_max_turns() -> u32 { 10 }
-    fn default_max_concurrent_executors() -> u32 { 4 }
+    fn default_executor_max_turns() -> u32 {
+        10
+    }
+    fn default_max_concurrent_executors() -> u32 {
+        4
+    }
 
     /// A named preset for common manager-executor configurations.
     pub struct ManagedAgentPreset {
@@ -1035,6 +1117,9 @@ pub mod config {
         pub custom_system_prompt: Option<String>,
         pub append_system_prompt: Option<String>,
         pub disable_claude_mds: bool,
+        /// Disable external prompt templates, skills and plugins for this session.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub disable_extensions: bool,
         pub project_dir: Option<PathBuf>,
         #[serde(default)]
         pub workspace_paths: Vec<PathBuf>,
@@ -1067,18 +1152,34 @@ pub mod config {
         /// Skill-discovery configuration (copied from Settings on load).
         #[serde(default)]
         pub skills: SkillsConfig,
+        /// Host-owned plugin prompt paths, shared across runtime Config clones.
+        /// Settings cannot supply capabilities or persisted runtime metadata.
+        #[serde(skip)]
+        pub runtime_skills:
+            std::sync::Arc<parking_lot::RwLock<Vec<crate::skill_discovery::SkillSource>>>,
         /// Managed agent (manager-executor) configuration.
         #[serde(default)]
         pub managed_agents: Option<ManagedAgentConfig>,
         /// Shadow-git auto-commit snapshot system.  `Some(true)` = enabled.  `None` or `Some(false)` = disabled (default).
         /// Set via `--auto-commits` flag or `"autoCommits": true` in settings.json.
-        #[serde(default, rename = "autoCommits", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "autoCommits",
+            skip_serializing_if = "Option::is_none"
+        )]
         pub auto_commits: Option<bool>,
         /// Enable cursor blinking in the chat prompt. Defaults to false (disabled).
-        #[serde(default, rename = "cursorBlinkEnabled", skip_serializing_if = "is_false")]
+        #[serde(
+            default,
+            rename = "cursorBlinkEnabled",
+            skip_serializing_if = "is_false"
+        )]
         pub cursor_blink_enabled: bool,
         /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
-        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
+        #[serde(
+            default = "default_file_autocomplete_limit",
+            rename = "fileAutocompleteLimit"
+        )]
         pub file_autocomplete_limit: usize,
         /// Whether to show hidden files in file autocomplete. Defaults to false.
         #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
@@ -1092,7 +1193,10 @@ pub mod config {
         /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
         /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
-        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
+        #[serde(
+            default = "default_file_injection_max_size",
+            rename = "fileInjectionMaxSize"
+        )]
         pub file_injection_max_size: usize,
         /// Total request timeout in seconds applied to provider HTTP clients.
         /// Slow local models (CPU inference, large MoE) can take several minutes
@@ -1112,7 +1216,11 @@ pub mod config {
         /// `"mouseCapture": false` to release the mouse to the terminal so native
         /// click-drag selection and copy/paste work without lag (issue #104).
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
-        #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "mouseCapture",
+            skip_serializing_if = "Option::is_none"
+        )]
         pub mouse_capture: Option<bool>,
     }
 
@@ -1301,7 +1409,10 @@ pub mod config {
         #[serde(default = "default_true", rename = "autoCompact")]
         pub auto_compact: bool,
         /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
-        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
+        #[serde(
+            default = "default_file_autocomplete_limit",
+            rename = "fileAutocompleteLimit"
+        )]
         pub file_autocomplete_limit: usize,
         /// Whether to show hidden files in file autocomplete. Defaults to false.
         #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
@@ -1315,7 +1426,10 @@ pub mod config {
         /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
         /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
-        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
+        #[serde(
+            default = "default_file_injection_max_size",
+            rename = "fileInjectionMaxSize"
+        )]
         pub file_injection_max_size: usize,
     }
 
@@ -1333,8 +1447,7 @@ pub mod config {
     }
 
     /// Configuration for a file formatter tool.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[derive(Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct FormatterConfig {
         /// Command to run, e.g. `["prettier", "--write"]`.
         pub command: Vec<String>,
@@ -1344,8 +1457,6 @@ pub mod config {
         #[serde(default)]
         pub disabled: bool,
     }
-
-    
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct ProjectSettings {
@@ -1435,7 +1546,9 @@ pub mod config {
                 Some("mistral") => "mistral-large-latest",
                 Some("xai") => "grok-2",
                 Some("openrouter") => "anthropic/claude-sonnet-4",
-                Some("togetherai") | Some("together-ai") => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                Some("togetherai") | Some("together-ai") => {
+                    "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+                }
                 Some("perplexity") => "sonar-pro",
                 Some("cohere") => "command-r-plus",
                 // DashScope runs as "qwen" at runtime but is "alibaba" in the
@@ -1449,12 +1562,11 @@ pub mod config {
                 Some("llamacpp") => "default",
                 Some("custom-openai") => "default",
                 Some("azure") => "gpt-4o",
-                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
+                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6",
                 Some("venice") => "llama-3.3-70b",
                 _ => crate::constants::DEFAULT_MODEL, // Anthropic default
             }
         }
-
 
         /// Resolve the effective max-tokens.
         pub fn effective_max_tokens(&self) -> u32 {
@@ -1578,25 +1690,43 @@ pub mod config {
                     let refreshed = 'refresh: {
                         let Ok(client) = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(30))
-                            .build() else { break 'refresh None; };
+                            .build()
+                        else {
+                            break 'refresh None;
+                        };
                         let Ok(resp) = client
                             .post(crate::oauth::TOKEN_URL)
                             .header("content-type", "application/json")
                             .json(&body)
                             .send()
-                            .await else { break 'refresh None; };
-                        if !resp.status().is_success() { break 'refresh None; }
-                        let Ok(data) = resp.json::<serde_json::Value>().await else { break 'refresh None; };
+                            .await
+                        else {
+                            break 'refresh None;
+                        };
+                        if !resp.status().is_success() {
+                            break 'refresh None;
+                        }
+                        let Ok(data) = resp.json::<serde_json::Value>().await else {
+                            break 'refresh None;
+                        };
                         let new_at = data["access_token"].as_str().unwrap_or("").to_string();
-                        if new_at.is_empty() { break 'refresh None; }
+                        if new_at.is_empty() {
+                            break 'refresh None;
+                        }
                         let new_rt = data["refresh_token"].as_str().map(String::from);
                         let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
                         let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
                         let scopes: Vec<String> = data["scope"]
-                            .as_str().unwrap_or("").split_whitespace().map(String::from).collect();
+                            .as_str()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .map(String::from)
+                            .collect();
                         let mut r = tokens.clone();
                         r.access_token = new_at;
-                        if let Some(nrt) = new_rt { r.refresh_token = Some(nrt); }
+                        if let Some(nrt) = new_rt {
+                            r.refresh_token = Some(nrt);
+                        }
                         r.expires_at_ms = Some(exp_ms);
                         r.scopes = scopes;
                         let _ = r.save().await;
@@ -1610,7 +1740,9 @@ pub mod config {
                 tokens
             };
 
-            tokens.effective_credential().map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+            tokens
+                .effective_credential()
+                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
         }
 
         pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
@@ -1818,19 +1950,31 @@ pub mod config {
             }
             // Merge top-level `providers` map into config.provider_configs.
             for (id, pc) in &self.providers {
-                config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
+                config
+                    .provider_configs
+                    .entry(id.clone())
+                    .or_insert_with(|| pc.clone());
             }
             // Merge top-level `modelOverrides` into config.model_overrides
             // (nested `config` block wins for keys present in both).
             for (id, ov) in &self.model_overrides {
-                config.model_overrides.entry(id.clone()).or_insert_with(|| ov.clone());
+                config
+                    .model_overrides
+                    .entry(id.clone())
+                    .or_insert_with(|| ov.clone());
             }
             // Copy top-level formatters and commands into config.
             for (k, v) in &self.formatter {
-                config.formatter.entry(k.clone()).or_insert_with(|| v.clone());
+                config
+                    .formatter
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
             }
             for (k, v) in &self.commands {
-                config.commands.entry(k.clone()).or_insert_with(|| v.clone());
+                config
+                    .commands
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
             }
             // Copy top-level agent definitions into config.
             for (k, v) in &self.agents {
@@ -1928,7 +2072,9 @@ pub mod config {
                 mut base: HashMap<K, V>,
                 over: HashMap<K, V>,
             ) -> HashMap<K, V> {
-                for (k, v) in over { base.insert(k, v); }
+                for (k, v) in over {
+                    base.insert(k, v);
+                }
                 base
             }
             // Merge the embedded Config structs.
@@ -1947,47 +2093,115 @@ pub mod config {
                 },
                 verbose: over.config.verbose || base.config.verbose,
                 output_format: over.config.output_format,
-                mcp_servers: { let mut v = base.config.mcp_servers; v.extend(over.config.mcp_servers); v },
-                lsp_servers: { let mut v = base.config.lsp_servers; v.extend(over.config.lsp_servers); v },
-                allowed_tools: { let mut v = base.config.allowed_tools; v.extend(over.config.allowed_tools); v.dedup(); v },
-                disallowed_tools: { let mut v = base.config.disallowed_tools; v.extend(over.config.disallowed_tools); v.dedup(); v },
+                mcp_servers: {
+                    let mut v = base.config.mcp_servers;
+                    v.extend(over.config.mcp_servers);
+                    v
+                },
+                lsp_servers: {
+                    let mut v = base.config.lsp_servers;
+                    v.extend(over.config.lsp_servers);
+                    v
+                },
+                allowed_tools: {
+                    let mut v = base.config.allowed_tools;
+                    v.extend(over.config.allowed_tools);
+                    v.dedup();
+                    v
+                },
+                disallowed_tools: {
+                    let mut v = base.config.disallowed_tools;
+                    v.extend(over.config.disallowed_tools);
+                    v.dedup();
+                    v
+                },
                 env: merge_map(base.config.env, over.config.env),
-                enable_all_mcp_servers: over.config.enable_all_mcp_servers || base.config.enable_all_mcp_servers,
-                custom_system_prompt: over.config.custom_system_prompt.or(base.config.custom_system_prompt),
-                append_system_prompt: over.config.append_system_prompt.or(base.config.append_system_prompt),
-                disable_claude_mds: over.config.disable_claude_mds || base.config.disable_claude_mds,
+                enable_all_mcp_servers: over.config.enable_all_mcp_servers
+                    || base.config.enable_all_mcp_servers,
+                custom_system_prompt: over
+                    .config
+                    .custom_system_prompt
+                    .or(base.config.custom_system_prompt),
+                append_system_prompt: over
+                    .config
+                    .append_system_prompt
+                    .or(base.config.append_system_prompt),
+                disable_claude_mds: over.config.disable_claude_mds
+                    || base.config.disable_claude_mds,
+                disable_extensions: over.config.disable_extensions
+                    || base.config.disable_extensions,
                 project_dir: over.config.project_dir.or(base.config.project_dir),
-                workspace_paths: { let mut v = base.config.workspace_paths; v.extend(over.config.workspace_paths); v },
-                additional_dirs: { let mut v = base.config.additional_dirs; v.extend(over.config.additional_dirs); v },
+                workspace_paths: {
+                    let mut v = base.config.workspace_paths;
+                    v.extend(over.config.workspace_paths);
+                    v
+                },
+                additional_dirs: {
+                    let mut v = base.config.additional_dirs;
+                    v.extend(over.config.additional_dirs);
+                    v
+                },
                 hooks: merge_map(base.config.hooks, over.config.hooks),
                 provider: over.config.provider.or(base.config.provider),
-                provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
-                model_overrides: merge_map(base.config.model_overrides, over.config.model_overrides),
+                provider_configs: merge_map(
+                    base.config.provider_configs,
+                    over.config.provider_configs,
+                ),
+                model_overrides: merge_map(
+                    base.config.model_overrides,
+                    over.config.model_overrides,
+                ),
                 formatter: merge_map(base.config.formatter, over.config.formatter),
                 commands: merge_map(base.config.commands, over.config.commands),
                 agents: merge_map(base.config.agents, over.config.agents),
+                runtime_skills: base.config.runtime_skills,
                 skills: {
                     let mut paths = base.config.skills.paths;
-                    for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    for p in over.config.skills.paths {
+                        if !paths.contains(&p) {
+                            paths.push(p);
+                        }
+                    }
                     let mut urls = base.config.skills.urls;
-                    for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
+                    for u in over.config.skills.urls {
+                        if !urls.contains(&u) {
+                            urls.push(u);
+                        }
+                    }
                     SkillsConfig { paths, urls }
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
-                cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
-                file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
-                file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
-                file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
-                file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
-                request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                cursor_blink_enabled: over.config.cursor_blink_enabled
+                    || base.config.cursor_blink_enabled,
+                file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 {
+                    over.config.file_autocomplete_limit
+                } else {
+                    base.config.file_autocomplete_limit
+                },
+                file_autocomplete_show_hidden_files: over
+                    .config
+                    .file_autocomplete_show_hidden_files
+                    || base.config.file_autocomplete_show_hidden_files,
+                file_injection_enabled: over.config.file_injection_enabled
+                    || base.config.file_injection_enabled,
+                file_injection_max_size: if over.config.file_injection_max_size != 0 {
+                    over.config.file_injection_max_size
+                } else {
+                    base.config.file_injection_max_size
+                },
+                request_timeout_secs: over
+                    .config
+                    .request_timeout_secs
+                    .or(base.config.request_timeout_secs),
             };
             Self {
                 config: merged_config,
                 version: over.version.or(base.version),
                 projects: merge_map(base.projects, over.projects),
-                remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
+                remote_control_at_startup: over.remote_control_at_startup
+                    || base.remote_control_at_startup,
                 // SECURITY: only the user's global settings may grant blanket
                 // trust to project MCP servers. A project's own settings file
                 // (`over`) must NOT be able to flip this on — otherwise a
@@ -2000,10 +2214,23 @@ pub mod config {
                 // pre-approve bash command prefixes.
                 skip_dangerous_mode_permission_prompt: base.skip_dangerous_mode_permission_prompt,
                 allowed_bash_prefixes: base.allowed_bash_prefixes,
-                permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
-                enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
-                disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
-                has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
+                permission_rules: {
+                    let mut v = base.permission_rules;
+                    v.extend(over.permission_rules);
+                    v
+                },
+                enabled_plugins: {
+                    let mut s = base.enabled_plugins;
+                    s.extend(over.enabled_plugins);
+                    s
+                },
+                disabled_plugins: {
+                    let mut s = base.disabled_plugins;
+                    s.extend(over.disabled_plugins);
+                    s
+                },
+                has_completed_onboarding: over.has_completed_onboarding
+                    || base.has_completed_onboarding,
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
@@ -2013,9 +2240,17 @@ pub mod config {
                 agents: merge_map(base.agents, over.agents),
                 skills: {
                     let mut paths = base.skills.paths;
-                    for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    for p in over.skills.paths {
+                        if !paths.contains(&p) {
+                            paths.push(p);
+                        }
+                    }
                     let mut urls = base.skills.urls;
-                    for u in over.skills.urls { if !urls.contains(&u) { urls.push(u); } }
+                    for u in over.skills.urls {
+                        if !urls.contains(&u) {
+                            urls.push(u);
+                        }
+                    }
                     SkillsConfig { paths, urls }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
@@ -2027,10 +2262,19 @@ pub mod config {
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
                 auto_compact: over.auto_compact || base.auto_compact,
-                file_autocomplete_limit: if over.file_autocomplete_limit != 0 { over.file_autocomplete_limit } else { base.file_autocomplete_limit },
-                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
+                file_autocomplete_limit: if over.file_autocomplete_limit != 0 {
+                    over.file_autocomplete_limit
+                } else {
+                    base.file_autocomplete_limit
+                },
+                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files
+                    || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
-                file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
+                file_injection_max_size: if over.file_injection_max_size != 0 {
+                    over.file_injection_max_size
+                } else {
+                    base.file_injection_max_size
+                },
             }
         }
     }
@@ -2045,7 +2289,9 @@ pub mod config {
 
         while let Some(ch) = chars.next() {
             if in_string {
-                if ch == '"' && prev_char != '\\' { in_string = false; }
+                if ch == '"' && prev_char != '\\' {
+                    in_string = false;
+                }
                 result.push(ch);
                 prev_char = ch;
                 continue;
@@ -2060,15 +2306,24 @@ pub mod config {
                 match chars.peek() {
                     Some('/') => {
                         // Line comment — skip to end of line.
-                        for c in chars.by_ref() { if c == '\n' { result.push('\n'); break; } }
+                        for c in chars.by_ref() {
+                            if c == '\n' {
+                                result.push('\n');
+                                break;
+                            }
+                        }
                     }
                     Some('*') => {
                         // Block comment — skip until `*/`.
                         chars.next();
                         let mut prev = '\0';
                         for c in chars.by_ref() {
-                            if prev == '*' && c == '/' { break; }
-                            if c == '\n' { result.push('\n'); }
+                            if prev == '*' && c == '/' {
+                                break;
+                            }
+                            if c == '\n' {
+                                result.push('\n');
+                            }
                             prev = c;
                         }
                     }
@@ -2090,16 +2345,14 @@ pub mod config {
         loop {
             match result.find("{env:") {
                 None => break,
-                Some(start) => {
-                    match result[start..].find('}') {
-                        None => break,
-                        Some(rel_end) => {
-                            let var_name = result[start + 5..start + rel_end].to_string();
-                            let value = std::env::var(&var_name).unwrap_or_default();
-                            result.replace_range(start..start + rel_end + 1, &value);
-                        }
+                Some(start) => match result[start..].find('}') {
+                    None => break,
+                    Some(rel_end) => {
+                        let var_name = result[start + 5..start + rel_end].to_string();
+                        let value = std::env::var(&var_name).unwrap_or_default();
+                        result.replace_range(start..start + rel_end + 1, &value);
                     }
-                }
+                },
             }
         }
         result
@@ -2135,11 +2388,9 @@ pub mod config {
 
             let error = replacement.save_to_path_sync(&path).unwrap_err();
 
-            assert!(
-                error
-                    .to_string()
-                    .contains("Refusing to overwrite malformed settings file")
-            );
+            assert!(error
+                .to_string()
+                .contains("Refusing to overwrite malformed settings file"));
             assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
         }
 
@@ -2150,14 +2401,14 @@ pub mod config {
             tokio::fs::write(&path, MALFORMED_SETTINGS).await.unwrap();
 
             let load_error = Settings::load_from_path(&path).await.unwrap_err();
-            assert!(load_error.to_string().contains("Failed to parse settings file"));
+            assert!(load_error
+                .to_string()
+                .contains("Failed to parse settings file"));
 
             let save_error = Settings::default().save_to_path(&path).await.unwrap_err();
-            assert!(
-                save_error
-                    .to_string()
-                    .contains("Refusing to overwrite malformed settings file")
-            );
+            assert!(save_error
+                .to_string()
+                .contains("Refusing to overwrite malformed settings file"));
             assert_eq!(
                 tokio::fs::read_to_string(path).await.unwrap(),
                 MALFORMED_SETTINGS
@@ -2182,7 +2433,10 @@ pub mod config {
 
         #[test]
         fn global_request_timeout_serde_roundtrips_with_camelcase_key() {
-            let config = Config { request_timeout_secs: Some(1800), ..Default::default() };
+            let config = Config {
+                request_timeout_secs: Some(1800),
+                ..Default::default()
+            };
             // Serialises with the documented camelCase key.
             let json = serde_json::to_string(&config).expect("serialise");
             assert!(
@@ -2199,23 +2453,24 @@ pub mod config {
         fn snake_case_alias_also_parses() {
             // Patch a fully-serialised config to use the snake_case alias and
             // confirm it still deserialises (back-compat with snake_case keys).
-            let mut value =
-                serde_json::to_value(Config::default()).expect("to_value");
+            let mut value = serde_json::to_value(Config::default()).expect("to_value");
             let obj = value.as_object_mut().unwrap();
             obj.remove("requestTimeoutSecs");
-            obj.insert(
-                "request_timeout_secs".to_string(),
-                serde_json::json!(900),
-            );
-            let parsed: Config =
-                serde_json::from_value(value).expect("alias should parse");
+            obj.insert("request_timeout_secs".to_string(), serde_json::json!(900));
+            let parsed: Config = serde_json::from_value(value).expect("alias should parse");
             assert_eq!(parsed.request_timeout_secs, Some(900));
         }
 
         #[test]
         fn per_provider_override_wins_over_global() {
-            let mut config = Config { request_timeout_secs: Some(1200), ..Default::default() };
-            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
+            let mut config = Config {
+                request_timeout_secs: Some(1200),
+                ..Default::default()
+            };
+            let provider = ProviderConfig {
+                request_timeout_secs: Some(3600),
+                ..Default::default()
+            };
             config
                 .provider_configs
                 .insert("ollama".to_string(), provider);
@@ -2229,7 +2484,10 @@ pub mod config {
         fn effective_config_merges_top_level_provider_timeout() {
             let mut settings = Settings::default();
             settings.config.request_timeout_secs = Some(1200);
-            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
+            let provider = ProviderConfig {
+                request_timeout_secs: Some(3600),
+                ..Default::default()
+            };
             settings.providers.insert("ollama".to_string(), provider);
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
@@ -2242,20 +2500,35 @@ pub mod config {
             // Nested `config` block wins for a key present in both.
             settings.config.model_overrides.insert(
                 "custom-openai/a".to_string(),
-                ModelOverride { context_window: Some(111), ..Default::default() },
+                ModelOverride {
+                    context_window: Some(111),
+                    ..Default::default()
+                },
             );
             settings.model_overrides.insert(
                 "custom-openai/a".to_string(),
-                ModelOverride { context_window: Some(999), ..Default::default() },
+                ModelOverride {
+                    context_window: Some(999),
+                    ..Default::default()
+                },
             );
             // Top-level-only key is folded in.
             settings.model_overrides.insert(
                 "custom-openai/b".to_string(),
-                ModelOverride { context_window: Some(222), ..Default::default() },
+                ModelOverride {
+                    context_window: Some(222),
+                    ..Default::default()
+                },
             );
             let config = settings.effective_config();
-            assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
-            assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+            assert_eq!(
+                config.model_overrides["custom-openai/a"].context_window,
+                Some(111)
+            );
+            assert_eq!(
+                config.model_overrides["custom-openai/b"].context_window,
+                Some(222)
+            );
         }
 
         #[test]
@@ -2286,7 +2559,10 @@ pub mod config {
 
         #[test]
         fn zero_is_treated_as_unset() {
-            let config = Config { request_timeout_secs: Some(0), ..Default::default() };
+            let config = Config {
+                request_timeout_secs: Some(0),
+                ..Default::default()
+            };
             assert_eq!(
                 config.resolve_request_timeout_secs("openai"),
                 DEFAULT_REQUEST_TIMEOUT_SECS
@@ -2346,6 +2622,7 @@ pub mod constants {
     pub const TOOL_NAME_TASK_LIST: &str = "TaskList";
     pub const TOOL_NAME_TASK_STOP: &str = "TaskStop";
     pub const TOOL_NAME_TASK_OUTPUT: &str = "TaskOutput";
+    pub const TOOL_NAME_TASK_ACCEPT: &str = "TaskAccept";
     pub const TOOL_NAME_ENTER_PLAN_MODE: &str = "EnterPlanMode";
     pub const TOOL_NAME_EXIT_PLAN_MODE: &str = "ExitPlanMode";
     pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
@@ -2400,10 +2677,7 @@ pub mod context {
 
             // Platform information
             parts.push(format!("Platform: {}", std::env::consts::OS));
-            parts.push(format!(
-                "Working directory: {}",
-                self.cwd.display()
-            ));
+            parts.push(format!("Working directory: {}", self.cwd.display()));
 
             if let Some(git_context) = self.get_git_context().await {
                 parts.push(git_context);
@@ -2422,9 +2696,7 @@ pub mod context {
         pub async fn build_user_context(&self) -> String {
             let mut parts = vec![];
 
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
+            let date = chrono::Local::now().format("%A, %B %d, %Y").to_string();
             parts.push(format!("Today's date is {}.", date));
 
             if !self.disable_claude_mds {
@@ -2700,10 +2972,7 @@ pub mod permissions {
                 } else {
                     "\nThis will write to the filesystem."
                 };
-                format!(
-                    "{} wants to write to `{}`{}",
-                    tool_name, target, extra
-                )
+                format!("{} wants to write to `{}`{}", tool_name, target, extra)
             }
             PermissionLevel::Network => {
                 let url = path.unwrap_or(description);
@@ -2729,8 +2998,8 @@ pub mod permissions {
         working_dir: Option<&std::path::Path>,
         allowed_roots: &[std::path::PathBuf],
     ) -> bool {
-        let canonical_path = std::fs::canonicalize(path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let canonical_path =
+            std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
 
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
         if let Some(root) = working_dir {
@@ -2851,8 +3120,17 @@ pub mod permissions {
                 PermissionLevel::Read
                     if !matches!(
                         tool_name,
-                        "Read" | "Glob" | "Grep" | "ListMcpResources" | "ReadMcpResource" | "LSP" | "Skill"
-                    ) => PermissionLevel::Execute,
+                        "Read"
+                            | "Glob"
+                            | "Grep"
+                            | "ListMcpResources"
+                            | "ReadMcpResource"
+                            | "LSP"
+                            | "Skill"
+                    ) =>
+                {
+                    PermissionLevel::Execute
+                }
                 other => other,
             };
             let read_in_workspace = path.is_some_and(|target| {
@@ -2884,8 +3162,7 @@ pub mod permissions {
                 | PermissionLevel::Write
                 | PermissionLevel::Execute
                 | PermissionLevel::Network => {
-                    let reason =
-                        format_permission_reason(tool_name, description, path, level);
+                    let reason = format_permission_reason(tool_name, description, path, level);
                     PermissionDecision::Ask { reason }
                 }
             }
@@ -3065,13 +3342,13 @@ pub mod permissions {
             use crate::config::PermissionMode;
             match self.mode {
                 PermissionMode::BypassPermissions => PermissionDecision::Allow,
-                    PermissionMode::AcceptEdits => {
-                        if request.tool_name == "Edit" || request.is_read_only {
-                            PermissionDecision::Allow
-                        } else {
-                            PermissionDecision::Deny
-                        }
+                PermissionMode::AcceptEdits => {
+                    if request.tool_name == "Edit" || request.is_read_only {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
                     }
+                }
                 PermissionMode::Plan => {
                     if request.is_read_only {
                         PermissionDecision::Allow
@@ -3316,7 +3593,10 @@ pub mod permissions {
                 action: PermissionAction::Deny,
                 scope: PermissionScope::Session,
             });
-            assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
+            assert_eq!(
+                m.evaluate("Bash", "echo hi", None, None, &[]),
+                PermissionDecision::Deny
+            );
         }
 
         #[test]
@@ -3341,7 +3621,13 @@ pub mod permissions {
         fn accept_edits_only_allows_edit() {
             let m = mgr(PermissionMode::AcceptEdits);
             assert_eq!(
-                m.evaluate("Edit", "edit file", Some("/workspace/src/lib.rs"), None, &[]),
+                m.evaluate(
+                    "Edit",
+                    "edit file",
+                    Some("/workspace/src/lib.rs"),
+                    None,
+                    &[]
+                ),
                 PermissionDecision::Allow
             );
             match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
@@ -3382,8 +3668,12 @@ pub mod permissions {
 
         #[test]
         fn format_reason_bash() {
-            let s =
-                format_permission_reason("Bash", "This will execute a shell command.", None, PermissionLevel::Execute);
+            let s = format_permission_reason(
+                "Bash",
+                "This will execute a shell command.",
+                None,
+                PermissionLevel::Execute,
+            );
             assert_eq!(s, "This will execute a shell command.");
         }
 
@@ -3395,7 +3685,10 @@ pub mod permissions {
                 None,
                 PermissionLevel::Execute,
             );
-            assert_eq!(s, "[High risk] This may modify system-wide security policy.");
+            assert_eq!(
+                s,
+                "[High risk] This may modify system-wide security policy."
+            );
         }
 
         #[test]
@@ -3428,6 +3721,7 @@ pub mod permissions {
 // history module
 // ---------------------------------------------------------------------------
 pub mod history {
+    pub use crate::session_fork::validated_fork_prefix;
     use crate::types::Message;
     use serde::{Deserialize, Serialize};
 
@@ -3599,9 +3893,7 @@ pub mod history {
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("json") {
                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        if let Ok(session) =
-                            serde_json::from_str::<ConversationSession>(&content)
-                        {
+                        if let Ok(session) = serde_json::from_str::<ConversationSession>(&content) {
                             sessions.push(session);
                         }
                     }
@@ -3669,7 +3961,7 @@ pub mod history {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: now,
             updated_at: now,
-            messages: source.messages[..clamped_idx].to_vec(),
+            messages: validated_fork_prefix(&source.messages, clamped_idx)?.to_vec(),
             model: source.model.clone(),
             title: new_title
                 .map(|t| t.to_string())
@@ -3800,7 +4092,10 @@ pub mod cost {
         /// Pick pricing based on model name substring matching.
         pub fn for_model(model: &str) -> Self {
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
-            if model.ends_with("-free") || model.starts_with("free/") || is_free_upstream_model(model) {
+            if model.ends_with("-free")
+                || model.starts_with("free/")
+                || is_free_upstream_model(model)
+            {
                 Self::FREE
             } else if model.contains("opus") {
                 Self::OPUS
@@ -3849,13 +4144,7 @@ pub mod cost {
             *self.pricing.write() = ModelPricing::for_model(model);
         }
 
-        pub fn add_usage(
-            &self,
-            input: u64,
-            output: u64,
-            cache_creation: u64,
-            cache_read: u64,
-        ) {
+        pub fn add_usage(&self, input: u64, output: u64, cache_creation: u64, cache_read: u64) {
             self.input_tokens.fetch_add(input, Ordering::Relaxed);
             self.output_tokens.fetch_add(output, Ordering::Relaxed);
             self.cache_creation_tokens
@@ -3923,8 +4212,52 @@ pub mod hooks {
     use crate::config::{HookEntry, HookEvent};
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::io;
     use std::path::Path;
+    use std::process::ExitStatus;
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::process::{Child, ChildStdin, Command};
+    use tokio::task::JoinSet;
+    use tokio_util::sync::CancellationToken;
     use tracing::{debug, warn};
+
+    const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
+    const MAX_HOOK_OUTPUT_BYTES: usize = 256 * 1024;
+    const HOOK_DEADLINE: Duration = Duration::from_secs(30);
+    const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+    const MAX_HOOK_ENV_BYTES: usize = MAX_HOOK_INPUT_BYTES;
+
+    /// Cancellation handle shared by bounded hook callers.
+    pub type HookCancellation = CancellationToken;
+
+    /// A validated environment variable passed to a supervised hook.
+    ///
+    /// Plugin callers use this narrow type instead of handing an arbitrary
+    /// environment map to the process runner. Names and values are validated
+    /// before process creation and the aggregate size is bounded.
+    #[derive(Debug, Clone, Copy)]
+    pub struct HookEnvironment<'a> {
+        name: &'a str,
+        value: &'a str,
+    }
+
+    impl<'a> HookEnvironment<'a> {
+        pub fn new(name: &'a str, value: &'a str) -> io::Result<Self> {
+            if name.is_empty()
+                || name.contains('=')
+                || name.chars().any(char::is_control)
+                || value.contains('\0')
+                || value.len() > MAX_HOOK_ENV_BYTES
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid or oversized hook environment variable",
+                ));
+            }
+            Ok(Self { name, value })
+        }
+    }
 
     /// Context passed to hook commands via stdin as JSON.
     #[derive(Debug, serde::Serialize)]
@@ -3949,8 +4282,410 @@ pub mod hooks {
         Allowed,
         /// Hook ran and blocked execution (blocking hook with non-zero exit).
         Blocked(String),
+        /// Hook requested a hard continuation veto (exit code greater than 1).
+        Vetoed(String),
+        /// Hook exited non-zero without the blocking flag.
+        Failed(String),
+        /// The supervisor rejected or could not complete the hook safely.
+        SupervisionFailed(String),
         /// Hook produced modified output (stdout of the hook command).
         Modified(String),
+    }
+
+    struct HookChild {
+        child: Child,
+        #[cfg(unix)]
+        group: Option<i32>,
+    }
+
+    impl HookChild {
+        fn new(mut command: Command) -> io::Result<Self> {
+            command.kill_on_drop(true);
+            #[cfg(unix)]
+            command.process_group(0);
+            let child = command.spawn()?;
+            #[cfg(unix)]
+            let group = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pid| *pid > 1);
+            Ok(Self {
+                child,
+                #[cfg(unix)]
+                group,
+            })
+        }
+
+        #[cfg(unix)]
+        fn signal_group(&self, signal: i32) {
+            if let Some(group) = self.group {
+                // SAFETY: the group is the positive PID of this child, which
+                // was created with process_group(0); negation addresses only
+                // that owned process group and never process group 0.
+                unsafe {
+                    let _ = kill(-group, signal);
+                }
+            }
+        }
+
+        fn terminate_owned_group(&self) {
+            // Keep the process-group identity until both signals have been
+            // issued. On Unix this is the only safe cleanup point after the
+            // direct child has reaped; a surviving descendant keeps the group
+            // identity alive while it is being terminated.
+            #[cfg(unix)]
+            self.signal_group(15); // SIGTERM
+            #[cfg(unix)]
+            self.signal_group(9); // SIGKILL
+        }
+
+        async fn stop_and_reap(&mut self) {
+            // Escalate before waiting so a descendant that ignores TERM cannot
+            // keep inherited pipes open.
+            self.terminate_owned_group();
+            let _ = self.child.start_kill();
+            if tokio::time::timeout(HOOK_SHUTDOWN_GRACE, self.child.wait())
+                .await
+                .is_err()
+            {
+                self.terminate_owned_group();
+                let _ = self.child.start_kill();
+                if tokio::time::timeout(HOOK_SHUTDOWN_GRACE, self.child.wait())
+                    .await
+                    .is_err()
+                {
+                    warn!("Hook process reap did not finish within shutdown grace");
+                }
+            }
+            #[cfg(unix)]
+            {
+                self.group = None;
+            }
+        }
+
+        async fn finish(&mut self) {
+            // A successful anchor can still have redirected descendants that
+            // no longer hold our pipes. Tear down the owned group before
+            // clearing its identity; otherwise those descendants outlive the
+            // hook unnoticed.
+            self.terminate_owned_group();
+            #[cfg(unix)]
+            {
+                // Do not retain a group identity after teardown, where a later
+                // process could reuse the identifier.
+                self.group = None;
+            }
+        }
+    }
+
+    impl Drop for HookChild {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            self.signal_group(9); // SIGKILL as the cancellation fallback
+            let _ = self.child.start_kill();
+            // Task abort can drop this guard after the async cancellation
+            // handler has stopped being polled. Reap through the owned child
+            // handle here; relying on Tokio's orphan queue would outlive the
+            // owning scope and may have no runtime left to drive it.
+            let deadline = std::time::Instant::now() + HOOK_SHUTDOWN_GRACE;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(None) => {
+                        warn!("Hook direct-child reap remained unconfirmed after bounded drop cleanup");
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(%error, "Hook direct-child reap failed during drop cleanup");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                return Ok(bytes);
+            }
+            if count > MAX_HOOK_OUTPUT_BYTES.saturating_sub(bytes.len()) {
+                return Err(io::Error::other("hook output exceeded byte limit"));
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    enum StdinWriteOutcome {
+        Complete,
+        BrokenPipe,
+    }
+
+    async fn write_bounded(mut stdin: ChildStdin, input: &[u8]) -> io::Result<StdinWriteOutcome> {
+        if input.len() > MAX_HOOK_INPUT_BYTES {
+            return Err(io::Error::other("hook input exceeded byte limit"));
+        }
+        match stdin.write_all(input).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Ok(StdinWriteOutcome::BrokenPipe);
+            }
+            Err(error) => return Err(error),
+        }
+        match stdin.shutdown().await {
+            Ok(()) => Ok(StdinWriteOutcome::Complete),
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                Ok(StdinWriteOutcome::BrokenPipe)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn wait_child_with_cancel(
+        process: &mut HookChild,
+        cancel: &CancellationToken,
+        remaining: Duration,
+    ) -> io::Result<ExitStatus> {
+        let wait = process.child.wait();
+        tokio::pin!(wait);
+        let deadline = tokio::time::sleep(remaining);
+        tokio::pin!(deadline);
+        tokio::select! {
+            result = &mut wait => result,
+            _ = cancel.cancelled() => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "hook cancelled",
+            )),
+            _ = &mut deadline => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "hook deadline exceeded",
+            )),
+        }
+    }
+
+    struct HookProcessOutput {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    async fn execute_hook_with_deadline(
+        command: &str,
+        working_dir: &Path,
+        input: &[u8],
+        cancel: &CancellationToken,
+        hook_deadline: Duration,
+        environment: &[HookEnvironment<'_>],
+    ) -> io::Result<HookProcessOutput> {
+        if input.len() > MAX_HOOK_INPUT_BYTES {
+            return Err(io::Error::other("hook input exceeded byte limit"));
+        }
+        environment.iter().try_fold(0usize, |total, env| {
+            total
+                .checked_add(env.name.len())
+                .and_then(|total| total.checked_add(env.value.len()))
+                .filter(|total| *total <= MAX_HOOK_ENV_BYTES)
+                .ok_or_else(|| io::Error::other("hook environment exceeded byte limit"))
+        })?;
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        let args: &[&str] = if cfg!(windows) {
+            &["/C", command]
+        } else {
+            &["-c", command]
+        };
+        let mut process = HookChild::new({
+            let mut cmd = Command::new(shell);
+            for env in environment {
+                cmd.env(env.name, env.value);
+            }
+            cmd.args(args)
+                .current_dir(working_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd
+        })?;
+
+        let stdin = process
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("hook stdin was not piped"))?;
+        let stdout = process
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("hook stdout was not piped"))?;
+        let stderr = process
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("hook stderr was not piped"))?;
+
+        let input = input.to_vec();
+        let started = std::time::Instant::now();
+        let io = async {
+            tokio::try_join!(
+                write_bounded(stdin, &input),
+                read_bounded(stdout),
+                read_bounded(stderr),
+            )
+        };
+        tokio::pin!(io);
+        let deadline = tokio::time::sleep(hook_deadline);
+        tokio::pin!(deadline);
+
+        let io_result = tokio::select! {
+            result = &mut io => result,
+            _ = &mut deadline => {
+                process.stop_and_reap().await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "hook deadline exceeded"));
+            }
+            _ = cancel.cancelled() => {
+                process.stop_and_reap().await;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "hook cancelled"));
+            }
+        };
+
+        let (stdin_result, stdout, stderr) = match io_result {
+            Ok(result) => result,
+            Err(error) => {
+                process.stop_and_reap().await;
+                return Err(error);
+            }
+        };
+        let remaining = hook_deadline.saturating_sub(started.elapsed());
+        let status = match wait_child_with_cancel(&mut process, cancel, remaining).await {
+            Ok(status) => status,
+            Err(error) => {
+                process.stop_and_reap().await;
+                return Err(error);
+            }
+        };
+        // A hook may intentionally close stdin before consuming the JSON and
+        // still use its exit status as the policy decision.  Preserve that
+        // status (including blocking exit 1/2) instead of turning BrokenPipe
+        // into a supervisor failure after the child has been reaped.
+        let _ = stdin_result;
+        process.finish().await;
+        Ok(HookProcessOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    struct BoundedHookInput(Vec<u8>);
+
+    impl std::io::Write for BoundedHookInput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > MAX_HOOK_INPUT_BYTES.saturating_sub(self.0.len()) {
+                return Err(io::Error::other("hook input exceeded byte limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run one hook entry through the bounded supervisor.
+    pub async fn run_hook(
+        entry: &HookEntry,
+        ctx: &HookContext,
+        working_dir: &Path,
+        cancel: &CancellationToken,
+    ) -> HookOutcome {
+        run_hook_with_environment(entry, ctx, working_dir, cancel, &[]).await
+    }
+
+    /// Run one hook entry through the bounded supervisor with additional
+    /// validated environment variables.
+    pub async fn run_hook_with_environment(
+        entry: &HookEntry,
+        ctx: &HookContext,
+        working_dir: &Path,
+        cancel: &CancellationToken,
+        environment: &[HookEnvironment<'_>],
+    ) -> HookOutcome {
+        let mut input = BoundedHookInput(Vec::new());
+        let ctx_json = match serde_json::to_writer(&mut input, ctx) {
+            Ok(()) => input.0,
+            Err(error) => {
+                return HookOutcome::SupervisionFailed(format!(
+                    "Hook '{}' context serialization failed: {error}",
+                    entry.command
+                ));
+            }
+        };
+        let mut environment = environment.to_vec();
+        if ctx.event == "Stop" {
+            if let Some(output) = ctx.tool_output.as_deref() {
+                match HookEnvironment::new("CLAUDE_HOOK_OUTPUT", output) {
+                    Ok(output_env) => environment.push(output_env),
+                    Err(error) => {
+                        return HookOutcome::SupervisionFailed(format!(
+                            "Hook '{}' environment rejected: {error}",
+                            entry.command
+                        ));
+                    }
+                }
+            }
+        }
+        let output = match execute_hook_with_deadline(
+            &entry.command,
+            working_dir,
+            &ctx_json,
+            cancel,
+            HOOK_DEADLINE,
+            &environment,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let reason = format!("Hook '{}' supervision failed: {error}", entry.command);
+                warn!(command = %entry.command, %error, "Hook supervision stopped execution");
+                return HookOutcome::SupervisionFailed(reason);
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let reason = if !stderr.is_empty() { stderr } else { stdout };
+            let reason = format!(
+                "Hook '{}' blocked execution: {}",
+                entry.command,
+                reason.trim()
+            );
+            return if entry.blocking {
+                if output.status.code().unwrap_or(1) > 1 {
+                    HookOutcome::Vetoed(reason)
+                } else {
+                    HookOutcome::Blocked(reason)
+                }
+            } else {
+                HookOutcome::Failed(reason)
+            };
+        }
+        if !stdout.trim().is_empty() {
+            HookOutcome::Modified(stdout.trim().to_string())
+        } else {
+            HookOutcome::Allowed
+        }
     }
 
     /// Run all hooks registered for the given event. Returns the first blocking
@@ -3961,16 +4696,19 @@ pub mod hooks {
         ctx: &HookContext,
         working_dir: &Path,
     ) -> HookOutcome {
+        run_hooks_with_cancel(hooks, event, ctx, working_dir, CancellationToken::new()).await
+    }
+
+    /// Run hooks with the query's cancellation signal wired to process cleanup.
+    pub async fn run_hooks_with_cancel(
+        hooks: &HashMap<HookEvent, Vec<HookEntry>>,
+        event: HookEvent,
+        ctx: &HookContext,
+        working_dir: &Path,
+        cancel: CancellationToken,
+    ) -> HookOutcome {
         let Some(entries) = hooks.get(&event) else {
             return HookOutcome::Allowed;
-        };
-
-        let ctx_json = match serde_json::to_string(ctx) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("Failed to serialize hook context: {}", e);
-                return HookOutcome::Allowed;
-            }
         };
 
         for entry in entries {
@@ -3983,61 +4721,563 @@ pub mod hooks {
                 }
             }
 
-            debug!(command = %entry.command, event = ?event, "Running hook");
-
-            let result = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-                .args(if cfg!(windows) {
-                    ["/C", &entry.command]
-                } else {
-                    ["-c", &entry.command]
-                })
-                .current_dir(working_dir)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-
-            let mut child = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(command = %entry.command, error = %e, "Failed to spawn hook");
-                    continue;
+            debug!("Running hook");
+            match run_hook(entry, ctx, working_dir, &cancel).await {
+                HookOutcome::Blocked(reason) | HookOutcome::Vetoed(reason) => {
+                    return HookOutcome::Blocked(reason)
                 }
-            };
-
-            // Write context JSON to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(ctx_json.as_bytes()).await;
-            }
-
-            let output = match child.wait_with_output().await {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(command = %entry.command, error = %e, "Hook wait failed");
-                    continue;
-                }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let exit_ok = output.status.success();
-
-            if !exit_ok && entry.blocking {
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let reason = if !stderr.is_empty() { stderr } else { stdout };
-                return HookOutcome::Blocked(format!(
-                    "Hook '{}' blocked execution: {}",
-                    entry.command,
-                    reason.trim()
-                ));
-            }
-
-            if !stdout.trim().is_empty() {
-                return HookOutcome::Modified(stdout.trim().to_string());
+                HookOutcome::Modified(output) => return HookOutcome::Modified(output),
+                HookOutcome::SupervisionFailed(reason) => return HookOutcome::Blocked(reason),
+                HookOutcome::Allowed | HookOutcome::Failed(_) => {}
             }
         }
 
         HookOutcome::Allowed
+    }
+
+    /// Run every matching hook for an informational event.  Stop hooks are
+    /// side-effecting notifications, so a successful hook's stdout must not
+    /// short-circuit later configured hooks.  Each invocation still uses the
+    /// shared cancellation and per-hook deadline from `run_hook`.
+    async fn run_all_hooks_with_cancel(
+        hooks: &HashMap<HookEvent, Vec<HookEntry>>,
+        event: HookEvent,
+        ctx: &HookContext,
+        working_dir: &Path,
+        cancel: &CancellationToken,
+    ) {
+        let Some(entries) = hooks.get(&event) else {
+            return;
+        };
+
+        for entry in entries {
+            if cancel.is_cancelled() {
+                return;
+            }
+            if let Some(ref filter) = entry.tool_filter {
+                if let Some(ref tool) = ctx.tool_name {
+                    if !filter.is_empty() && filter != tool && filter != "*" {
+                        continue;
+                    }
+                }
+            }
+            let _ = run_hook(entry, ctx, working_dir, cancel).await;
+        }
+    }
+
+    /// Owned non-blocking hook task scope. Call `close` at query shutdown to
+    /// await all children within each hook's own deadline; use
+    /// `cancel_and_close` when shutdown must interrupt them first. Drop still
+    /// signals any live process as a last-resort cleanup.
+    pub struct HookTaskScope {
+        cancel: CancellationToken,
+        tasks: JoinSet<()>,
+    }
+
+    impl Default for HookTaskScope {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl HookTaskScope {
+        pub fn new() -> Self {
+            Self {
+                cancel: CancellationToken::new(),
+                tasks: JoinSet::new(),
+            }
+        }
+
+        pub fn with_cancel(cancel: CancellationToken) -> Self {
+            Self {
+                cancel: cancel.child_token(),
+                tasks: JoinSet::new(),
+            }
+        }
+
+        pub fn spawn(
+            &mut self,
+            hooks: HashMap<HookEvent, Vec<HookEntry>>,
+            ctx: HookContext,
+            working_dir: std::path::PathBuf,
+        ) {
+            let cancel = self.cancel.clone();
+            self.tasks.spawn(async move {
+                run_all_hooks_with_cancel(&hooks, HookEvent::Stop, &ctx, &working_dir, &cancel)
+                    .await;
+            });
+        }
+
+        /// Wait for owned Stop hooks to finish. Each hook has its own bounded
+        /// deadline, and the entire scope has one bounded shutdown window.
+        pub async fn close(self) {
+            self.close_inner(false).await;
+        }
+
+        /// Explicit cancellation path for hosts that are shutting down before
+        /// normal Stop-hook completion is desired.
+        pub async fn cancel_and_close(self) {
+            self.close_inner(true).await;
+        }
+
+        async fn close_inner(mut self, cancel_first: bool) {
+            if cancel_first {
+                self.cancel.cancel();
+            }
+            let shutdown_window = HOOK_DEADLINE + HOOK_SHUTDOWN_GRACE;
+            let deadline = tokio::time::sleep(shutdown_window);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    task = self.tasks.join_next() => {
+                        if task.is_none() {
+                            return;
+                        }
+                    }
+                    _ = &mut deadline => {
+                        self.cancel.cancel();
+                        // A cancelled supervisor may use both bounded child-wait
+                        // attempts before its Drop fallback. Let that owned
+                        // cleanup finish before forcing task cancellation.
+                        let grace_deadline = tokio::time::sleep(HOOK_SHUTDOWN_GRACE * 3);
+                        tokio::pin!(grace_deadline);
+                        loop {
+                            let joined = tokio::select! {
+                                task = self.tasks.join_next() => task.is_some(),
+                                _ = &mut grace_deadline => false,
+                            };
+                            if !joined {
+                                break;
+                            }
+                        }
+                        self.tasks.abort_all();
+                        let abort_deadline = tokio::time::sleep(HOOK_SHUTDOWN_GRACE);
+                        tokio::pin!(abort_deadline);
+                        loop {
+                            let joined = tokio::select! {
+                                task = self.tasks.join_next() => task.is_some(),
+                                _ = &mut abort_deadline => false,
+                            };
+                            if !joined {
+                                break;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for HookTaskScope {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.tasks.abort_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn context() -> HookContext {
+            HookContext {
+                event: "test".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                is_error: None,
+                session_id: None,
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn hook_drop_reaps_child_after_runtime_shutdown() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("hook test runtime");
+            let child = {
+                let _entered = runtime.enter();
+                let mut command = Command::new("sh");
+                command.args(["-c", "trap '' TERM; exec sleep 30"]);
+                HookChild::new(command).expect("owned hook child")
+            };
+            let pid = child.child.id().expect("live child id") as i32;
+            runtime.shutdown_timeout(Duration::from_millis(100));
+            let started = std::time::Instant::now();
+            drop(child);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            unsafe extern "C" {
+                fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            }
+            let mut status = 0;
+            // SAFETY: this is the exact owned child PID; WNOHANG never
+            // blocks. ECHILD proves Drop already consumed the child status.
+            let waited = unsafe { waitpid(pid, &mut status, 1) };
+            assert_eq!(waited, -1, "child status was not reaped by Drop");
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(10));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn dropped_stop_scope_reaps_its_child() {
+            let root =
+                std::env::temp_dir().join(format!("claurst-stop-drop-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("scope fixture");
+            let pid_file = root.join("pid");
+            let mut hooks = HashMap::new();
+            hooks.insert(
+                HookEvent::Stop,
+                vec![HookEntry {
+                    command: "trap '' TERM; printf '%s' $$ > pid; exec sleep 30".to_string(),
+                    ..Default::default()
+                }],
+            );
+            let mut scope = HookTaskScope::new();
+            scope.spawn(hooks, context(), root.clone());
+            let pid = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("Stop child started");
+            drop(scope);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                // SAFETY: signal 0 observes the exact owned PID, without
+                // delivering a signal. Zombies remain visible until reaped.
+                while unsafe { kill(pid, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("dropped scope must reap direct child");
+            std::fs::remove_dir_all(root).expect("scope fixture cleanup");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn stop_hook_preserves_output_environment() {
+            let entry = HookEntry {
+                command: "printf '%s' \"$CLAUDE_HOOK_OUTPUT\"".to_string(),
+                tool_filter: None,
+                blocking: false,
+            };
+            let mut ctx = context();
+            ctx.event = "Stop".to_string();
+            ctx.tool_output = Some("exact stop output".to_string());
+            let outcome = run_hook(&entry, &ctx, Path::new("."), &CancellationToken::new()).await;
+            assert!(matches!(outcome, HookOutcome::Modified(text) if text == "exact stop output"));
+        }
+
+        #[tokio::test]
+        async fn bounded_hook_preserves_modified_stdout() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "echo modified".to_string()
+                } else {
+                    "printf modified".to_string()
+                },
+                blocking: true,
+                ..Default::default()
+            };
+            let outcome = run_hook(
+                &entry,
+                &context(),
+                Path::new("."),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(matches!(outcome, HookOutcome::Modified(text) if text == "modified"));
+        }
+
+        #[tokio::test]
+        async fn bounded_hook_preserves_validated_environment() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "echo %CLAURST_TEST_ROOT%:%CLAURST_TEST_NAME%".to_string()
+                } else {
+                    "printf '%s:%s' \"$CLAURST_TEST_ROOT\" \"$CLAURST_TEST_NAME\"".to_string()
+                },
+                ..Default::default()
+            };
+            let environment = [
+                HookEnvironment::new("CLAURST_TEST_ROOT", "/plugin/root").unwrap(),
+                HookEnvironment::new("CLAURST_TEST_NAME", "fixture").unwrap(),
+            ];
+            let outcome = run_hook_with_environment(
+                &entry,
+                &context(),
+                Path::new("."),
+                &CancellationToken::new(),
+                &environment,
+            )
+            .await;
+            assert!(
+                matches!(outcome, HookOutcome::Modified(text) if text.trim() == "/plugin/root:fixture")
+            );
+        }
+
+        #[test]
+        fn hook_environment_rejects_invalid_and_oversized_values() {
+            assert!(HookEnvironment::new("BAD=NAME", "value").is_err());
+            assert!(HookEnvironment::new("BAD_NAME", "x\0y").is_err());
+            assert!(HookEnvironment::new("BIG", &"x".repeat(MAX_HOOK_ENV_BYTES + 1)).is_err());
+        }
+
+        #[tokio::test]
+        async fn blocking_exit_two_is_a_hard_veto() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "exit /B 2".to_string()
+                } else {
+                    "exit 2".to_string()
+                },
+                blocking: true,
+                ..Default::default()
+            };
+            let outcome = run_hook(
+                &entry,
+                &context(),
+                Path::new("."),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(matches!(outcome, HookOutcome::Vetoed(_)));
+        }
+
+        #[tokio::test]
+        async fn cancellation_stops_owned_hook_without_waiting_for_deadline() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "ping -n 30 127.0.0.1 >NUL".to_string()
+                } else {
+                    "sleep 30".to_string()
+                },
+                blocking: true,
+                ..Default::default()
+            };
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            let task = tokio::spawn(async move {
+                run_hook(&entry, &context(), Path::new("."), &trigger).await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("cancelled hook must be reaped")
+                .expect("hook task must join");
+            assert!(matches!(result, HookOutcome::SupervisionFailed(_)));
+        }
+
+        #[tokio::test]
+        async fn oversized_hook_input_is_reported_as_supervision_failure() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "type".to_string()
+                } else {
+                    "cat".to_string()
+                },
+                blocking: true,
+                ..Default::default()
+            };
+            let mut ctx = context();
+            ctx.tool_output = Some("x".repeat(MAX_HOOK_INPUT_BYTES + 1));
+            let outcome = run_hook(&entry, &ctx, Path::new("."), &CancellationToken::new()).await;
+            assert!(matches!(outcome, HookOutcome::SupervisionFailed(_)));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn inherited_pipe_descendant_is_killed_at_injected_deadline() {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_hook_with_deadline(
+                    "sleep 30 &",
+                    Path::new("."),
+                    b"{}",
+                    &CancellationToken::new(),
+                    Duration::from_millis(100),
+                    &[],
+                ),
+            )
+            .await
+            .expect("descendant holding pipes must be bounded")
+            .err()
+            .expect("inherited pipe must hit the injected deadline");
+            assert_eq!(result.kind(), io::ErrorKind::TimedOut);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn successful_hook_tears_down_redirected_descendant() {
+            let marker = std::env::temp_dir().join(format!(
+                "claurst-hook-descendant-{}.marker",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&marker);
+            let command = format!(
+                "(sleep 1; echo late > '{}') >/dev/null 2>&1 &",
+                marker.display()
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_hook_with_deadline(
+                    &command,
+                    Path::new("."),
+                    b"{}",
+                    &CancellationToken::new(),
+                    Duration::from_secs(2),
+                    &[],
+                ),
+            )
+            .await
+            .expect("successful hook must remain bounded")
+            .expect("successful hook should return its status");
+            assert!(output.status.success());
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(
+                !marker.exists(),
+                "redirected descendant survived hook cleanup"
+            );
+            let _ = std::fs::remove_file(marker);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn cancellation_after_pipe_eof_interrupts_child_wait() {
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            let task = tokio::spawn(async move {
+                execute_hook_with_deadline(
+                    "exec 1>/dev/null 2>/dev/null; sleep 30",
+                    Path::new("."),
+                    b"{}",
+                    &trigger,
+                    Duration::from_secs(30),
+                    &[],
+                )
+                .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("EOF-before-exit cancellation must be bounded")
+                .expect("hook task must join")
+                .err()
+                .expect("cancelled child wait must fail");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn early_stdin_close_is_accepted_after_successful_exit() {
+            let input = vec![b'x'; MAX_HOOK_INPUT_BYTES];
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_hook_with_deadline(
+                    "exit 0",
+                    Path::new("."),
+                    &input,
+                    &CancellationToken::new(),
+                    Duration::from_secs(2),
+                    &[],
+                ),
+            )
+            .await
+            .expect("early stdin close must be bounded")
+            .expect("successful early stdin close is allowed");
+            assert!(output.status.success());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn early_stdin_close_preserves_nonzero_exit_status() {
+            let input = vec![b'x'; MAX_HOOK_INPUT_BYTES];
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_hook_with_deadline(
+                    "exit 2",
+                    Path::new("."),
+                    &input,
+                    &CancellationToken::new(),
+                    Duration::from_secs(2),
+                    &[],
+                ),
+            )
+            .await
+            .expect("early stdin close must be bounded")
+            .expect("exit status must remain available after early stdin close");
+            assert_eq!(output.status.code(), Some(2));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn stop_scope_runs_hooks_after_modified_stdout() {
+            let marker = std::env::temp_dir().join(format!(
+                "claurst-stop-hook-followup-{}.marker",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&marker);
+            let mut hooks = HashMap::new();
+            hooks.insert(
+                HookEvent::Stop,
+                vec![
+                    HookEntry {
+                        command: "printf first".to_string(),
+                        ..Default::default()
+                    },
+                    HookEntry {
+                        command: format!("touch '{}'", marker.display()),
+                        ..Default::default()
+                    },
+                ],
+            );
+
+            let mut scope = HookTaskScope::new();
+            scope.spawn(hooks, context(), Path::new(".").to_path_buf());
+            scope.close().await;
+
+            assert!(marker.exists(), "later Stop hook was not dispatched");
+            let _ = std::fs::remove_file(marker);
+        }
+
+        #[tokio::test]
+        async fn output_overflow_is_rejected_before_unbounded_capture() {
+            let entry = HookEntry {
+                command: if cfg!(windows) {
+                    "for /L %i in (1,1,400000) do @<nul set /p =x".to_string()
+                } else {
+                    "yes x".to_string()
+                },
+                blocking: true,
+                ..Default::default()
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_hook(
+                    &entry,
+                    &context(),
+                    Path::new("."),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("overflow hook must be bounded");
+            assert!(
+                matches!(&result, HookOutcome::SupervisionFailed(reason) if reason.contains("byte limit")),
+                "overflow must produce the bounded supervision error: {result:?}"
+            );
+        }
     }
 }
 
@@ -4062,10 +5302,8 @@ pub mod oauth {
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-    pub const API_KEY_URL: &str =
-        "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
-    pub const MANUAL_REDIRECT_URL: &str =
-        "https://platform.claude.com/oauth/code/callback";
+    pub const API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
+    pub const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
     pub const CLAUDEAI_SUCCESS_URL: &str =
         "https://platform.claude.com/oauth/code/success?app=claude-code";
     pub const CONSOLE_SUCCESS_URL: &str = "https://platform.claude.com/buy_credits\
@@ -4121,7 +5359,11 @@ pub mod oauth {
         /// - Claude.ai flow: the `access_token` itself (Bearer)
         pub fn effective_credential(&self) -> Option<&str> {
             if self.uses_bearer_auth() {
-                if self.access_token.is_empty() { None } else { Some(&self.access_token) }
+                if self.access_token.is_empty() {
+                    None
+                } else {
+                    Some(&self.access_token)
+                }
             } else {
                 self.api_key.as_deref()
             }
@@ -4172,8 +5414,8 @@ pub mod oauth {
         /// If `label` is None, derives the id from email/account_uuid.
         pub async fn save_and_register(&self, label: Option<&str>) -> anyhow::Result<String> {
             use crate::accounts::{
-                AccountProfile, AccountRegistry, ensure_unique_profile_id,
-                slugify_profile_id, PROVIDER_ANTHROPIC,
+                ensure_unique_profile_id, slugify_profile_id, AccountProfile, AccountRegistry,
+                PROVIDER_ANTHROPIC,
             };
 
             let mut registry = AccountRegistry::load();
@@ -4186,8 +5428,7 @@ pub mod oauth {
                 .into_iter()
                 .find(|p| {
                     (self.email.is_some() && p.email == self.email)
-                        || (self.account_uuid.is_some()
-                            && p.account_id == self.account_uuid)
+                        || (self.account_uuid.is_some() && p.account_id == self.account_uuid)
                 })
                 .map(|p| p.id);
 
@@ -4261,11 +5502,37 @@ pub mod oauth {
             None
         }
 
+        /// Return the stored account UUID only when `credential` belongs to
+        /// the active Claude.ai profile read from the same token snapshot.
+        ///
+        /// This exact credential match prevents a client created for one
+        /// account from borrowing metadata after another account becomes
+        /// active. The credential itself is never returned or logged.
+        pub fn active_account_uuid_for_credential(credential: &str) -> Option<String> {
+            if credential.is_empty() {
+                return None;
+            }
+
+            let registry = crate::accounts::AccountRegistry::load();
+            let active = registry.active(crate::accounts::PROVIDER_ANTHROPIC)?;
+            let path = crate::accounts::anthropic_token_path(active);
+            let content = std::fs::read_to_string(path).ok()?;
+            let tokens: Self = serde_json::from_str(&content).ok()?;
+
+            if !tokens.uses_bearer_auth() || tokens.effective_credential() != Some(credential) {
+                return None;
+            }
+            tokens.account_uuid
+        }
+
         /// Clear credentials for the active profile (or all credentials if
         /// `purge_all` is true) and drop the profile from the registry.
         pub async fn clear() -> anyhow::Result<()> {
             let mut registry = crate::accounts::AccountRegistry::load();
-            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC).map(String::from) {
+            if let Some(active) = registry
+                .active(crate::accounts::PROVIDER_ANTHROPIC)
+                .map(String::from)
+            {
                 registry.remove(crate::accounts::PROVIDER_ANTHROPIC, &active)?;
             }
             // Also remove any legacy file.
@@ -4319,8 +5586,7 @@ pub mod oauth {
         callback_port: u16,
         is_manual: bool,
     ) -> String {
-        let mut u = url::Url::parse(authorize_base)
-            .expect("valid OAuth authorize base URL");
+        let mut u = url::Url::parse(authorize_base).expect("valid OAuth authorize base URL");
         {
             let mut q = u.query_pairs_mut();
             q.append_pair("code", "true"); // tells the login page to show Claude Max upsell
@@ -4344,21 +5610,25 @@ pub mod oauth {
     /// `/api/oauth/profile`. `has_premium` (Claude Max or extra-usage) gates the
     /// `context-1m` / `mid-conversation-system` betas. Falls back to the token's
     /// stored `account_uuid` if the profile call fails; `None` if no token.
-    pub async fn current_anthropic_account_meta() -> Option<(String, bool)> {
-        let tokens = OAuthTokens::load().await?;
-        let token = tokens.access_token.clone();
-        let stored_uuid = tokens.account_uuid.clone();
-
+    pub async fn anthropic_account_meta_for_credential(
+        access_token: &str,
+        stored_uuid: Option<String>,
+    ) -> Option<(String, bool)> {
+        if access_token.is_empty() {
+            return stored_uuid.map(|uuid| (uuid, false));
+        }
         let fetched = async {
             let cfg = crate::oauth_config::get_oauth_config();
             let url = format!("{}/api/oauth/profile", cfg.base_api_url);
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .tls_danger_accept_invalid_certs(false)
+                .tls_danger_accept_invalid_hostnames(false)
                 .build()
                 .ok()?;
             let resp = client
                 .get(&url)
-                .header("Authorization", format!("Bearer {token}"))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .header("anthropic-beta", "oauth-2025-04-20")
                 .header("content-type", "application/json")
                 .send()
@@ -4379,6 +5649,17 @@ pub mod oauth {
 
         fetched.or_else(|| stored_uuid.map(|u| (u, false)))
     }
+
+    /// Active OAuth account metadata for compatibility callers.
+    ///
+    /// New request paths should bind the token and stored UUID to the client
+    /// once, then call [`anthropic_account_meta_for_credential`] with that
+    /// captured pair.
+    pub async fn current_anthropic_account_meta() -> Option<(String, bool)> {
+        let tokens = OAuthTokens::load().await?;
+        anthropic_account_meta_for_credential(&tokens.access_token, tokens.account_uuid.clone())
+            .await
+    }
 }
 
 // Re-export OAuthTokens at crate root for convenience
@@ -4388,32 +5669,32 @@ pub use oauth::OAuthTokens;
 // New modules: keybindings, voice, analytics, lsp, team_memory_sync,
 //              system_prompt, memdir, oauth_config
 // ---------------------------------------------------------------------------
-pub mod keybindings;
-pub mod voice;
-pub mod analytics;
-pub mod lsp;
-pub mod session_tracing;
-pub mod context_collapse;
-pub mod team_memory_sync;
-pub mod system_prompt;
-pub mod memdir;
-pub mod oauth_config;
-pub mod codex_oauth;
 pub mod accounts;
-pub mod migrations;
-pub mod output_styles;
-pub mod feature_gates;
-pub mod tips;
-pub mod remote_settings;
-pub mod settings_sync;
-pub mod import_config;
-pub mod effort;
-pub mod keywords;
-pub mod prompt_history;
+pub mod analytics;
 pub mod bash_classifier;
-pub mod ps_classifier;
+pub mod codex_oauth;
+pub mod context_collapse;
+pub mod effort;
+pub mod feature_gates;
+pub mod import_config;
+pub mod keybindings;
+pub mod keywords;
+pub mod lsp;
 pub mod mcp_trust;
+pub mod memdir;
+pub mod migrations;
+pub mod oauth_config;
+pub mod output_styles;
 pub mod paths;
+pub mod prompt_history;
+pub mod ps_classifier;
+pub mod remote_settings;
+pub mod session_tracing;
+pub mod settings_sync;
+pub mod system_prompt;
+pub mod team_memory_sync;
+pub mod tips;
+pub mod voice;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -4533,6 +5814,12 @@ pub mod tasks {
         /// Look up a task by ID.
         pub fn get(&self, id: &str) -> Option<BackgroundTask> {
             self.tasks.get(id).map(|e| e.clone())
+        }
+
+        /// Remove a task mirror after its owning service evicts the record.
+        /// No-op when the ID is already absent.
+        pub fn remove(&self, id: &str) {
+            self.tasks.remove(id);
         }
 
         /// Return a snapshot of all tasks, ordered by `started_at` ascending.
@@ -4723,7 +6010,10 @@ mod tests {
 
     #[test]
     fn test_config_mouse_capture_explicit_off() {
-        let mut cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
+        let mut cfg = crate::config::Config {
+            mouse_capture: Some(false),
+            ..Default::default()
+        };
         assert!(!cfg.mouse_capture_enabled());
         cfg.mouse_capture = Some(true);
         assert!(cfg.mouse_capture_enabled());
@@ -4741,7 +6031,10 @@ mod tests {
         assert!(back.mouse_capture_enabled());
 
         // Explicit off serializes the key and round-trips as disabled.
-        let cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
+        let cfg = crate::config::Config {
+            mouse_capture: Some(false),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"mouseCapture\":false"));
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
@@ -4757,19 +6050,37 @@ mod tests {
 
     #[test]
     fn test_config_effective_model_override() {
-        let cfg = crate::config::Config { model: Some("claude-haiku-4-5-20251001".to_string()), ..Default::default() };
+        let cfg = crate::config::Config {
+            model: Some("claude-haiku-4-5-20251001".to_string()),
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_config_effective_model_bedrock_default_uses_converse_id() {
+        let cfg = crate::config::Config {
+            provider: Some("amazon-bedrock".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "anthropic.claude-sonnet-4-6");
     }
 
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
-        assert_eq!(cfg.effective_max_tokens(), crate::constants::DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            cfg.effective_max_tokens(),
+            crate::constants::DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]
     fn test_config_effective_max_tokens_override() {
-        let cfg = crate::config::Config { max_tokens: Some(8192), ..Default::default() };
+        let cfg = crate::config::Config {
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_max_tokens(), 8192);
     }
 
@@ -4780,7 +6091,10 @@ mod tests {
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
+        let cfg = crate::config::Config {
+            api_key: Some("sk-ant-config-key".to_string()),
+            ..Default::default()
+        };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
 
         if let Some(k) = orig {
@@ -4827,7 +6141,10 @@ mod tests {
             expires_at_ms: None,
             ..Default::default()
         };
-        assert!(!tokens.is_expired(), "Token with no expiry should not be considered expired");
+        assert!(
+            !tokens.is_expired(),
+            "Token with no expiry should not be considered expired"
+        );
     }
 
     #[test]
@@ -4860,7 +6177,10 @@ mod tests {
             expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3 * 60 * 1000),
             ..Default::default()
         };
-        assert!(tokens.is_expired(), "Token within 5-min buffer should be considered expired");
+        assert!(
+            tokens.is_expired(),
+            "Token within 5-min buffer should be considered expired"
+        );
     }
 
     #[test]
@@ -4930,9 +6250,15 @@ mod tests {
     fn test_pkce_code_verifier_length() {
         let verifier = crate::oauth::generate_code_verifier();
         // 32 bytes base64url-encoded (no padding) = ceil(32 * 4/3) = 43 chars
-        assert_eq!(verifier.len(), 43, "Code verifier should be 43 base64url chars (32 bytes)");
+        assert_eq!(
+            verifier.len(),
+            43,
+            "Code verifier should be 43 base64url chars (32 bytes)"
+        );
         // Must only contain URL-safe base64 chars
-        assert!(verifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -4940,8 +6266,14 @@ mod tests {
         let verifier = crate::oauth::generate_code_verifier();
         let challenge = crate::oauth::generate_code_challenge(&verifier);
         // SHA256 = 32 bytes → 43 base64url chars
-        assert_eq!(challenge.len(), 43, "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)");
-        assert!(challenge.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert_eq!(
+            challenge.len(),
+            43,
+            "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)"
+        );
+        assert!(challenge
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -4964,7 +6296,9 @@ mod tests {
     fn test_pkce_state_length_and_format() {
         let state = crate::oauth::generate_state();
         assert_eq!(state.len(), 43);
-        assert!(state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(state
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     // ---- Auth URL building tests --------------------------------------------
@@ -5001,10 +6335,7 @@ mod tests {
             9999,
             true, // manual
         );
-        assert!(
-            url.contains("redirect_uri="),
-            "URL must have redirect_uri"
-        );
+        assert!(url.contains("redirect_uri="), "URL must have redirect_uri");
         // Manual redirect should NOT be localhost
         assert!(
             !url.contains("localhost"),
@@ -5125,8 +6456,12 @@ mod tests {
     #[test]
     fn test_message_get_all_text_multiple_blocks() {
         let msg = Message::assistant_blocks(vec![
-            ContentBlock::Text { text: "First ".into() },
-            ContentBlock::Text { text: "Second".into() },
+            ContentBlock::Text {
+                text: "First ".into(),
+            },
+            ContentBlock::Text {
+                text: "Second".into(),
+            },
         ]);
         assert_eq!(msg.get_all_text(), "First Second");
     }
@@ -5138,7 +6473,9 @@ mod tests {
                 thinking: "reasoning".into(),
                 signature: "sig".into(),
             },
-            ContentBlock::Text { text: "answer".into() },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
         ]);
         assert_eq!(msg.get_text(), Some("answer"));
     }
@@ -5177,30 +6514,84 @@ mod tests {
     #[test]
     fn test_model_pricing_free_variants() {
         // Test that models ending with -free use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+        assert_eq!(
+            cost::ModelPricing::for_model("deepseek-v4-flash-free"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("zen/minimax-m2.5-free"),
+            cost::ModelPricing::FREE
+        );
 
         // Test that models starting with free/ use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("free/auto"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("free/some-model"), cost::ModelPricing::FREE);
+        assert_eq!(
+            cost::ModelPricing::for_model("free/auto"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("free/some-model"),
+            cost::ModelPricing::FREE
+        );
 
         // Test that upstream-prefixed free models use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), cost::ModelPricing::FREE);
+        assert_eq!(
+            cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("google/gemini-2.5-flash"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("mistral/mistral-large-latest"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("cohere/command-r-plus"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("openrouter/free"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("zai/glm-4.6"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("zhipuai/glm-4.5"),
+            cost::ModelPricing::FREE
+        );
 
         // Test that other models use their appropriate pricing
-        assert_eq!(cost::ModelPricing::for_model("claude-opus"), cost::ModelPricing::OPUS);
-        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), cost::ModelPricing::HAIKU);
-        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), cost::ModelPricing::SONNET);
+        assert_eq!(
+            cost::ModelPricing::for_model("claude-opus"),
+            cost::ModelPricing::OPUS
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("claude-haiku"),
+            cost::ModelPricing::HAIKU
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("claude-sonnet"),
+            cost::ModelPricing::SONNET
+        );
     }
 
     #[test]
@@ -5233,10 +6624,16 @@ mod tests {
     #[test]
     fn builtin_presets_all_have_valid_model_format() {
         for preset in builtin_managed_agent_presets() {
-            assert!(preset.manager_model.contains('/'),
-                "Preset {} manager_model must be provider/model", preset.name);
-            assert!(preset.executor_model.contains('/'),
-                "Preset {} executor_model must be provider/model", preset.name);
+            assert!(
+                preset.manager_model.contains('/'),
+                "Preset {} manager_model must be provider/model",
+                preset.name
+            );
+            assert!(
+                preset.executor_model.contains('/'),
+                "Preset {} executor_model must be provider/model",
+                preset.name
+            );
         }
     }
 

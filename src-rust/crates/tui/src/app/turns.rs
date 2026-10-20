@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use super::types::TurnMetadata;
+use super::App;
 use crate::diff_viewer::build_turn_diff;
 use claurst_core::file_history::FileHistory;
 use claurst_core::types::{ContentBlock, Message, Role};
-use super::App;
-use super::types::TurnMetadata;
 
 pub(super) fn format_elapsed_ms(ms: u128) -> String {
     let total_secs = ((ms + 500) / 1000) as u64; // round to nearest second
@@ -172,5 +172,4 @@ impl App {
         };
         self.diff_viewer.set_turn_diff(files);
     }
-
 }

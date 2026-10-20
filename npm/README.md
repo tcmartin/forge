@@ -1,40 +1,30 @@
-# claurst
+# Forge local npm package
 
-**Open-source, multi-provider terminal coding agent built in Rust.**
+This private package exposes the `forge` command for a verified local Forge binary. It is not published to npm and does not assume a public release repository.
 
-[![Version](https://img.shields.io/npm/v/claurst?style=flat-square)](https://www.npmjs.com/package/claurst)
-[![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](https://github.com/kuberwastaken/claurst/blob/main/LICENSE.md)
-
-## Install
+## Install from a local binary
 
 ```bash
-npm install -g claurst
+FORGE_BINARY_PATH=/absolute/path/to/forge npm install -g ./npm
+forge --version
 ```
+
+The postinstall step replaces the installed binary with the supplied file and marks it executable on Unix. It records the package version, platform and binary checksum. Repeated installs verify those records before reusing a binary.
+
+Installs with lifecycle scripts disabled require an explicit rebuild:
 
 ```bash
-bun install -g claurst
+FORGE_BINARY_PATH=/absolute/path/to/forge npm rebuild forge-coding-agent-local
 ```
 
-On install, the correct pre-built native binary for your platform is automatically downloaded from [GitHub Releases](https://github.com/kuberwastaken/claurst/releases). No compilation required.
+The launcher rejects missing records, a different package version, or a changed file identity. Normal launches use file metadata; installer reuse also verifies the full checksum. These checks detect stale installs and accidental changes. They do not authenticate files against modification by the same operating-system user.
 
-## Usage
+## Install from an explicit release repository
 
 ```bash
-claurst                    # interactive TUI
-claurst -p "fix this bug"  # headless one-shot
+FORGE_RELEASE_REPO=owner/repository npm install -g ./npm
 ```
 
-## Supported platforms
+The repository must contain a `v0.1.7` release with a platform archive named `forge-<platform>-<architecture>.tar.gz` or `.zip`. Forge never falls back to the upstream Claurst release channel.
 
-| Platform | Architecture |
-|----------|-------------|
-| macOS    | x64, arm64 (Apple Silicon) |
-| Linux    | x64, arm64 |
-| Windows  | x64 |
-
-## Links
-
-- [Homepage](https://claurst.kuber.studio)
-- [GitHub](https://github.com/kuberwastaken/claurst)
-- [Documentation](https://claurst.kuber.studio/docs)
-- [Issues](https://github.com/kuberwastaken/claurst/issues)
+The package retains the upstream GPL-3.0 license and attribution. Public npm publication remains disabled until a package scope and release repository are explicitly chosen.

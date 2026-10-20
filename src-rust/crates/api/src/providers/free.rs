@@ -21,7 +21,7 @@
 //     to the first upstream in the chain.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
@@ -187,11 +187,7 @@ impl FreeProvider {
     /// Decide how to route a user-facing model id into the chain.
     fn resolve_route(&self, model: &str) -> Route {
         let trimmed = model.trim();
-        if trimmed.is_empty()
-            || trimmed == "free"
-            || trimmed == "auto"
-            || trimmed == "free/auto"
-        {
+        if trimmed.is_empty() || trimmed == "free" || trimmed == "auto" || trimmed == "free/auto" {
             return Route::Auto;
         }
 
@@ -255,12 +251,62 @@ impl FreeProvider {
         }
     }
 
+    fn upstream_budget(
+        &self,
+        request: &ProviderRequest,
+        entry: &FreeEntry,
+        model: &str,
+    ) -> Result<crate::WireBudget, ProviderError> {
+        static LIMITS: LazyLock<crate::ModelRegistry> = LazyLock::new(crate::ModelRegistry::new);
+        let caller = crate::budget_from_request(request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+        if entry.provider.id() != entry.upstream.id {
+            return Err(ProviderError::InvalidRequest {
+                provider: self.id.clone(),
+                message: "Free route provider identity does not match its catalog entry".into(),
+            });
+        }
+        let model_limit = LIMITS.get(entry.upstream.id, model)
+            .map(|entry| u64::from(entry.info.context_window))
+            .filter(|limit| *limit > 0 && *limit <= 100_000_000)
+            .ok_or_else(|| ProviderError::InvalidRequest {
+                provider: self.id.clone(),
+                message: format!("No finite context metadata for {}/{}. Select that provider directly and configure modelOverrides.", entry.upstream.id, model),
+            })?;
+        let context_limit = caller.context_limit_tokens.min(model_limit);
+        let input_limit = context_limit
+            .checked_sub(caller.output_reserve_tokens)
+            .map(|input| input.min(caller.input_limit_tokens))
+            .ok_or_else(|| {
+                ProviderError::budget(self.id.clone(), crate::WireBudgetError::InvalidBudget)
+            })?;
+        crate::WireBudget::finite(
+            context_limit,
+            input_limit,
+            caller.output_reserve_tokens,
+            caller.max_wire_bytes,
+            caller.media.clone(),
+        )
+        .and_then(|budget| budget.with_framing_tokens(caller.framing_tokens))
+        .and_then(|budget| {
+            budget.with_source(format!(
+                "registry:{}/{};caller={}",
+                entry.upstream.id, model, caller.budget_source
+            ))
+        })
+        .map_err(|error| ProviderError::budget(self.id.clone(), error))
+    }
+
     fn should_fallback(err: &ProviderError) -> bool {
         // Don't fall back on user-fixable problems — they would behave the
         // same on every upstream.
         !matches!(
             err,
-            ProviderError::InvalidRequest { .. } | ProviderError::ContentFiltered { .. }
+            ProviderError::BudgetExceeded { .. }
+                | ProviderError::InvalidRequest { .. }
+                | ProviderError::ContentFiltered { .. }
+                | ProviderError::AdmissionRejected { .. }
+                | ProviderError::DispatchRejected { .. }
         )
     }
 }
@@ -279,11 +325,23 @@ impl LlmProvider for FreeProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        // Validate local metadata and typed media before selecting any upstream.
+        crate::prepare_provider_json(
+            "free",
+            "free-route",
+            false,
+            &serde_json::json!({}),
+            &request,
+        )
+        .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+
         if self.chain.is_empty() {
             return Err(ProviderError::AuthFailed {
                 provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
             });
         }
 
@@ -293,15 +351,18 @@ impl LlmProvider for FreeProvider {
 
         for (idx, upstream_model) in plan {
             let entry = &self.chain[idx];
+            let upstream_budget = self.upstream_budget(&request, entry, &upstream_model)?;
             let mut req = request.clone();
             req.model = upstream_model;
+            req.wire_budget = Some(upstream_budget);
             match entry.provider.create_message(req).await {
                 Ok(resp) => return Ok(resp),
                 Err(err) if Self::should_fallback(&err) => {
                     tracing::warn!(
-                        "FreeProvider: {} failed: {} — trying next upstream",
-                        entry.upstream.id,
-                        err,
+                        upstream = %entry.upstream.id,
+                        error_kind = err.diagnostic_kind(),
+                        status = ?err.diagnostic_status(),
+                        "FreeProvider upstream failed — trying next upstream",
                     );
                     last_err = Some(err);
                     continue;
@@ -321,15 +382,19 @@ impl LlmProvider for FreeProvider {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        // Validate local metadata and typed media before selecting any upstream.
+        crate::prepare_provider_json("free", "free-route", true, &serde_json::json!({}), &request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+
         if self.chain.is_empty() {
             return Err(ProviderError::AuthFailed {
                 provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
             });
         }
 
@@ -339,15 +404,18 @@ impl LlmProvider for FreeProvider {
 
         for (idx, upstream_model) in plan {
             let entry = &self.chain[idx];
+            let upstream_budget = self.upstream_budget(&request, entry, &upstream_model)?;
             let mut req = request.clone();
             req.model = upstream_model;
+            req.wire_budget = Some(upstream_budget);
             match entry.provider.create_message_stream(req).await {
                 Ok(stream) => return Ok(stream),
                 Err(err) if Self::should_fallback(&err) => {
                     tracing::warn!(
-                        "FreeProvider: {} stream failed: {} — trying next upstream",
-                        entry.upstream.id,
-                        err,
+                        upstream = %entry.upstream.id,
+                        error_kind = err.diagnostic_kind(),
+                        status = ?err.diagnostic_status(),
+                        "FreeProvider upstream stream failed — trying next upstream",
                     );
                     last_err = Some(err);
                     continue;
@@ -382,7 +450,10 @@ impl LlmProvider for FreeProvider {
         )];
 
         for entry in &self.chain {
-            let label = format!("{} \u{2014} {}", entry.upstream.title, entry.upstream.default_model);
+            let label = format!(
+                "{} \u{2014} {}",
+                entry.upstream.title, entry.upstream.default_model
+            );
             models.push(mk(
                 &format!("{}/{}", entry.upstream.id, entry.upstream.default_model),
                 &label,
@@ -432,12 +503,14 @@ impl LlmProvider for FreeProvider {
 mod tests {
     use super::*;
     use claurst_core::types::{Message, UsageInfo};
+    use std::sync::Mutex;
 
     use crate::provider_types::StopReason;
 
     struct StubProvider {
         id: ProviderId,
         ok: bool,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
 
     #[async_trait]
@@ -454,6 +527,7 @@ mod tests {
             &self,
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
             if self.ok {
                 Ok(ProviderResponse {
                     id: "msg".to_string(),
@@ -472,11 +546,12 @@ mod tests {
 
         async fn create_message_stream(
             &self,
-            _request: ProviderRequest,
+            request: ProviderRequest,
         ) -> Result<
             Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
             ProviderError,
         > {
+            self.requests.lock().unwrap().push(request);
             Err(ProviderError::ServerError {
                 provider: self.id.clone(),
                 status: None,
@@ -510,14 +585,23 @@ mod tests {
     }
 
     fn entry(id: &'static str, ok: bool) -> FreeEntry {
+        counted_entry(id, ok).0
+    }
+
+    fn counted_entry(id: &'static str, ok: bool) -> (FreeEntry, Arc<Mutex<Vec<ProviderRequest>>>) {
         let upstream = *catalog_entry(id).expect("catalog entry");
-        FreeEntry {
-            upstream,
-            provider: Arc::new(StubProvider {
-                id: ProviderId::new(id),
-                ok,
-            }),
-        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            FreeEntry {
+                upstream,
+                provider: Arc::new(StubProvider {
+                    id: ProviderId::new(id),
+                    ok,
+                    requests: requests.clone(),
+                }),
+            },
+            requests,
+        )
     }
 
     fn dummy_request(model: &str) -> ProviderRequest {
@@ -533,6 +617,19 @@ mod tests {
             stop_sequences: Vec::new(),
             thinking: None,
             provider_options: serde_json::Value::Null,
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: Some(
+                crate::WireBudget::finite(
+                    10_000_000,
+                    9_999_992,
+                    8,
+                    8 * 1024 * 1024,
+                    crate::MediaAccounting::None,
+                )
+                .unwrap(),
+            ),
+            dispatch: None,
         }
     }
 
@@ -550,7 +647,10 @@ mod tests {
         let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
         let route = provider.resolve_route("cerebras/qwen-3-235b");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 1);
                 assert_eq!(pinned_model, "qwen-3-235b");
             }
@@ -560,13 +660,14 @@ mod tests {
 
     #[test]
     fn legacy_zen_prefix_routes_to_opencode_zen() {
-        let provider = FreeProvider::new(vec![
-            entry("opencode-zen", true),
-            entry("openrouter", true),
-        ]);
+        let provider =
+            FreeProvider::new(vec![entry("opencode-zen", true), entry("openrouter", true)]);
         let route = provider.resolve_route("zen/big-pickle");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 0);
                 assert_eq!(pinned_model, "big-pickle");
             }
@@ -645,6 +746,12 @@ mod tests {
                 message: "filtered".into(),
             }
         ));
+        assert!(!FreeProvider::should_fallback(
+            &ProviderError::AdmissionRejected {
+                provider: ProviderId::new("groq"),
+                error: crate::inference_admission::AdmissionError::QueueTimeout,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -665,5 +772,93 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::AuthFailed { .. }));
+    }
+    #[tokio::test]
+    async fn missing_budget_makes_zero_upstream_attempts() {
+        let (upstream, requests) = counted_entry("groq", true);
+        let provider = FreeProvider::new(vec![upstream]);
+        let mut request = dummy_request("free/auto");
+        request.wire_budget = None;
+        let error = provider.create_message(request.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, ProviderError::BudgetExceeded { error, .. } if matches!(*error, crate::WireBudgetError::MissingBudget))
+        );
+        assert!(provider.create_message_stream(request).await.is_err());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn each_fallback_attempt_binds_actual_model_limit() {
+        let (first, first_requests) = counted_entry("groq", false);
+        let (second, second_requests) = counted_entry("google", true);
+        let provider = FreeProvider::new(vec![first, second]);
+        let response = provider
+            .create_message(dummy_request("free/auto"))
+            .await
+            .unwrap();
+        assert_eq!(response.model, "gemini-2.5-flash");
+        let registry = crate::ModelRegistry::new();
+        for (id, requests) in [("groq", first_requests), ("google", second_requests)] {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            let budget = request.wire_budget.as_ref().unwrap();
+            let model_limit = u64::from(
+                registry
+                    .get(id, &request.model)
+                    .unwrap()
+                    .info
+                    .context_window,
+            );
+            assert_eq!(budget.context_limit_tokens, model_limit.min(10_000_000));
+            assert_eq!(budget.input_limit_tokens, budget.context_limit_tokens - 8);
+            assert!(budget
+                .budget_source
+                .contains(&format!("{id}/{}", request.model)));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_and_invalid_budget_do_not_reach_upstream() {
+        let (upstream, requests) = counted_entry("groq", true);
+        let provider = FreeProvider::new(vec![upstream]);
+        let error = provider
+            .create_message(dummy_request("groq/unknown-alias"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidRequest { .. }));
+        let mut request = dummy_request("auto");
+        request.wire_budget.as_mut().unwrap().framing_tokens = 0;
+        assert!(
+            matches!(provider.create_message(request).await.unwrap_err(),
+            ProviderError::BudgetExceeded { error, .. } if matches!(*error, crate::WireBudgetError::InvalidBudget))
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn smaller_caller_cap_survives_upstream_model_binding() {
+        let (upstream, requests) = counted_entry("google", true);
+        let provider = FreeProvider::new(vec![upstream]);
+        let mut request = dummy_request("auto");
+        request.wire_budget = Some(
+            crate::WireBudget::finite(
+                32_000,
+                31_992,
+                8,
+                8 * 1024 * 1024,
+                crate::MediaAccounting::None,
+            )
+            .unwrap()
+            .with_source("explicit")
+            .unwrap(),
+        );
+        provider.create_message(request).await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let budget = requests[0].wire_budget.as_ref().unwrap();
+        assert_eq!(budget.context_limit_tokens, 32_000);
+        assert_eq!(budget.input_limit_tokens, 31_992);
+        assert!(budget.budget_source.contains("caller=explicit"));
     }
 }

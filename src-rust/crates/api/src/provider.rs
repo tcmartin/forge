@@ -5,13 +5,20 @@
 // and report capabilities.  Auth concerns live in `auth.rs`.
 
 use async_trait::async_trait;
+use claurst_core::dispatch::{DispatchDenied, DispatchRoute};
+use claurst_core::effort::EffortLevel;
 use claurst_core::provider_id::{ModelId, ProviderId};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::Arc;
 
+use crate::dispatch_policy::DispatchPolicy;
 use crate::provider_error::ProviderError;
-use crate::provider_types::{ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent};
+use crate::provider_types::{
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus,
+    ResponseContinuationSupport, StreamEvent,
+};
 
 // ---------------------------------------------------------------------------
 // ModelInfo
@@ -71,6 +78,9 @@ impl Default for ModelInfo {
 ///
 /// Implementors are required to be `Send + Sync` so they can be held behind an
 /// `Arc<dyn LlmProvider>` and shared across async tasks.
+// async-trait emits a bare `#[must_use]` on its boxed futures;
+// Rust 1.99 Clippy sees the boxed future's own marker and reports a duplicate.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Unique machine-readable identifier, e.g. `"anthropic"`, `"openai"`.
@@ -90,10 +100,7 @@ pub trait LlmProvider: Send + Sync {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 
     /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
     /// a local Ollama/LM Studio server, or a Copilot entitlement query).
@@ -119,4 +126,51 @@ pub trait LlmProvider: Send + Sync {
     /// This must not make a network call — it describes the provider's known
     /// feature set as compiled in.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Declare whether this exact adapter route accepts provider-managed
+    /// response-ID continuation. The conservative default is full context.
+    fn response_continuation_support(&self) -> ResponseContinuationSupport {
+        ResponseContinuationSupport::Unsupported
+    }
+
+    /// Return an opaque, host-only identity for the exact account and endpoint
+    /// that would own a response-continuation anchor for `model`.
+    ///
+    /// Providers that enable response-ID continuation must override this and
+    /// change the value whenever the account, endpoint, or compatible route
+    /// changes. The query layer snapshots it before dispatch; it is never sent
+    /// to the provider.
+    fn response_continuation_route_identity(&self, model: &str) -> Option<String> {
+        let _ = model;
+        None
+    }
+
+    /// Return an opaque host-only fingerprint for the current provider
+    /// configuration, when this adapter can identify its account and endpoint
+    /// without exposing either value. The query layer uses this only as a
+    /// continuity-cache hint; dispatch authority remains bound to the
+    /// returned provider and its verified route.
+    fn host_configuration_fingerprint(&self) -> Option<String> {
+        None
+    }
+
+    /// Return a typed dispatch route for this provider when it supports
+    /// host-authorized inference dispatch. Unsupported providers fail closed.
+    fn dispatch_route(
+        &self,
+        model: &str,
+        effort: EffortLevel,
+    ) -> Result<DispatchRoute, DispatchDenied> {
+        let _ = (model, effort);
+        Err(DispatchDenied::UnsupportedRoute)
+    }
+
+    /// Return a retained provider instance carrying host-verified dispatch
+    /// policy. Providers that cannot bind policy remain fixed/base-only.
+    fn bind_dispatch_policy(
+        &self,
+        _policy: Arc<DispatchPolicy>,
+    ) -> Result<Arc<dyn LlmProvider>, DispatchDenied> {
+        Err(DispatchDenied::UnsupportedRoute)
+    }
 }

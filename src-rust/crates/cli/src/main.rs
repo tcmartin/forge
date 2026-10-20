@@ -1,6 +1,6 @@
-// claurst CLI entry point
+// Forge CLI entry point
 //
-// This is the main binary for Claurst. It:
+// This is the main binary for Forge. It:
 // 1. Parses CLI arguments with clap (mirrors cli.tsx + main.tsx flags)
 // 2. Loads configuration from settings.json + env vars
 // 3. Builds system/user context (git status, AGENTS.md)
@@ -12,8 +12,10 @@
 // parameters; grouping them into structs is a larger refactor out of scope here.
 #![allow(clippy::too_many_arguments)]
 
-mod oauth_flow;
+mod cli_identity;
 mod codex_oauth_flow;
+mod oauth_flow;
+mod tool_policy;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +38,7 @@ pub const FEEDBACK_CHANNEL: &str = env!("FEEDBACK_CHANNEL");
 pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
 use anyhow::Context;
+use clap::{ArgAction, Parser, ValueEnum};
 use claurst_core::{
     config::{Config, PermissionMode, Settings},
     constants::APP_VERSION,
@@ -43,72 +46,204 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use async_trait::async_trait;
-use claurst_core::types::ToolDefinition;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
-use clap::{ArgAction, Parser, ValueEnum};
+use claurst_query::host_inventory::{filter_shared_tools, HostInventorySource, McpToolWrapper};
+use claurst_tools::ToolContext;
 use parking_lot::Mutex as ParkingMutex;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
+use claurst_query::effort_policy::{PinProvenance, ValueProvenance, ValueSource};
+use cli_identity::{parse_context_limit, parse_wire_limit_bytes, workspace_scope_id, PRODUCT_NAME};
+use tool_policy::{filter_tool_names, ToolPolicy};
 
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager: Arc<claurst_mcp::McpManager>,
+type ToolSet = Arc<Vec<Box<dyn claurst_tools::Tool>>>;
+
+const MAX_STREAM_JSON_RECORD_BYTES: usize = 1024 * 1024;
+
+struct BoundedStreamJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
 }
 
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
+impl std::io::Write for BoundedStreamJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream-json record size overflow",
+            )
+        })?;
+        if next > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream-json record exceeds bounded line",
+            ));
         }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
 
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
-        let args = if input.is_null() { None } else { Some(input) };
+fn write_bounded_stream_json<T: serde::Serialize>(
+    mut output: impl std::io::Write,
+    value: &T,
+) -> anyhow::Result<()> {
+    let payload_limit = MAX_STREAM_JSON_RECORD_BYTES
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("stream-json record bound is invalid"))?;
+    let mut writer = BoundedStreamJsonWriter {
+        bytes: Vec::with_capacity(4096),
+        limit: payload_limit,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    let with_newline = writer
+        .bytes
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("stream-json record size overflow"))?;
+    if with_newline > MAX_STREAM_JSON_RECORD_BYTES {
+        return Err(anyhow::anyhow!("stream-json record exceeds bounded line"));
+    }
+    writer.bytes.push(b'\n');
+    output.write_all(&writer.bytes)?;
+    output.flush()?;
+    Ok(())
+}
 
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
+fn emit_bounded_stream_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    write_bounded_stream_json(std::io::stdout().lock(), value)
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedPluginMcp {
+    owner_source_id: String,
+    config: claurst_core::config::McpServerConfig,
+    fingerprint: String,
+}
+
+fn mcp_definition_fingerprint(config: &claurst_core::config::McpServerConfig) -> String {
+    let mut env: Vec<_> = config.env.iter().collect();
+    env.sort_by(|left, right| left.0.cmp(right.0));
+    format!(
+        "name={:?};command={:?};args={:?};env={:?};url={:?};type={:?};origin={:?}",
+        canonical_plugin_mcp_name(&config.name),
+        config.command,
+        config.args,
+        env,
+        config.url,
+        config.server_type,
+        config.origin,
+    )
+}
+
+fn canonical_plugin_mcp_name(name: &str) -> String {
+    claurst_mcp::canonical_mcp_server_name(name)
+}
+
+/// Collapse the configured roster before trust partitioning or transport
+/// startup. Explicit/user definitions win over project definitions, and the
+/// namespace is case-insensitive across config and plugin sources.
+fn dedupe_configured_mcp_servers(config: &mut Config) {
+    let mut indexes = std::collections::HashMap::<String, usize>::new();
+    let mut selected: Vec<claurst_core::config::McpServerConfig> = Vec::new();
+    for server in config.mcp_servers.drain(..) {
+        let key = canonical_plugin_mcp_name(&server.name);
+        if let Some(index) = indexes.get(&key).copied() {
+            if selected[index].origin == claurst_core::config::McpServerOrigin::Project
+                && server.origin == claurst_core::config::McpServerOrigin::User
+            {
+                selected[index] = server;
             }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
+        } else {
+            indexes.insert(key, selected.len());
+            selected.push(server);
         }
     }
+    config.mcp_servers = selected;
+}
+
+fn merge_startup_plugin_mcp(
+    config: &mut Config,
+    registry: &claurst_plugins::PluginRegistry,
+) -> Vec<AcceptedPluginMcp> {
+    dedupe_configured_mcp_servers(config);
+    let mut names: std::collections::HashMap<String, usize> = config
+        .mcp_servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| (canonical_plugin_mcp_name(&server.name), index))
+        .collect();
+    let mut accepted = Vec::new();
+    for server in registry.all_mcp_servers_with_owners() {
+        let key = canonical_plugin_mcp_name(&server.config.name);
+        if let Some(index) = names.get(&key).copied() {
+            if config.mcp_servers[index].origin != claurst_core::config::McpServerOrigin::Project {
+                continue;
+            }
+            config.mcp_servers[index] = server.config.clone();
+            accepted.push(AcceptedPluginMcp {
+                owner_source_id: server.owner_source_id,
+                config: server.config,
+                fingerprint: mcp_definition_fingerprint(&config.mcp_servers[index]),
+            });
+        } else {
+            names.insert(key, config.mcp_servers.len());
+            let fingerprint = mcp_definition_fingerprint(&server.config);
+            config.mcp_servers.push(server.config.clone());
+            accepted.push(AcceptedPluginMcp {
+                owner_source_id: server.owner_source_id,
+                config: server.config,
+                fingerprint,
+            });
+        }
+    }
+    accepted
+}
+
+fn reconcile_plugin_mcp_config(
+    config: &mut Config,
+    previous: &[AcceptedPluginMcp],
+    registry: &claurst_plugins::PluginRegistry,
+) -> Vec<AcceptedPluginMcp> {
+    let previous_fingerprints: std::collections::HashMap<_, _> = previous
+        .iter()
+        .map(|server| {
+            (
+                canonical_plugin_mcp_name(&server.config.name),
+                server.fingerprint.clone(),
+            )
+        })
+        .collect();
+    config.mcp_servers.retain(|server| {
+        previous_fingerprints
+            .get(&canonical_plugin_mcp_name(&server.name))
+            .is_none_or(|fingerprint| mcp_definition_fingerprint(server) != *fingerprint)
+    });
+    merge_startup_plugin_mcp(config, registry)
+}
+
+fn plugin_mcp_identity_changes(
+    previous: &[AcceptedPluginMcp],
+    current: &[AcceptedPluginMcp],
+) -> std::collections::HashSet<String> {
+    let current_by_name: std::collections::HashMap<_, _> = current
+        .iter()
+        .map(|entry| (canonical_plugin_mcp_name(&entry.config.name), entry))
+        .collect();
+    previous
+        .iter()
+        .filter_map(|entry| {
+            let key = canonical_plugin_mcp_name(&entry.config.name);
+            let next = current_by_name.get(&key)?;
+            (entry.owner_source_id != next.owner_source_id || entry.fingerprint != next.fingerprint)
+                .then_some(key)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +252,9 @@ impl Tool for McpToolWrapper {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "claurst",
+    name = PRODUCT_NAME,
     version = APP_VERSION,
-    about = "Claurst - AI-powered coding assistant",
+    about = "Forge - AI-powered coding assistant",
     long_about = None,
 )]
 struct Cli {
@@ -146,6 +281,10 @@ struct Cli {
     #[arg(long = "max-turns", default_value_t = 10)]
     max_turns: u32,
 
+    /// Maximum number of concurrent inference transports
+    #[arg(long = "max-concurrent-inference", value_name = "COUNT", default_value_t = 4, value_parser = parse_inference_capacity)]
+    max_concurrent_inference: usize,
+
     /// Custom system prompt
     #[arg(long = "system-prompt", short = 's')]
     system_prompt: Option<String>,
@@ -157,6 +296,10 @@ struct Cli {
     /// Disable AGENTS.md memory files
     #[arg(long = "no-claude-md", action = ArgAction::SetTrue)]
     no_claude_md: bool,
+
+    /// Save session memories in .claurst/AGENTS.md using an additional provider request
+    #[arg(long = "session-memory", action = ArgAction::SetTrue)]
+    session_memory: bool,
 
     /// Output format
     #[arg(long = "output-format", value_enum, default_value_t = CliOutputFormat::Text)]
@@ -173,6 +316,14 @@ struct Cli {
     /// Maximum tokens per response
     #[arg(long = "max-tokens")]
     max_tokens: Option<u32>,
+
+    /// Finite context budget in tokens for request selection
+    #[arg(long = "context-limit", value_name = "TOKENS", value_parser = parse_context_limit)]
+    context_limit: Option<u64>,
+
+    /// Finite maximum provider request body size in bytes
+    #[arg(long = "wire-limit-bytes", value_name = "BYTES", value_parser = parse_wire_limit_bytes)]
+    wire_limit_bytes: Option<u64>,
 
     /// Working directory
     #[arg(long = "cwd")]
@@ -191,7 +342,7 @@ struct Cli {
     mcp_config: Option<String>,
 
     /// Trust and auto-launch project-defined MCP servers (declared in a repo's
-    /// .claurst/settings.json) without prompting. Off by default: such servers
+    /// project settings) without prompting. Off by default: such servers
     /// can run arbitrary commands, so opening an untrusted repo would otherwise
     /// require explicit per-server approval. Intended for automation/CI.
     #[arg(long = "trust-project-mcp", action = ArgAction::SetTrue)]
@@ -205,7 +356,7 @@ struct Cli {
     #[arg(long = "auto-commits", action = ArgAction::SetTrue)]
     auto_commits: bool,
 
-    /// Grant Claurst access to an additional directory (can be repeated)
+    /// Grant Forge access to an additional directory (can be repeated)
     #[arg(long = "add-dir", value_name = "DIR", action = ArgAction::Append)]
     add_dir: Vec<PathBuf>,
 
@@ -228,6 +379,10 @@ struct Cli {
     /// Extended thinking budget in tokens (enables extended thinking)
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
+
+    /// Explicit verified-effort startup policy document
+    #[arg(long = "verified-policy", value_name = "FILE")]
+    verified_policy: Option<PathBuf>,
 
     /// Continue the most recent conversation
     #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
@@ -270,11 +425,11 @@ struct Cli {
     fallback_model: Option<String>,
 
     /// LLM provider to use (default: anthropic). Examples: openai, google, ollama
-    #[arg(long, env = "CLAURST_PROVIDER")]
+    #[arg(long, env = "FORGE_PROVIDER")]
     provider: Option<String>,
 
     /// Override the API base URL for the selected provider
-    #[arg(long, env = "CLAURST_API_BASE")]
+    #[arg(long, env = "FORGE_API_BASE")]
     api_base: Option<String>,
 
     /// Named agent to use (e.g., build, plan, explore)
@@ -351,18 +506,55 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
-    if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+fn parse_inference_capacity(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| "max concurrent inference must be an integer from 1 to 64".to_string())?;
+    if (1..=64).contains(&value) {
+        Ok(value)
+    } else {
+        Err("max concurrent inference must be between 1 and 64".to_string())
+    }
+}
+
+fn effort_cli_provenance(raw: Option<&str>) -> ValueProvenance {
+    match raw {
+        Some(value) if claurst_core::effort::EffortLevel::from_str(value).is_some() => {
+            ValueProvenance::new(ValueSource::ExplicitUser, true)
+        }
+        Some(_) => ValueProvenance::new(ValueSource::Unknown, true),
+        None => ValueProvenance::default(),
+    }
+}
+
+fn ensure_selected_provider_enabled(config: &Config) -> anyhow::Result<()> {
+    if config
+        .provider_configs
+        .get(config.selected_provider_id())
+        .is_some_and(|provider| !provider.enabled)
+    {
+        anyhow::bail!("selected provider is disabled")
+    }
+    Ok(())
+}
+
+fn handle_exit_key(
+    app: &mut claurst_tui::app::App,
+    key: crossterm::event::KeyEvent,
+    cancel: &Option<tokio_util::sync::CancellationToken>,
+) -> bool {
+    if !key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
         return false;
     }
 
     match key.code {
         crossterm::event::KeyCode::Char('c') => {
             // Cancel background task first, then let app handle state cleanup
-            if app.is_streaming {
-                if let Some(ref ct) = cancel {
-                    ct.cancel();
-                }
+            if let Some(ref ct) = cancel {
+                ct.cancel();
             }
             app.handle_key_event(key);
             true
@@ -374,12 +566,37 @@ fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEv
         _ => false,
     }
 }
+
+#[cfg(unix)]
+async fn wait_for_headless_shutdown_signal() -> bool {
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => return ctrl_c.await.is_ok(),
+        };
+    tokio::select! {
+        result = &mut ctrl_c => result.is_ok(),
+        _ = terminate.recv() => true,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_headless_shutdown_signal() -> bool {
+    tokio::signal::ctrl_c().await.is_ok()
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Must happen before any fast path or settings/auth lookup. Claurst's
+    // internal crates continue to read CLAURST_HOME as a compatibility bridge,
+    // while Forge keeps a separate default root and never falls back to
+    // ~/.claurst for a fresh install.
+    cli_identity::configure_data_root();
+
     // Fast-path: handle --version before parsing everything
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("claurst {}", APP_VERSION);
+        println!("{} {}", PRODUCT_NAME, APP_VERSION);
         return Ok(());
     }
 
@@ -422,7 +639,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cmd_name) = raw_args.get(1).map(|s| s.as_str()) {
         // Only intercept if it looks like a subcommand (no leading `-` or `/`)
         if !cmd_name.starts_with('-') && !cmd_name.starts_with('/') {
-            if let Some(named_cmd) = claurst_commands::named_commands::find_named_command(cmd_name) {
+            if let Some(named_cmd) = claurst_commands::named_commands::find_named_command(cmd_name)
+            {
                 // Build a minimal CommandContext (named commands are pre-session)
                 let settings = Settings::load().await.unwrap_or_default();
                 let config = settings.effective_config();
@@ -463,18 +681,34 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Configure the shared finite inference gate before any provider or
+    // registry construction. All inference leaves then share this capacity.
+    claurst_api::inference_admission::InferenceAdmission::configure_process(
+        cli.max_concurrent_inference,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
     // Setup logging
     let log_level = if cli.verbose { "debug" } else { "warn" };
-    let base_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let base_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let log_filter = base_filter
-        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"))
+        .add_directive(
+            "rmcp::service::client=error"
+                .parse()
+                .expect("valid rmcp directive"),
+        )
         // Suppress error/warn logs from providers and query — errors are already shown as error modals
-        .add_directive("claurst_api::providers::free=off".parse().expect("valid directive"))
+        .add_directive(
+            "claurst_api::providers::free=off"
+                .parse()
+                .expect("valid directive"),
+        )
         .add_directive("claurst_query=off".parse().expect("valid directive"));
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .without_time()
         .init();
 
@@ -484,11 +718,35 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    debug!(cwd = %cwd.display(), "Starting Claurst");
+    debug!("Starting Forge");
 
     // Determine mode early (needed for settings error reporting, auth error
     // handling, and permission handler selection).
     let is_headless = cli.print || cli.prompt.is_some();
+
+    // Load an explicitly selected verified policy before constructing any
+    // provider, plugin, MCP, or checker state. The loader canonicalizes and
+    // validates the startup workspace and returns categorical errors without
+    // exposing the selected path or document values.
+    let verified_startup_policy = cli
+        .verified_policy
+        .as_deref()
+        .map(|path| {
+            let startup_workspace = std::fs::canonicalize(&cwd)
+                .map_err(|_| claurst_query::startup_policy::StartupPolicyError::InvalidWorkspace)?;
+            claurst_query::startup_policy::LoadedVerifiedPolicy::load(path, &startup_workspace)
+                .map(Arc::new)
+        })
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("verified policy startup failed: {error}"))?;
+    let anthropic_client_factory = verified_startup_policy
+        .as_ref()
+        .map(|policy| {
+            claurst_api::AnthropicClientFactory::with_dispatch_policy(Arc::clone(
+                policy.dispatch_policy(),
+            ))
+        })
+        .unwrap_or_default();
 
     // Load settings from disk (hierarchical: global < project). A malformed
     // global file is kept intact; interactive mode displays the error in the
@@ -511,8 +769,10 @@ async fn main() -> anyhow::Result<()> {
         settings.trust_project_mcp_servers = true;
     }
 
-    // Build effective config (CLI args override settings)
+    // Build effective config (CLI args override settings). Capture whether the
+    // model came from settings before the CLI override erases that boundary.
     let mut config = settings.effective_config();
+    let settings_model_was_present = config.model.is_some();
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
@@ -526,7 +786,8 @@ async fn main() -> anyhow::Result<()> {
     config.output_format = cli.output_format.into();
     // --bare implies --no-claude-md: opening an untrusted repo in bare mode
     // must not load or inject AGENTS.md memory files.
-    config.disable_claude_mds = cli.no_claude_md || cli.bare;
+    config.disable_claude_mds |= cli.no_claude_md || cli.bare;
+    config.disable_extensions |= cli.bare;
     if cli.bare {
         // Bare mode runs no event hooks. Drop any hooks resolved from
         // settings so no `run_hooks` call site has anything to execute.
@@ -563,7 +824,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(base) = &cli.api_base {
         // Store in the provider's config entry
-        let provider_id = config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
+        let provider_id = config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "anthropic".to_string());
         config
             .provider_configs
             .entry(provider_id)
@@ -571,10 +835,34 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
+    // Reject an explicitly selected provider before auth resolution, plugin
+    // loading, MCP startup, or any provider construction can perform work.
+    ensure_selected_provider_enabled(&config)?;
+
+    // CLI values override settings-file values. Keep the resulting policy in
+    // Config so the scheduler's execution gate and every ToolContext share the
+    // same source of truth; the exposed inventory is filtered below as well.
+    let cli_tool_policy = match ToolPolicy::from_cli(
+        cli.allowed_tools.as_deref(),
+        cli.disallowed_tools.as_deref(),
+    ) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("{}: invalid tool selector: {}", PRODUCT_NAME, error);
+            std::process::exit(2);
+        }
+    };
+    cli_tool_policy.apply_cli_overrides(
+        &mut config,
+        cli.allowed_tools.is_some(),
+        cli.disallowed_tools.is_some(),
+    );
+    let tool_policy = ToolPolicy::from_config(&config)
+        .map_err(|error| anyhow::anyhow!("invalid configured tool selector: {}", error))?;
+
     // --dump-system-prompt fast path
     if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
+        let ctx = ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
         let sys = ctx.build_system_context().await;
         let user = ctx.build_user_context().await;
         println!("{}\n\n{}", sys, user);
@@ -582,8 +870,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
+    let ctx_builder =
+        ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
@@ -642,7 +930,8 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let client = Arc::new(
-        claurst_api::AnthropicClient::new(client_config.clone())
+        anthropic_client_factory
+            .create(client_config)
             .context("Failed to create API client")?,
     );
 
@@ -651,12 +940,12 @@ async fn main() -> anyhow::Result<()> {
     // Anthropic is always the default; additional providers (OpenAI, Google,
     // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
     // their respective environment variables or auth store entries are found.
-    let provider_registry = claurst_api::ProviderRegistry::from_config(&config, client_config);
+    let provider_registry =
+        claurst_api::ProviderRegistry::from_config_with_anthropic_client(&config, client.clone());
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
-    if let Some(cfg) = bridge_config.as_ref() {
+    if bridge_config.is_some() {
         info!(
-            server_url = %cfg.server_url,
             startup_enabled = settings.remote_control_at_startup,
             "Remote control bridge configured for interactive startup"
         );
@@ -668,9 +957,13 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
-        Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
+        Arc::new(AutoPermissionHandler::with_manager(
+            permission_manager.clone(),
+        ))
     } else {
-        Arc::new(InteractivePermissionHandler::with_manager(permission_manager.clone()))
+        Arc::new(InteractivePermissionHandler::with_manager(
+            permission_manager.clone(),
+        ))
     };
     let cost_tracker = CostTracker::new();
     // Use --session-id if provided, otherwise generate a fresh UUID.
@@ -682,6 +975,37 @@ async fn main() -> anyhow::Result<()> {
         claurst_core::file_history::FileHistory::new(),
     ));
     let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Load plugins before MCP startup so plugin-declared servers enter the
+    // same trust partition, connection, and tool-policy filter as settings
+    // servers. Bare mode skips discovery from the untrusted repository.
+    let plugin_registry = if config.disable_extensions {
+        claurst_plugins::PluginRegistry::new()
+    } else {
+        claurst_plugins::load_plugins(&cwd, &[]).await
+    };
+    {
+        let plugin_cmd_count = plugin_registry.all_command_defs().len();
+        let plugin_hook_count = plugin_registry
+            .build_hook_registry()
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>();
+        info!(
+            plugins = plugin_registry.enabled_count(),
+            commands = plugin_cmd_count,
+            hooks = plugin_hook_count,
+            "Plugins loaded"
+        );
+    }
+
+    // Register plugin MCP servers into the in-memory config before the trust
+    // decision and manager construction below. Keep ownership separately so
+    // a later reload can remove only definitions this merge inserted.
+    let accepted_plugin_mcp = merge_startup_plugin_mcp(&mut config, &plugin_registry);
+
+    plugin_registry.publish_skill_sources(&config, &cwd);
+    claurst_plugins::set_global_registry(plugin_registry);
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     //
@@ -704,24 +1028,25 @@ async fn main() -> anyhow::Result<()> {
     };
     let pending_project_mcp = mcp_decision.pending.clone();
     if !pending_project_mcp.is_empty() {
-        let names: Vec<&str> = pending_project_mcp.iter().map(|s| s.name.as_str()).collect();
         if is_headless {
             warn!(
-                servers = ?names,
+                count = pending_project_mcp.len(),
                 "Skipping project-defined MCP server(s) pending approval. \
                  Approve them in the interactive TUI, or pass --trust-project-mcp \
                  (or set trustProjectMcpServers) to launch them in headless mode."
             );
         } else {
             info!(
-                servers = ?names,
+                count = pending_project_mcp.len(),
                 "Project-defined MCP server(s) require approval before launching."
             );
         }
     }
     let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
 
-    let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
+    let pending_permissions = Arc::new(ParkingMutex::new(
+        claurst_tools::PendingPermissionStore::default(),
+    ));
 
     let is_non_interactive = cli.print || cli.prompt.is_some();
 
@@ -729,7 +1054,11 @@ async fn main() -> anyhow::Result<()> {
     // Only created in interactive mode; None in headless/print mode.
     let (user_question_tx, user_question_rx) =
         tokio::sync::mpsc::unbounded_channel::<claurst_tools::UserQuestionEvent>();
-    let user_question_rx = if is_non_interactive { None } else { Some(user_question_rx) };
+    let user_question_rx = if is_non_interactive {
+        None
+    } else {
+        Some(user_question_rx)
+    };
 
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
@@ -746,10 +1075,16 @@ async fn main() -> anyhow::Result<()> {
         completion_notifier: None,
         pending_permissions: Some(pending_permissions.clone()),
         permission_manager: Some(permission_manager.clone()),
-        user_question_tx: if is_non_interactive { None } else { Some(user_question_tx) },
+        user_question_tx: if is_non_interactive {
+            None
+        } else {
+            Some(user_question_tx)
+        },
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        catalog_view: None,
+        trusted_checker_catalog: Arc::new(claurst_tools::TrustedCheckerCatalog::empty()),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -778,45 +1113,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
-
-    // Load plugins and register any plugin-provided MCP servers into the
-    // in-memory config (does not modify the settings file on disk).
-    // Bare mode skips plugin discovery entirely and uses an empty registry so
-    // no plugin commands, hooks, or MCP servers are loaded from an untrusted
-    // repo. Downstream code still works against the empty registry.
-    let plugin_registry = if cli.bare {
-        claurst_plugins::PluginRegistry::new()
-    } else {
-        claurst_plugins::load_plugins(&cwd, &[]).await
-    };
-    {
-        let plugin_cmd_count = plugin_registry.all_command_defs().len();
-        let plugin_hook_count = plugin_registry
-            .build_hook_registry()
-            .values()
-            .map(|v| v.len())
-            .sum::<usize>();
-        info!(
-            plugins = plugin_registry.enabled_count(),
-            commands = plugin_cmd_count,
-            hooks = plugin_hook_count,
-            "Plugins loaded"
-        );
-
-        // Register plugin MCP servers into the in-memory config so they are
-        // picked up by any subsequent MCP manager construction.
-        let existing_names: std::collections::HashSet<String> = config
-            .mcp_servers
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        for mcp_server in plugin_registry.all_mcp_servers() {
-            if !existing_names.contains(&mcp_server.name) {
-                config.mcp_servers.push(mcp_server);
-            }
-        }
-    }
+    let tools = filter_tool_names(build_tools_with_mcp(mcp_manager_arc.clone()), &tool_policy);
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -824,12 +1121,42 @@ async fn main() -> anyhow::Result<()> {
     let model_registry = load_cached_model_registry(&config);
 
     // Build query config
-    let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
+    let mut query_config =
+        claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
+    if let Some(policy) = verified_startup_policy.as_ref() {
+        query_config.effort_policy = policy.effort_policy();
+        query_config.verified_startup_policy = verified_startup_policy.clone();
+        query_config.anthropic_client_factory = Some(anthropic_client_factory.clone());
+    }
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
+    query_config.session_memory_enabled = cli.session_memory;
+    if let Some(limit) = cli.context_limit {
+        query_config.context_budget.context_limit_tokens = Some(limit);
+    }
+    if let Some(limit) = cli.wire_limit_bytes {
+        query_config.context_budget.wire_byte_limit = limit;
+    }
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
+    let model_provenance = if cli.model.is_some() {
+        ValueProvenance::new(ValueSource::ExplicitUser, true)
+    } else if settings_model_was_present {
+        ValueProvenance::new(ValueSource::Settings, true)
+    } else {
+        ValueProvenance::default()
+    };
+    let effort_provenance = effort_cli_provenance(cli.effort.as_deref());
+    let thinking_provenance = if cli.thinking.is_some() {
+        ValueProvenance::new(ValueSource::ExplicitUser, true)
+    } else {
+        ValueProvenance::default()
+    };
+    query_config.pin_provenance = PinProvenance::default()
+        .with_model_source(model_provenance)
+        .with_effort(effort_provenance)
+        .with_thinking_budget(thinking_provenance);
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -837,7 +1164,10 @@ async fn main() -> anyhow::Result<()> {
         if let Some(level) = claurst_core::effort::EffortLevel::from_str(level_str) {
             query_config.effort_level = Some(level);
         } else {
-            eprintln!("Warning: unknown effort level '{}' — expected low/medium/high/max", level_str);
+            eprintln!(
+                "Warning: unknown effort level '{}' — expected low/medium/high/max",
+                level_str
+            );
         }
     }
     if let Some(usd) = cli.max_budget_usd {
@@ -863,27 +1193,48 @@ async fn main() -> anyhow::Result<()> {
             if let Some(turns) = def.max_turns {
                 query_config.max_turns = turns;
             }
-            filter_tools_for_agent(tools, &access)
+            filter_tools_for_agent(tools, &access, None, &cwd)
         } else {
-            eprintln!("Warning: unknown agent '{}'. Run /agent to see available agents.", agent_name);
+            eprintln!(
+                "Warning: unknown agent '{}'. Run /agent to see available agents.",
+                agent_name
+            );
             tools
         }
     } else {
         tools
     };
 
+    let mut native_tools = claurst_tools::all_tools();
+    native_tools.push(Box::new(claurst_query::AgentTool));
+    query_config.inventory_source = Some(HostInventorySource::new(
+        Arc::new(native_tools),
+        &tool_ctx.config,
+        query_config
+            .agent_definition
+            .as_ref()
+            .map(|definition| definition.access.as_str()),
+    )?);
+
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
-    // Cancelled automatically when the process exits since we use a shared token.
+    // Each durable cron session gets its own workspace-bound HistoryRead tool
+    // through the same policy-filtered factory used by foreground queries.
+    let history_root = Settings::config_dir();
     let cron_cancel = tokio_util::sync::CancellationToken::new();
-    claurst_query::start_cron_scheduler(
+    let cron_tool_factory = build_cron_tool_factory(&tool_ctx, &query_config);
+    let cron_control = claurst_query::start_cron_scheduler_with_history(
         client.clone(),
-        tools.clone(),
+        cron_tool_factory,
         tool_ctx.clone(),
         query_config.clone(),
+        history_root.clone(),
+        cwd.clone(),
         cron_cancel.clone(),
     );
+    drop(mcp_manager_arc);
 
     // --print mode (headless)
+    let history_workspace = workspace_scope_id(&cwd);
     let result = if is_headless {
         run_headless(
             &cli,
@@ -892,6 +1243,8 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
+            history_root.clone(),
+            history_workspace.clone(),
         )
         .await
     } else {
@@ -909,6 +1262,7 @@ async fn main() -> anyhow::Result<()> {
             tools,
             tool_ctx,
             query_config,
+            cron_control,
             cost_tracker,
             cli.resume,
             bridge_config,
@@ -916,7 +1270,11 @@ async fn main() -> anyhow::Result<()> {
             model_registry,
             user_question_rx,
             pending_project_mcp,
+            accepted_plugin_mcp,
             mcp_project_root,
+            history_root,
+            history_workspace,
+            cli.disable_slash_commands,
         )
         .await
     };
@@ -940,29 +1298,92 @@ async fn connect_mcp_manager_arc(
 
 fn build_tools_with_mcp(
     mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
-) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+) -> Vec<Box<dyn claurst_tools::Tool>> {
     let mut v: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools();
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
+        match manager_arc.checked_catalog_snapshot() {
+            Ok(snapshot) => {
+                for descriptor in snapshot.descriptors {
+                    v.push(Box::new(McpToolWrapper::new(
+                        descriptor,
+                        Arc::clone(manager_arc),
+                    )));
+                }
+            }
+            Err(_) => warn!("MCP catalog unavailable during tool-list display assembly"),
         }
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
-    Arc::new(v)
+    v
+}
+
+fn build_tools_with_history(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    history_index: Option<Arc<ParkingMutex<claurst_query::HistoryIndex>>>,
+    workspace: &std::path::Path,
+    policy: &ToolPolicy,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let mut tools = build_tools_with_mcp(mcp_manager);
+    if policy.allows("HistoryRead") {
+        if let Some(history_index) = history_index {
+            tools.push(claurst_query::make_history_read_tool_for_workspace(
+                history_index,
+                workspace,
+            ));
+        }
+    }
+    filter_tool_names(tools, policy)
+}
+
+fn build_policy_tools(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    history_index: Option<Arc<ParkingMutex<claurst_query::HistoryIndex>>>,
+    workspace: &std::path::Path,
+    config: &Config,
+    agent_access: Option<&str>,
+) -> (ToolSet, ToolSet) {
+    let policy = ToolPolicy::from_config(config).unwrap_or_else(|_| {
+        warn!("Invalid runtime tool policy; denying all tools");
+        ToolPolicy::deny_all()
+    });
+    let all_tools =
+        build_tools_with_history(mcp_manager, history_index.clone(), workspace, &policy);
+    let active_tools = agent_access.map_or_else(
+        || all_tools.clone(),
+        |access| filter_tools_for_agent(all_tools.clone(), access, history_index, workspace),
+    );
+    (all_tools, active_tools)
+}
+
+fn build_cron_tool_factory(
+    tool_ctx: &ToolContext,
+    query_config: &claurst_query::QueryConfig,
+) -> claurst_query::CronToolFactory {
+    let manager = tool_ctx.mcp_manager.clone();
+    let config = tool_ctx.config.clone();
+    let access = query_config
+        .agent_definition
+        .as_ref()
+        .map(|definition| definition.access.clone());
+    Arc::new(move |index, workspace| {
+        build_policy_tools(
+            manager.clone(),
+            Some(index),
+            workspace,
+            &config,
+            access.as_deref(),
+        )
+        .1
+    })
 }
 
 fn model_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("claurst")
+    // Keep the catalog under Forge's configured root. This avoids reading or
+    // writing the legacy ~/.cache/claurst catalog when Forge starts.
+    Settings::config_dir().join("cache")
 }
 
 /// Resolve the models.dev source URL, honoring env-var overrides.
@@ -1026,8 +1447,7 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
-    let mut registry = claurst_api::ModelRegistry::new()
-        .with_cache_path(models_cache_path());
+    let mut registry = claurst_api::ModelRegistry::new().with_cache_path(models_cache_path());
 
     if refresh {
         // Force-refresh by clearing the freshness check first.
@@ -1099,12 +1519,26 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         let out_cost = entry.cost_output.unwrap_or(0.0);
 
         let mut flags = Vec::new();
-        if entry.tool_calling { flags.push("tools"); }
-        if entry.reasoning { flags.push("reasoning"); }
-        if entry.vision() { flags.push("vision"); }
-        if entry.audio_input() { flags.push("audio"); }
-        if entry.pdf_input() { flags.push("pdf"); }
-        let flags_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(",")) };
+        if entry.tool_calling {
+            flags.push("tools");
+        }
+        if entry.reasoning {
+            flags.push("reasoning");
+        }
+        if entry.vision() {
+            flags.push("vision");
+        }
+        if entry.audio_input() {
+            flags.push("audio");
+        }
+        if entry.pdf_input() {
+            flags.push("pdf");
+        }
+        let flags_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(","))
+        };
 
         if verbose {
             println!(
@@ -1227,24 +1661,6 @@ fn spawn_models_cache_refresh() {
     });
 }
 
-/// TUI-startup analogue of opencode's `ModelsDev` background refresh
-/// (models-dev.ts:233-236): fire one refresh now (gated by the 5-minute TTL),
-/// then repeat spaced ~60 minutes so a long-running session keeps a fresh
-/// catalog on disk for the `/model` picker to reload. Non-blocking — the UI is
-/// never held on the network.
-fn spawn_models_cache_refresh_loop() {
-    if std::env::var("CLAURST_DISABLE_MODELS_FETCH").is_ok() {
-        tracing::debug!("CLAURST_DISABLE_MODELS_FETCH set — skipping models.dev refresh loop");
-        return;
-    }
-    tokio::spawn(async move {
-        loop {
-            refresh_models_cache_once().await;
-            tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
-        }
-    });
-}
-
 /// Fetch the models.dev catalog into the on-disk cache once, honoring the
 /// 5-minute mtime freshness check (mirrors opencode `ModelsDev.fresh()`). All
 /// network/parse failures are silent — the bundled snapshot is always
@@ -1274,8 +1690,8 @@ async fn refresh_models_cache_once() {
         .await
     {
         Ok(r) => r,
-        Err(err) => {
-            tracing::debug!(?err, "models.dev refresh: network error");
+        Err(_) => {
+            tracing::debug!("models.dev refresh: network error");
             return;
         }
     };
@@ -1293,7 +1709,7 @@ async fn refresh_models_cache_once() {
     // Write canonical path + legacy path so older installs keep working.
     let _ = std::fs::write(&cache_path, &text);
     let _ = std::fs::write(&legacy_cache_path, &text);
-    tracing::info!(path = %cache_path.display(), "Models cache refreshed from {}", url);
+    tracing::info!("Models cache refreshed");
 }
 
 async fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
@@ -1314,6 +1730,7 @@ struct RefreshedProviderRuntime {
 
 async fn refresh_provider_runtime_state(
     current_config: &Config,
+    anthropic_client_factory: &claurst_api::AnthropicClientFactory,
 ) -> anyhow::Result<RefreshedProviderRuntime> {
     remove_file_if_exists(&claurst_core::AuthStore::path())
         .await
@@ -1358,11 +1775,13 @@ async fn refresh_provider_runtime_state(
         ..Default::default()
     };
     let client = Arc::new(
-        claurst_api::AnthropicClient::new(client_config.clone())
+        anthropic_client_factory
+            .create(client_config)
             .context("Failed to rebuild Anthropic client")?,
     );
-    let provider_registry =
-        Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
+    let provider_registry = Arc::new(
+        claurst_api::ProviderRegistry::from_config_with_anthropic_client(&config, client.clone()),
+    );
     let model_registry = load_cached_model_registry(&config);
 
     spawn_models_cache_refresh();
@@ -1383,6 +1802,7 @@ async fn refresh_provider_runtime_state(
 /// Claude Pro/Max login works without a restart.
 async fn reload_provider_runtime_state(
     current_config: &Config,
+    anthropic_client_factory: &claurst_api::AnthropicClientFactory,
 ) -> anyhow::Result<RefreshedProviderRuntime> {
     let config = current_config.clone();
 
@@ -1403,11 +1823,13 @@ async fn reload_provider_runtime_state(
         ..Default::default()
     };
     let client = Arc::new(
-        claurst_api::AnthropicClient::new(client_config.clone())
+        anthropic_client_factory
+            .create(client_config)
             .context("Failed to rebuild Anthropic client")?,
     );
-    let provider_registry =
-        Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
+    let provider_registry = Arc::new(
+        claurst_api::ProviderRegistry::from_config_with_anthropic_client(&config, client.clone()),
+    );
     let model_registry = load_cached_model_registry(&config);
 
     Ok(RefreshedProviderRuntime {
@@ -1434,124 +1856,196 @@ fn normalize_provider_from_model(config: &mut Config) {
 fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     access: &str,
+    _history_index: Option<Arc<ParkingMutex<claurst_query::HistoryIndex>>>,
+    _workspace: &std::path::Path,
 ) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
     use claurst_tools::PermissionLevel as PL;
-    match access {
+    filter_shared_tools(tools, |tool| match access {
         "read-only" => {
-            // Collect names of tools that are read-only, then rebuild from all_tools
-            // (Box<dyn Tool> is not Clone so we can't directly filter-and-keep).
-            let allowed_names: Vec<String> = tools
-                .iter()
-                .filter(|t| {
-                    matches!(t.permission_level(), PL::ReadOnly | PL::None)
-                        || t.name() == "AskUserQuestion"
-                })
-                .map(|t| t.name().to_string())
-                .collect();
-            let filtered: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools()
-                .into_iter()
-                .filter(|t| allowed_names.iter().any(|n| n == t.name()))
-                .collect();
-            Arc::new(filtered)
+            matches!(tool.permission_level(), PL::ReadOnly | PL::None)
+                || tool.name() == "AskUserQuestion"
         }
-        "search-only" => {
-            const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
-            let filtered: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools()
-                .into_iter()
-                .filter(|t| SEARCH_TOOLS.contains(&t.name()))
-                .collect();
-            Arc::new(filtered)
-        }
-        _ => tools, // "full" — allow all tools unchanged
-    }
+        "search-only" => ["Grep", "Glob", "Read", "WebSearch", "WebFetch"].contains(&tool.name()),
+        _ => true,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Headless mode: read prompt from arg/stdin, run, print response
 // ---------------------------------------------------------------------------
 
+fn open_history_index(
+    history_root: &std::path::Path,
+    workspace_scope: &str,
+    session_id: &str,
+) -> anyhow::Result<Arc<ParkingMutex<claurst_query::HistoryIndex>>> {
+    let index = claurst_query::HistoryIndex::open(history_root, workspace_scope, session_id)
+        .with_context(|| format!("failed to open durable history for session {session_id}"))?;
+    Ok(Arc::new(ParkingMutex::new(index)))
+}
+
 async fn run_headless(
     cli: &Cli,
     client: Arc<claurst_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
-    tool_ctx: ToolContext,
-    query_config: claurst_query::QueryConfig,
+    _tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
+    mut tool_ctx: ToolContext,
+    mut query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
+    history_root: PathBuf,
+    _history_workspace: String,
 ) -> anyhow::Result<()> {
     use claurst_query::{QueryEvent, QueryOutcome};
-    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    // Resume loads the durable transcript before accepting the new prompt.
+    // This keeps headless and interactive modes on the same stable session IDs.
+    let requested_resume = if cli.continue_session {
+        Some("__last__")
+    } else {
+        cli.resume.as_deref()
+    };
+    let mut resumed_session = if let Some(requested_id) = requested_resume {
+        let id = if requested_id == "__last__" {
+            claurst_core::history::list_sessions()
+                .await
+                .first()
+                .map(|session| session.id.clone())
+        } else {
+            Some(requested_id.to_string())
+        };
+        match id {
+            Some(id) => match claurst_core::history::load_session(&id).await {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    anyhow::bail!("could not resume session {id}: {error}");
+                }
+            },
+            None => anyhow::bail!("no previous sessions found to resume"),
+        }
+    } else {
+        None
+    };
+    if let Some(session) = resumed_session.as_ref() {
+        tool_ctx.session_id = session.id.clone();
+        if let Some(saved_dir) = session.working_dir.as_ref() {
+            let saved_path = PathBuf::from(saved_dir);
+            if saved_path.exists() {
+                tool_ctx.working_dir = saved_path;
+            }
+        }
+    }
+    let effective_workspace = workspace_scope_id(&tool_ctx.working_dir);
+    query_config.working_directory = Some(tool_ctx.working_dir.display().to_string());
+    query_config.history_index = Some(open_history_index(
+        &history_root,
+        &effective_workspace,
+        &tool_ctx.session_id,
+    )?);
+    let history_index = query_config
+        .history_index
+        .clone()
+        .expect("history index was just installed");
+    let agent_access = query_config
+        .agent_definition
+        .as_ref()
+        .map(|definition| definition.access.as_str());
+    let (_, query_tools) = build_policy_tools(
+        tool_ctx.mcp_manager.clone(),
+        Some(history_index.clone()),
+        &tool_ctx.working_dir,
+        &tool_ctx.config,
+        agent_access,
+    );
 
     // Build initial messages list from input.
     // --input-format stream-json: stdin is newline-delimited JSON, each line is
     //   {"role":"user"|"assistant","content":"..."} (mirrors TS --input-format stream-json).
     // --input-format text (default): read prompt from positional arg or entire stdin as text.
-    let mut messages: Vec<claurst_core::types::Message> = if cli.input_format == CliInputFormat::StreamJson {
-        use tokio::io::{self, AsyncBufReadExt, BufReader};
-        let stdin = io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-        let mut parsed: Vec<claurst_core::types::Message> = Vec::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<serde_json::Value>(trimmed) {
-                Ok(v) => {
-                    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content = v
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if role == "assistant" {
-                        parsed.push(claurst_core::types::Message::assistant(content));
-                    } else {
-                        parsed.push(claurst_core::types::Message::user(content));
+    let mut messages: Vec<claurst_core::types::Message> =
+        if cli.input_format == CliInputFormat::StreamJson {
+            use tokio::io::{self, AsyncBufReadExt, BufReader};
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
+            let mut parsed: Vec<claurst_core::types::Message> = Vec::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v) => {
+                        let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                        let content = v
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if role == "assistant" {
+                            parsed.push(claurst_core::types::Message::assistant(content));
+                        } else {
+                            parsed.push(claurst_core::types::Message::user(content));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: skipping malformed JSON line: {} ({:?})",
+                            trimmed, e
+                        );
                     }
                 }
-                Err(e) => {
-                    eprintln!("Warning: skipping malformed JSON line: {} ({:?})", trimmed, e);
+            }
+            if parsed.is_empty() {
+                // Also check positional arg as fallback
+                if let Some(ref p) = cli.prompt {
+                    parsed.push(claurst_core::types::Message::user(p.clone()));
                 }
             }
-        }
-        if parsed.is_empty() {
-            // Also check positional arg as fallback
-            if let Some(ref p) = cli.prompt {
-                parsed.push(claurst_core::types::Message::user(p.clone()));
+            if let Some(session) = resumed_session.as_ref() {
+                let mut combined = session.messages.clone();
+                combined.extend(parsed);
+                combined
+            } else {
+                parsed
             }
-        }
-        parsed
-    } else {
-        // Plain text mode
-        let prompt = if let Some(ref p) = cli.prompt {
-            p.clone()
         } else {
-            use tokio::io::{self, AsyncReadExt};
-            let mut stdin = io::stdin();
-            let mut buf = String::new();
-            stdin.read_to_string(&mut buf).await?;
-            buf.trim().to_string()
+            // Plain text mode
+            let prompt = if let Some(ref p) = cli.prompt {
+                p.clone()
+            } else {
+                use tokio::io::{self, AsyncReadExt};
+                let mut stdin = io::stdin();
+                let mut buf = String::new();
+                stdin.read_to_string(&mut buf).await?;
+                buf.trim().to_string()
+            };
+
+            if prompt.is_empty() {
+                eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
+                std::process::exit(1);
+            }
+
+            let prompt_message = claurst_core::types::Message::user(prompt);
+            if let Some(session) = resumed_session.as_ref() {
+                let mut combined = session.messages.clone();
+                combined.push(prompt_message);
+                combined
+            } else {
+                vec![prompt_message]
+            }
         };
-
-        if prompt.is_empty() {
-            eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
-            std::process::exit(1);
-        }
-
-        vec![claurst_core::types::Message::user(prompt)]
-    };
 
     // --prefill: inject a partial assistant turn before the query so the model
     // continues from that text (mirrors TS --prefill flag).
     if let Some(ref prefill_text) = cli.prefill {
-        messages.push(claurst_core::types::Message::assistant(prefill_text.clone()));
+        messages.push(claurst_core::types::Message::assistant(
+            prefill_text.clone(),
+        ));
     }
 
     if messages.is_empty() {
@@ -1559,11 +2053,23 @@ async fn run_headless(
         std::process::exit(1);
     }
 
-    let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
+    let is_json_output = matches!(
+        cli.output_format,
+        CliOutputFormat::Json | CliOutputFormat::StreamJson
+    );
     let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    query_config.capture_mcp_diagnostics =
+        is_stream_json && std::env::var_os("FORGE_P07_RAW_MCP_RECEIPT_SINK").is_some();
     let cancel = CancellationToken::new();
+    let (event_tx, mut event_rx, event_delivery) = claurst_query::event_channel::bounded_events(
+        cancel.clone(),
+        256,
+        8 * 1024 * 1024,
+        MAX_STREAM_JSON_RECORD_BYTES,
+        claurst_query::event_channel::stream_event_charge,
+    )
+    .expect("fixed headless event limits");
     let client_clone = client.clone();
     let tool_ctx_clone = tool_ctx.clone();
     let qcfg = query_config.clone();
@@ -1571,11 +2077,14 @@ async fn run_headless(
     let event_tx_clone = event_tx.clone();
     let cancel_clone = cancel.clone();
 
-    let query_handle = tokio::spawn(async move {
-        claurst_query::run_query_loop(
+    let messages_arc = Arc::new(tokio::sync::Mutex::new(messages));
+    let messages_for_query = messages_arc.clone();
+    let mut query_handle = tokio::spawn(async move {
+        let mut messages = messages_for_query.lock().await.clone();
+        let outcome = claurst_query::run_query_loop_with_events(
             client_clone.as_ref(),
             &mut messages,
-            tools.as_slice(),
+            query_tools.as_slice(),
             &tool_ctx_clone,
             &qcfg,
             tracker_clone,
@@ -1583,7 +2092,11 @@ async fn run_headless(
             cancel_clone,
             None,
         )
-        .await
+        .await;
+        // The query mutates the transcript with tool calls and the assistant
+        // response. Publish it back for session persistence.
+        *messages_for_query.lock().await = messages;
+        outcome
     });
 
     // Drop the original tx so the channel closes when the task drops its clone
@@ -1591,9 +2104,58 @@ async fn run_headless(
 
     // Drain events and print streaming text
     let mut full_text = String::new();
+    let mut fallback_notice_shown = false;
+    let mut streaming_tool_ids = std::collections::HashSet::new();
 
-    while let Some(event) = event_rx.recv().await {
-        match &event {
+    let mut interrupted_by_signal = false;
+    let mut shutdown_signal = Box::pin(wait_for_headless_shutdown_signal());
+    macro_rules! forward_stream_json {
+        ($value:expr) => {
+            if emit_bounded_stream_json(&$value).is_err() {
+                event_delivery.forwarding_failed();
+                break;
+            }
+        };
+    }
+    loop {
+        let event = tokio::select! {
+            event = event_rx.recv() => event,
+            _ = &mut shutdown_signal => {
+                cancel.cancel();
+                interrupted_by_signal = true;
+                break;
+            }
+        };
+        let Some(event_lease) = event else {
+            break;
+        };
+        // Keep the reservation while stdout forwarding uses the borrowed event.
+        let event = event_lease.event();
+        match event {
+            QueryEvent::ProviderWireWitness(witness) if is_stream_json => {
+                forward_stream_json!(serde_json::json!({"type": "provider_witness", "witness": witness}));
+            }
+            QueryEvent::McpDiscovery(witness) if is_stream_json => {
+                if emit_bounded_stream_json(&serde_json::json!({"type":"mcp_discovery","witness":witness})).is_err() {
+                    event_delivery.forwarding_failed();
+                    break;
+                }
+            }
+            QueryEvent::McpInvocation { tool_id, identity, operation_context } if is_stream_json => {
+                if emit_bounded_stream_json(&serde_json::json!({"type":"mcp_invocation","tool_id":tool_id,"identity":identity,"operation_context":operation_context})).is_err() {
+                    event_delivery.forwarding_failed();
+                    break;
+                }
+            }
+            QueryEvent::Stream(claurst_api::AnthropicStreamEvent::MessageStart {
+                id,
+                model,
+                usage,
+            }) if is_stream_json => {
+                forward_stream_json!(serde_json::json!({
+                        "type": "message_start", "message_id": id, "model": model, "usage": usage,
+                    }));
+            }
             QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
                 delta: claurst_api::streaming::ContentDelta::TextDelta { text },
                 ..
@@ -1605,16 +2167,79 @@ async fn run_headless(
                     std::io::stdout().flush().ok();
                 } else if is_stream_json {
                     let chunk = serde_json::json!({ "type": "text_delta", "text": text });
-                    println!("{}", chunk);
+                    forward_stream_json!(chunk);
                 }
             }
-            QueryEvent::ToolStart { tool_name, .. } => {
-                if !is_json_output {
-                    eprintln!("\n[{}...]", tool_name);
-                } else {
+            QueryEvent::ToolStart {
+                tool_name,
+                tool_id,
+                input_json,
+            } => {
+                if is_stream_json {
+                    streaming_tool_ids.insert(tool_id.clone());
+                    let ev = serde_json::json!({
+                        "type": "tool_start", "tool": tool_name,
+                        "tool_id": tool_id, "input": input_json,
+                    });
+                    forward_stream_json!(ev);
+                } else if is_json_output {
+                    // Json reserves stdout for its single final result object.
+                    // Progress remains visible without corrupting machine output.
                     let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
-                    println!("{}", ev);
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!("\n[{}...]", tool_name);
                 }
+            }
+            QueryEvent::ToolEnd {
+                tool_name,
+                tool_id,
+                result,
+                is_error,
+                execution_witness,
+            } if is_stream_json => {
+                // Rejected or undisclosed calls can return a result without
+                // an execution start. Preserve it without inventing a start.
+                let kind = if streaming_tool_ids.remove(tool_id) {
+                    "tool_end"
+                } else {
+                    "tool_result_unpaired"
+                };
+                let mut event = serde_json::json!({
+                    "type": kind, "tool": tool_name, "tool_id": tool_id,
+                    "result": result, "is_error": is_error,
+                });
+                if let Some(witness) = execution_witness {
+                    event["execution_witness"] =
+                        serde_json::to_value(witness).unwrap_or(serde_json::Value::Null);
+                }
+                forward_stream_json!(event);
+            }
+            QueryEvent::TurnComplete {
+                turn,
+                stop_reason,
+                usage,
+            } if is_stream_json => {
+                forward_stream_json!(serde_json::json!({
+                        "type": "turn_complete", "turn": turn,
+                        "stop_reason": stop_reason, "usage": usage,
+                    }));
+            }
+            QueryEvent::EffortSelection(selection) => {
+                if is_stream_json && !selection.is_default_fixed() {
+                    forward_stream_json!(serde_json::json!({
+                            "type": "effort_selection",
+                            "status": selection.status_line(),
+                        }));
+                } else if !selection.is_default_fixed() {
+                    eprintln!("\n{}", selection.status_line());
+                }
+            }
+            QueryEvent::Status(status)
+                if !fallback_notice_shown && status.starts_with("Context budget unknown for ") =>
+            {
+                eprintln!("Notice: {}", status);
+                fallback_notice_shown = true;
             }
             QueryEvent::Error(msg) => {
                 if is_json_output {
@@ -1628,42 +2253,124 @@ async fn run_headless(
         }
     }
 
-    // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        claurst_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
+    // Wait for the query task to finish and get the final outcome. A signal
+    // gets a bounded join; aborting after the deadline is reported as a
+    // cancellation and never falls through to normal completion/persistence.
+    let (mut outcome, query_joined) = if interrupted_by_signal || event_delivery.failure().is_some()
+    {
+        match tokio::time::timeout(Duration::from_secs(5), &mut query_handle).await {
+            Ok(joined) => (
+                joined.unwrap_or(QueryOutcome::Error(
+                    claurst_core::error::ClaudeError::Other(
+                        "Query task panicked while cancelling".to_string(),
+                    ),
+                )),
+                true,
+            ),
+            Err(_) => {
+                query_handle.abort();
+                let _ = query_handle.await;
+                (QueryOutcome::Cancelled, false)
+            }
+        }
+    } else {
+        (
+            query_handle.await.unwrap_or(QueryOutcome::Error(
+                claurst_core::error::ClaudeError::Other("Query task panicked".to_string()),
+            )),
+            true,
+        )
+    };
+    if event_delivery.failure().is_some() {
+        outcome = QueryOutcome::Error(claurst_core::error::ClaudeError::Config(
+            "Query event delivery failed".to_string(),
+        ));
+    }
+    // The query task owns the working transcript; copy it only after the
+    // provider loop has finished, then persist the stable session identity.
+    // (The task body writes the updated vector below before returning.)
+    let final_messages = messages_arc.lock().await.clone();
+    let mut session = resumed_session.take().unwrap_or_else(|| {
+        let mut session =
+            claurst_core::history::ConversationSession::new(query_config.model.clone());
+        session.id = tool_ctx.session_id.clone();
+        session
+    });
+    session.messages = final_messages;
+    session.model = query_config.model.clone();
+    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    session.updated_at = chrono::Utc::now();
+    if query_joined && claurst_core::history::save_session(&session).await.is_err() {
+        warn!("failed to persist headless session");
+    }
+
+    // Headless runs are single-turn sessions. Wait for the query task above,
+    // then terminate every REPL rooted in this workspace/session before any
+    // output path can call process::exit. A foreign workspace with the same
+    // session id is outside this scoped shutdown.
+    let child_shutdown =
+        claurst_tools::agent_tasks::shutdown_child_services(&tool_ctx, Duration::from_secs(5))
+            .await;
+    if matches!(
+        child_shutdown.cleanup,
+        claurst_tools::agent_tasks::ChildCleanup::CleanupUnknown
+    ) {
+        warn!(
+            repl_sessions = child_shutdown.repl_sessions,
+            background_processes = child_shutdown.background_processes,
+            "child service cleanup remained unconfirmed after headless query"
+        );
+    }
+
+    // Every headless exit path must close owned MCP transports and flush the
+    // explicit receipt before process::exit can bypass Rust destructors.
+    if let Some(manager) = tool_ctx.mcp_manager.as_ref() {
+        let shutdown = tokio::time::timeout(
+            Duration::from_secs(5),
+            claurst_tools::McpManager::reconcile_with_previous(manager, &[]),
+        )
+        .await;
+        if !matches!(shutdown, Ok(ref outcome) if outcome.failures.is_empty()) {
+            outcome = QueryOutcome::Error(claurst_core::error::ClaudeError::Config(
+                "MCP shutdown was not confirmed".to_owned(),
+            ));
+        }
+    }
 
     // Final output
     match cli.output_format {
-        CliOutputFormat::Json => {
-            match outcome {
-                QueryOutcome::EndTurn { message, usage } => {
-                    let result_text = if full_text.is_empty() {
-                        message.get_all_text()
-                    } else {
-                        full_text
-                    };
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "result": result_text,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
+        CliOutputFormat::Json => match outcome {
+            QueryOutcome::EndTurn { message, usage } => {
+                let result_text = if full_text.is_empty() {
+                    message.get_all_text()
+                } else {
+                    full_text
+                };
+                let out = serde_json::json!({
+                    "type": "result",
+                    "result": result_text,
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                    "cost_usd": cost_tracker.total_cost_usd(),
+                });
+                println!("{}", out);
             }
-        }
+            QueryOutcome::Error(e) => {
+                let out = serde_json::json!({ "type": "error", "error": e.to_string() });
+                eprintln!("{}", out);
+                std::process::exit(1);
+            }
+            QueryOutcome::Cancelled => {
+                let out = serde_json::json!({ "type": "cancelled", "cancelled": true });
+                eprintln!("{}", out);
+                std::process::exit(130);
+            }
+            _ => {}
+        },
         CliOutputFormat::StreamJson => {
             // Already streamed above; emit final result event
             match outcome {
@@ -1676,12 +2383,24 @@ async fn run_headless(
                         },
                         "cost_usd": cost_tracker.total_cost_usd(),
                     });
-                    println!("{}", out);
+                    if emit_bounded_stream_json(&out).is_err() {
+                        event_delivery.forwarding_failed();
+                        anyhow::bail!("Query event forwarding failed");
+                    }
                 }
                 QueryOutcome::Error(e) => {
                     let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
+                    if write_bounded_stream_json(std::io::stderr().lock(), &out).is_err() {
+                        event_delivery.forwarding_failed();
+                    }
                     std::process::exit(1);
+                }
+                QueryOutcome::Cancelled => {
+                    let out = serde_json::json!({ "type": "cancelled", "cancelled": true });
+                    if write_bounded_stream_json(std::io::stderr().lock(), &out).is_err() {
+                        event_delivery.forwarding_failed();
+                    }
+                    std::process::exit(130);
                 }
                 _ => {}
             }
@@ -1702,12 +2421,19 @@ async fn run_headless(
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
-                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                QueryOutcome::BudgetExceeded {
+                    cost_usd,
+                    limit_usd,
+                } => {
                     eprintln!(
                         "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
                         limit_usd, cost_usd
                     );
                     std::process::exit(2);
+                }
+                QueryOutcome::Cancelled => {
+                    eprintln!("Cancelled.");
+                    std::process::exit(130);
                 }
                 _ => {}
             }
@@ -1742,21 +2468,23 @@ fn permission_request_from_core(
                 command,
                 suggested_prefix,
             )
-        },
+        }
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
             tool_use_id,
             tool_name,
             reason,
             command,
         ),
-        ("Read", Some(path)) => claurst_tui::dialogs::PermissionRequest::file_read(
-            tool_use_id,
-            tool_name,
-            reason,
-            path,
-        ),
+        ("Read", Some(path)) => {
+            claurst_tui::dialogs::PermissionRequest::file_read(tool_use_id, tool_name, reason, path)
+        }
         (_, Some(path)) if matches!(tool_name.as_str(), "Write" | "Edit" | "NotebookEdit") => {
-            claurst_tui::dialogs::PermissionRequest::file_write(tool_use_id, tool_name, reason, path)
+            claurst_tui::dialogs::PermissionRequest::file_write(
+                tool_use_id,
+                tool_name,
+                reason,
+                path,
+            )
         }
         _ => claurst_tui::dialogs::PermissionRequest::from_reason(
             tool_use_id,
@@ -1767,31 +2495,134 @@ fn permission_request_from_core(
     }
 }
 
+fn resolve_remote_permission(
+    pending_permissions: &Arc<ParkingMutex<claurst_tools::PendingPermissionStore>>,
+    permission_manager: Option<
+        &Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>,
+    >,
+    tool_use_id: &str,
+    response: claurst_bridge::PermissionResponseKind,
+) -> bool {
+    let session_allow = matches!(
+        response,
+        claurst_bridge::PermissionResponseKind::AllowSession
+    );
+    let decision = match response {
+        claurst_bridge::PermissionResponseKind::Allow
+        | claurst_bridge::PermissionResponseKind::AllowSession => {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+        claurst_bridge::PermissionResponseKind::Deny => {
+            claurst_core::permissions::PermissionDecision::Deny
+        }
+    };
+
+    let Some(mut pending) = pending_permissions.lock().waiting.remove(tool_use_id) else {
+        return false;
+    };
+
+    if session_allow {
+        if let Some(manager) = permission_manager {
+            if let Ok(mut manager) = manager.lock() {
+                if let Some(path) = pending.request.path.as_deref() {
+                    manager.add_session_allow_path(&pending.request.tool_name, path);
+                } else {
+                    manager.add_session_allow(&pending.request.tool_name);
+                }
+            }
+        }
+    }
+
+    if let Some(tx) = pending.decision_tx.take() {
+        let _ = tx.send(decision);
+    }
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeDeliveryStatus {
+    Queued,
+    Full,
+    Closed,
+}
+
+fn try_queue_bridge<T>(sender: &tokio::sync::mpsc::Sender<T>, value: T) -> BridgeDeliveryStatus {
+    match sender.try_send(value) {
+        Ok(()) => BridgeDeliveryStatus::Queued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => BridgeDeliveryStatus::Full,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => BridgeDeliveryStatus::Closed,
+    }
+}
+
+struct BridgeRuntime {
+    tui_rx: tokio::sync::mpsc::Receiver<claurst_bridge::TuiBridgeEvent>,
+    outbound_tx: tokio::sync::mpsc::Sender<claurst_bridge::BridgeOutbound>,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    sidecar_cancel: tokio_util::sync::CancellationToken,
+    relay_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BridgeRuntime {
+    async fn shutdown(&mut self, reason: &str) {
+        self.cancel.cancel();
+        self.sidecar_cancel.cancel();
+
+        if let Some(mut relay_task) = self.relay_task.take() {
+            if tokio::time::timeout(Duration::from_secs(6), &mut relay_task)
+                .await
+                .is_err()
+            {
+                warn!(reason, "Bridge event relay shutdown timed out");
+                relay_task.abort();
+                let _ = relay_task.await;
+            }
+        }
+
+        if tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+            .await
+            .is_err()
+        {
+            warn!(reason, "Bridge shutdown timed out");
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+}
 
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
     settings_load_error: Option<String>,
     client: Arc<claurst_api::AnthropicClient>,
-    tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
+    _tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     tool_ctx: ToolContext,
     query_config: claurst_query::QueryConfig,
+    cron_control: claurst_query::CronSchedulerControl,
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
     bridge_config: Option<claurst_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
-    user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
+    user_question_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>,
+    >,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
+    mut accepted_plugin_mcp: Vec<AcceptedPluginMcp>,
     mcp_project_root: Option<PathBuf>,
+    history_root: PathBuf,
+    _history_workspace: String,
+    disable_slash_commands: bool,
 ) -> anyhow::Result<()> {
-    use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
+    use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_query::{QueryEvent, QueryOutcome};
+    // The interactive host assembles its scoped inventory below. Keeping the
+    // startup wrapper vector would retain disconnected MCP managers.
+    drop(_tools);
     use claurst_tui::{
-        bridge_state::BridgeConnectionState, notifications::NotificationKind,
-        render::render_app, restore_terminal, setup_terminal, App,
-        device_auth_dialog::DeviceAuthEvent,
+        bridge_state::BridgeConnectionState, device_auth_dialog::DeviceAuthEvent,
+        notifications::NotificationKind, render::render_app, restore_terminal, setup_terminal, App,
     };
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use std::time::Duration;
@@ -1832,27 +2663,46 @@ async fn run_interactive(
                 session
             }
             Err(e) => {
-                resume_warning = Some(format!("Could not load session {}: {}. Starting new session.", id, e));
-                let mut session =
-                    claurst_core::history::ConversationSession::new(
-                        claurst_api::effective_model_for_config(&config, &model_registry),
-                    );
+                resume_warning = Some(format!(
+                    "Could not load session {}: {}. Starting new session.",
+                    id, e
+                ));
+                let mut session = claurst_core::history::ConversationSession::new(
+                    claurst_api::effective_model_for_config(&config, &model_registry),
+                );
                 session.id = tool_ctx.session_id.clone();
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 session
             }
         }
     } else {
-        let mut session =
-            claurst_core::history::ConversationSession::new(
-                claurst_api::effective_model_for_config(&config, &model_registry),
-            );
+        let mut session = claurst_core::history::ConversationSession::new(
+            claurst_api::effective_model_for_config(&config, &model_registry),
+        );
         session.id = tool_ctx.session_id.clone();
         session.working_dir = Some(tool_ctx.working_dir.display().to_string());
         session
     };
     let initial_messages = session.messages.clone();
     let mut base_query_config = query_config;
+    let mut native_tools = claurst_tools::all_tools();
+    native_tools.push(Box::new(claurst_query::AgentTool));
+    let host_inventory = HostInventorySource::new(Arc::new(native_tools), &tool_ctx.config, None)?;
+    base_query_config.inventory_source = Some(
+        host_inventory.with_access(
+            base_query_config
+                .agent_definition
+                .as_ref()
+                .map(|definition| definition.access.as_str()),
+        )?,
+    );
+    let history_workspace = workspace_scope_id(&tool_ctx.working_dir);
+    base_query_config.history_index = Some(open_history_index(
+        &history_root,
+        &history_workspace,
+        &session.id,
+    )?);
+    let mut history_index = base_query_config.history_index.clone();
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
     // after each turn, instead of the REPL re-dispatching a fresh turn. Select
@@ -1865,11 +2715,11 @@ async fn run_interactive(
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
     }
-    let pending_permissions = tool_ctx
-        .pending_permissions
-        .clone()
-        .unwrap_or_else(|| Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default())));
-
+    let pending_permissions = tool_ctx.pending_permissions.clone().unwrap_or_else(|| {
+        Arc::new(ParkingMutex::new(
+            claurst_tools::PendingPermissionStore::default(),
+        ))
+    });
 
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
@@ -1900,14 +2750,6 @@ async fn run_interactive(
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
     app.auto_compact_enabled = live_config.auto_compact;
-
-    // Background: keep the model registry fresh from models.dev for the whole
-    // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
-    // 5-min TTL). The fetched JSON is saved as a cache file; the App reloads it
-    // from disk whenever the /model picker opens. Non-blocking.
-    {
-        spawn_models_cache_refresh_loop();
-    }
 
     // Wire the ask-user question channel into the app so the TUI can show
     // the dialog and return an answer to the query loop.
@@ -1970,7 +2812,8 @@ async fn run_interactive(
             if !settings.has_completed_onboarding {
                 app.onboarding_dialog.show();
             } else {
-                app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
+                app.status_message =
+                    Some("No provider configured. Run /connect to set one up.".to_string());
             }
         } else if !settings.has_completed_onboarding {
             // User has credentials but hasn't formally completed onboarding — mark it done
@@ -2026,25 +2869,14 @@ async fn run_interactive(
         });
     }
 
-    // Bridge runtime channels — Some when bridge is configured and started.
-    //
-    // tui_rx:       TUI-facing events from the bridge worker (connect/disconnect/prompts)
-    // outbound_tx:  Forward query events to the bridge worker for upload to server
-    // bridge_cancel: CancellationToken to stop the bridge worker task
-    struct BridgeRuntime {
-        tui_rx: mpsc::Receiver<TuiBridgeEvent>,
-        outbound_tx: mpsc::Sender<BridgeOutbound>,
-        cancel: CancellationToken,
-    }
-
     // Preserve the bridge token before consuming bridge_config so we can reconstruct
     // a BridgeSessionInfo once the bridge worker reports it has connected.
-    let bridge_token: Option<String> = bridge_config
-        .as_ref()
-        .and_then(|c| c.session_token.clone());
+    let mut bridge_token: Option<String> =
+        bridge_config.as_ref().and_then(|c| c.session_token.clone());
 
     let mut bridge_runtime: Option<BridgeRuntime> = if let Some(cfg) = bridge_config {
         let bridge_cancel = CancellationToken::new();
+        let sidecar_cancel = CancellationToken::new();
         let (tui_tx, tui_rx) = mpsc::channel::<TuiBridgeEvent>(64);
         let (outbound_tx, outbound_rx) = mpsc::channel::<BridgeOutbound>(256);
 
@@ -2052,9 +2884,12 @@ async fn run_interactive(
         app.bridge_state = BridgeConnectionState::Connecting;
 
         let cancel_clone = bridge_cancel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = claurst_bridge::run_bridge_loop(cfg, tui_tx, outbound_rx, cancel_clone).await {
-                warn!("Bridge loop exited with error: {}", e);
+        let task = tokio::spawn(async move {
+            if claurst_bridge::run_bridge_loop(cfg, tui_tx, outbound_rx, cancel_clone)
+                .await
+                .is_err()
+            {
+                warn!("Bridge loop exited with error");
             }
         });
 
@@ -2062,6 +2897,9 @@ async fn run_interactive(
             tui_rx,
             outbound_tx,
             cancel: bridge_cancel,
+            task,
+            sidecar_cancel,
+            relay_task: None,
         })
     } else {
         None
@@ -2074,14 +2912,11 @@ async fn run_interactive(
     //                 post_bridge_event so the web UI sees live streaming events.
     // relay_ev_rx_opt: Option wrapper so we can move the Receiver into the relay
     //                 task exactly once when the bridge session comes online.
-    // remote_prompt_tx/rx: inbound user messages polled from poll_bridge_messages
-    //                 are delivered here; the main loop injects them as query turns.
     let (relay_ev_tx, relay_ev_rx) = mpsc::channel::<String>(256);
     let mut relay_ev_rx_opt: Option<mpsc::Receiver<String>> = Some(relay_ev_rx);
-    let (remote_prompt_tx, mut remote_prompt_rx) = mpsc::channel::<String>(32);
 
     // Once the bridge worker reports Connected we build this from the session
-    // credentials so both relay tasks can POST/poll the /api/bridge/sessions API.
+    // credentials so the owned relay task can POST to the /api/bridge/sessions API.
     let mut bridge_session_info: Option<std::sync::Arc<claurst_bridge::BridgeSessionInfo>> = None;
 
     let mut messages = initial_messages;
@@ -2098,10 +2933,19 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
-    let mut tools_arc = tools;
+    // Keep the policy-filtered full set so agent-mode switching cannot restore
+    // a tool denied by CLI or settings configuration.
+    let agent_access = base_query_config
+        .agent_definition
+        .as_ref()
+        .map(|definition| definition.access.as_str());
+    let (mut all_tools_arc, mut tools_arc) = build_policy_tools(
+        tool_ctx.mcp_manager.clone(),
+        history_index.clone(),
+        &tool_ctx.working_dir,
+        &tool_ctx.config,
+        agent_access,
+    );
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -2111,14 +2955,10 @@ async fn run_interactive(
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
     let mut current_effort: Option<claurst_core::effort::EffortLevel> = None;
-
-    // Background update check: spawned once at startup; result delivered via channel.
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    tokio::spawn(async move {
-        let info = claurst_core::check_for_updates().await;
-        let version = info.map(|i| i.latest_version);
-        let _ = update_tx.send(version).await;
-    });
+    // TUI selections carry an explicit revision even when the selected level
+    // equals the current value. This prevents provenance from being inferred
+    // from a value comparison.
+    let mut applied_effort_revision = app.effort_revision;
 
     // Device code / OAuth auth channel — background tasks send events here
     // so the main loop can update the device_auth_dialog state.
@@ -2167,13 +3007,16 @@ async fn run_interactive(
         .map(|s| s.terminal_progress_bar)
         .unwrap_or(true);
     let mut progress_shown = false;
+    let mut bridge_delivery_drops = 0u64;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)
-        if let Some((outcome, pending_input, pending_imgs)) = app.file_injection_dialog.take_outcome() {
+        if let Some((outcome, pending_input, pending_imgs)) =
+            app.file_injection_dialog.take_outcome()
+        {
             use claurst_tui::FileInjectionOutcome;
 
             if matches!(outcome, FileInjectionOutcome::Abort) {
@@ -2274,9 +3117,7 @@ async fn run_interactive(
                     // flood as one paste (human typing never queues 2+ chars
                     // in the same instant). Must run BEFORE the Enter/submit
                     // handling below so pasted newlines can't submit.
-                    if key.modifiers == KeyModifiers::NONE
-                        || key.modifiers == KeyModifiers::SHIFT
-                    {
+                    if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT {
                         if let KeyCode::Char(c) = key.code {
                             if app.paste_burst_allowed() {
                                 if let Some(burst) = app.try_detect_paste_burst(c) {
@@ -2301,7 +3142,25 @@ async fn run_interactive(
                         && !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL);
+                    if plain_enter && current_query.is_some() && !any_dialog_open {
+                        app.status_message = Some(
+                            "Current response is still finishing; wait before changing sessions."
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     if plain_enter && app.is_streaming && !any_dialog_open {
+                        // Session/workspace mutations must wait for the
+                        // authoritative query handle to join.  Keep the
+                        // slash command in the editor for execution after
+                        // cancellation; ordinary prompts may still queue.
+                        if app.prompt_input.text.trim_start().starts_with('/') {
+                            app.status_message = Some(
+                                "Current response is still finishing; wait before changing sessions."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         // Queue the message: it will auto-submit once the
                         // current turn finishes (issue #149).
                         let input = app.take_input();
@@ -2317,14 +3176,17 @@ async fn run_interactive(
                         }
                         continue;
                     }
-                    if plain_enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter
+                        && !app.is_streaming
+                        && current_query.is_none()
+                        && !any_dialog_open
+                    {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some_and(|index| {
-                                app.prompt_input
-                                    .suggestions
-                                    .get(index)
-                                    .is_some_and(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                                app.prompt_input.suggestions.get(index).is_some_and(|s| {
+                                    s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef
+                                })
                             })
                         {
                             app.prompt_input.accept_suggestion();
@@ -2341,13 +3203,13 @@ async fn run_interactive(
                             // Fall through to submit — no second Enter needed
                         }
 
-                        let input = app.take_input();
+                        let mut input = app.take_input();
                         if input.is_empty() {
                             continue;
                         }
 
                         // Check for slash command
-                        if input.starts_with('/') {
+                        if input.starts_with('/') && !disable_slash_commands {
                             let (cmd_name, cmd_args) =
                                 claurst_tui::input::parse_slash_command(&input);
                             let cmd_name = cmd_name.to_string();
@@ -2367,8 +3229,15 @@ async fn run_interactive(
                             let skip_tui_for_args = !cmd_args.is_empty()
                                 && matches!(
                                     cmd_name.as_str(),
-                                    "model" | "theme" | "resume" | "session"
-                                        | "vim" | "vi" | "voice" | "fast" | "speed"
+                                    "model"
+                                        | "theme"
+                                        | "resume"
+                                        | "session"
+                                        | "vim"
+                                        | "vi"
+                                        | "voice"
+                                        | "fast"
+                                        | "speed"
                                 );
                             let handled_by_tui = if skip_tui_for_args {
                                 false
@@ -2392,7 +3261,31 @@ async fn run_interactive(
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
-                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // `/move` mutates the source worktree immediately. Stop
+                            // interpreters rooted there before the command relocates
+                            // files, while keeping same-id interpreters in another
+                            // workspace untouched.
+                            let move_cleanup = if cmd_name == "move" {
+                                Some(
+                                    claurst_tools::repl_tool::shutdown_for_workspace(&tool_ctx)
+                                        .await,
+                                )
+                            } else {
+                                None
+                            };
+                            let cli_result = if move_cleanup.as_ref().is_some_and(|shutdown| {
+                                matches!(
+                                    shutdown.cleanup,
+                                    claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                )
+                            }) {
+                                Some(CommandResult::Error(
+                                    "REPL cleanup is unconfirmed; refusing to move the session."
+                                        .to_string(),
+                                ))
+                            } else {
+                                execute_command(&input, &mut cmd_ctx).await
+                            };
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
 
@@ -2402,48 +3295,136 @@ async fn run_interactive(
                             match cli_result {
                                 Some(CommandResult::Exit) => break 'main,
                                 Some(CommandResult::ClearConversation) => {
+                                    let repl_shutdown =
+                                        claurst_tools::repl_tool::shutdown_for_workspace(&tool_ctx)
+                                            .await;
                                     messages.clear();
                                     app.replace_messages(Vec::new());
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
-                                    app.status_message =
-                                        Some("Conversation cleared.".to_string());
+                                    app.status_message = Some(
+                                        if matches!(
+                                            repl_shutdown.cleanup,
+                                            claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                        ) {
+                                            format!(
+                                            "Conversation cleared; REPL cleanup is unconfirmed ({} session{}).",
+                                            repl_shutdown.sessions,
+                                            if repl_shutdown.sessions == 1 { "" } else { "s" }
+                                        )
+                                        } else {
+                                            "Conversation cleared.".to_string()
+                                        },
+                                    );
                                 }
                                 Some(CommandResult::NewSession) => {
-                                    // Fresh lazy-home session (opencode /new):
-                                    // preserve the current model / provider / effort
-                                    // selection and working directory. The new
-                                    // session is only persisted once the first
-                                    // message completes a turn, matching opencode's
-                                    // lazy-session semantics.
-                                    let model = claurst_api::effective_model_for_config(
-                                        &cmd_ctx.config,
-                                        &model_registry,
-                                    );
-                                    session = claurst_commands::build_home_session(
-                                        model,
-                                        Some(tool_ctx.working_dir.display().to_string()),
-                                    );
-                                    messages.clear();
-                                    app.replace_messages(Vec::new());
-                                    tool_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_title = None;
-                                    // Reset per-turn diff/turn bookkeeping, as
-                                    // ResumeSession does when swapping sessions.
-                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                                        claurst_core::file_history::FileHistory::new(),
-                                    ));
-                                    tool_ctx.current_turn = Arc::new(
-                                        std::sync::atomic::AtomicUsize::new(0),
-                                    );
-                                    app.attach_turn_diff_state(
-                                        tool_ctx.file_history.clone(),
-                                        tool_ctx.current_turn.clone(),
-                                    );
-                                    claurst_tui::update_terminal_title(None);
-                                    app.status_message =
-                                        Some("Started a new session.".to_string());
+                                    let repl_shutdown =
+                                        claurst_tools::repl_tool::shutdown_for_workspace(&tool_ctx)
+                                            .await;
+                                    let pending_mutation =
+                                        claurst_tools::mutation::pending_for_scope(&tool_ctx);
+                                    if matches!(
+                                        repl_shutdown.cleanup,
+                                        claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                    ) || pending_mutation
+                                    {
+                                        app.status_message = Some(
+                                            if pending_mutation {
+                                                "Pending mutation cleanup is unconfirmed; refusing to start a new session."
+                                            } else {
+                                                "REPL cleanup is unconfirmed; refusing to start a new session."
+                                            }
+                                            .to_string(),
+                                        );
+                                    } else {
+                                        // Fresh lazy-home session (opencode /new):
+                                        // preserve the current model / provider / effort
+                                        // selection and working directory. The new
+                                        // session is only persisted once the first
+                                        // message completes a turn, matching opencode's
+                                        // lazy-session semantics.
+                                        let model = claurst_api::effective_model_for_config(
+                                            &cmd_ctx.config,
+                                            &model_registry,
+                                        );
+                                        session = claurst_commands::build_home_session(
+                                            model,
+                                            Some(tool_ctx.working_dir.display().to_string()),
+                                        );
+                                        messages.clear();
+                                        app.replace_messages(Vec::new());
+                                        tool_ctx.session_id = session.id.clone();
+                                        cmd_ctx.session_id = session.id.clone();
+                                        cmd_ctx.session_title = None;
+                                        // Reset per-turn diff/turn bookkeeping, as
+                                        // ResumeSession does when swapping sessions.
+                                        tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                            claurst_core::file_history::FileHistory::new(),
+                                        ));
+                                        tool_ctx.current_turn =
+                                            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                                        app.attach_turn_diff_state(
+                                            tool_ctx.file_history.clone(),
+                                            tool_ctx.current_turn.clone(),
+                                        );
+                                        let history_status = match open_history_index(
+                                            &history_root,
+                                            &workspace_scope_id(&tool_ctx.working_dir),
+                                            &session.id,
+                                        ) {
+                                            Ok(index) => {
+                                                history_index = Some(index);
+                                                base_query_config.history_index =
+                                                    history_index.clone();
+                                                None
+                                            }
+                                            Err(error) => {
+                                                history_index = None;
+                                                base_query_config.history_index = None;
+                                                Some(format!(
+                                                "HistoryRead unavailable for this session: {error}"
+                                            ))
+                                            }
+                                        };
+                                        let agent_access = base_query_config
+                                            .agent_definition
+                                            .as_ref()
+                                            .map(|definition| definition.access.as_str());
+                                        (all_tools_arc, tools_arc) = build_policy_tools(
+                                            tool_ctx.mcp_manager.clone(),
+                                            history_index.clone(),
+                                            &tool_ctx.working_dir,
+                                            &tool_ctx.config,
+                                            agent_access,
+                                        );
+                                        claurst_tui::update_terminal_title(None);
+                                        let cleanup_notice = matches!(
+                                            repl_shutdown.cleanup,
+                                            claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                        )
+                                        .then(|| {
+                                            format!(
+                                                "REPL cleanup is unconfirmed ({} session{}).",
+                                                repl_shutdown.sessions,
+                                                if repl_shutdown.sessions == 1 { "" } else { "s" }
+                                            )
+                                        });
+                                        app.status_message =
+                                            Some(match (history_status, cleanup_notice) {
+                                                (Some(notice), Some(cleanup)) => format!(
+                                                    "Started a new session. {notice} {cleanup}"
+                                                ),
+                                                (Some(notice), None) => {
+                                                    format!("Started a new session. {notice}")
+                                                }
+                                                (None, Some(cleanup)) => {
+                                                    format!("Started a new session. {cleanup}")
+                                                }
+                                                (None, None) => {
+                                                    "Started a new session.".to_string()
+                                                }
+                                            });
+                                    }
                                 }
                                 Some(CommandResult::MoveSession {
                                     destination,
@@ -2462,11 +3443,38 @@ async fn run_interactive(
                                     app.config.project_dir = Some(destination.clone());
                                     base_query_config.working_directory =
                                         Some(destination.display().to_string());
-                                    session.working_dir =
-                                        Some(destination.display().to_string());
+                                    session.working_dir = Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
-                                    let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                    let _ = claurst_core::history::save_session(&session).await;
+                                    let history_status = match open_history_index(
+                                        &history_root,
+                                        &workspace_scope_id(&tool_ctx.working_dir),
+                                        &session.id,
+                                    ) {
+                                        Ok(index) => {
+                                            history_index = Some(index);
+                                            base_query_config.history_index = history_index.clone();
+                                            None
+                                        }
+                                        Err(error) => {
+                                            history_index = None;
+                                            base_query_config.history_index = None;
+                                            Some(format!(
+                                                "HistoryRead unavailable for this workspace: {error}"
+                                            ))
+                                        }
+                                    };
+                                    let agent_access = base_query_config
+                                        .agent_definition
+                                        .as_ref()
+                                        .map(|definition| definition.access.as_str());
+                                    (all_tools_arc, tools_arc) = build_policy_tools(
+                                        tool_ctx.mcp_manager.clone(),
+                                        history_index.clone(),
+                                        &tool_ctx.working_dir,
+                                        &tool_ctx.config,
+                                        agent_access,
+                                    );
                                     // NOTE: opencode appends a synthetic
                                     // <system-reminder> prompt after a move. claurst
                                     // re-derives working_directory into every turn's
@@ -2480,15 +3488,21 @@ async fn run_interactive(
                                     } else {
                                         ""
                                     };
-                                    app.status_message = Some(format!(
-                                        "Moved session to {}{}",
-                                        destination.display(),
-                                        carried
-                                    ));
+                                    app.status_message = Some(match history_status {
+                                        Some(notice) => format!(
+                                            "Moved session to {}{}; {notice}",
+                                            destination.display(),
+                                            carried
+                                        ),
+                                        None => format!(
+                                            "Moved session to {}{}",
+                                            destination.display(),
+                                            carried
+                                        ),
+                                    });
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
-                                    let removed =
-                                        messages.len().saturating_sub(new_msgs.len());
+                                    let removed = messages.len().saturating_sub(new_msgs.len());
                                     messages = new_msgs.clone();
                                     app.replace_messages(new_msgs);
                                     session.messages = messages.clone();
@@ -2521,54 +3535,136 @@ async fn run_interactive(
                                         Some("Select what to import from ~/.claude.".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
-                                    session = resumed_session;
-                                    messages = session.messages.clone();
-                                    app.replace_messages(messages.clone());
-                                    cmd_ctx.config.model = Some(session.model.clone());
-                                    app.config.model = Some(session.model.clone());
-                                    tool_ctx.config.model = Some(session.model.clone());
-                                    app.model_name = session.model.clone();
-                                    tool_ctx.session_id = session.id.clone();
-                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                                        claurst_core::file_history::FileHistory::new(),
-                                    ));
-                                    tool_ctx.current_turn = Arc::new(
-                                        std::sync::atomic::AtomicUsize::new(0),
-                                    );
-                                    cmd_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_title = session.title.clone();
-                                    if let Some(saved_dir) = session.working_dir.as_ref() {
-                                        let saved_path =
-                                            std::path::PathBuf::from(saved_dir);
-                                        if saved_path.exists() {
-                                            tool_ctx.working_dir = saved_path.clone();
-                                            cmd_ctx.working_dir = saved_path;
+                                    let repl_shutdown =
+                                        claurst_tools::repl_tool::shutdown_for_workspace(&tool_ctx)
+                                            .await;
+                                    let pending_mutation =
+                                        claurst_tools::mutation::pending_for_scope(&tool_ctx);
+                                    if matches!(
+                                        repl_shutdown.cleanup,
+                                        claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                    ) || pending_mutation
+                                    {
+                                        app.status_message = Some(
+                                            if pending_mutation {
+                                                "Pending mutation cleanup is unconfirmed; refusing to resume the session."
+                                            } else {
+                                                "REPL cleanup is unconfirmed; refusing to resume the session."
+                                            }
+                                            .to_string(),
+                                        );
+                                    } else {
+                                        session = resumed_session;
+                                        messages = session.messages.clone();
+                                        app.replace_messages(messages.clone());
+                                        cmd_ctx.config.model = Some(session.model.clone());
+                                        app.config.model = Some(session.model.clone());
+                                        tool_ctx.config.model = Some(session.model.clone());
+                                        app.model_name = session.model.clone();
+                                        tool_ctx.session_id = session.id.clone();
+                                        tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                            claurst_core::file_history::FileHistory::new(),
+                                        ));
+                                        tool_ctx.current_turn =
+                                            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                                        cmd_ctx.session_id = session.id.clone();
+                                        cmd_ctx.session_title = session.title.clone();
+                                        if let Some(saved_dir) = session.working_dir.as_ref() {
+                                            let saved_path = std::path::PathBuf::from(saved_dir);
+                                            if saved_path.exists() {
+                                                tool_ctx.working_dir = saved_path.clone();
+                                                cmd_ctx.working_dir = saved_path;
+                                            }
                                         }
+                                        app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                        app.attach_turn_diff_state(
+                                            tool_ctx.file_history.clone(),
+                                            tool_ctx.current_turn.clone(),
+                                        );
+                                        let resumed_workspace =
+                                            workspace_scope_id(&tool_ctx.working_dir);
+                                        let history_status = match open_history_index(
+                                            &history_root,
+                                            &resumed_workspace,
+                                            &session.id,
+                                        ) {
+                                            Ok(index) => {
+                                                history_index = Some(index);
+                                                base_query_config.history_index =
+                                                    history_index.clone();
+                                                None
+                                            }
+                                            Err(error) => {
+                                                history_index = None;
+                                                base_query_config.history_index = None;
+                                                Some(format!(
+                                                "HistoryRead unavailable for this session: {error}"
+                                            ))
+                                            }
+                                        };
+                                        let agent_access = base_query_config
+                                            .agent_definition
+                                            .as_ref()
+                                            .map(|definition| definition.access.as_str());
+                                        (all_tools_arc, tools_arc) = build_policy_tools(
+                                            tool_ctx.mcp_manager.clone(),
+                                            history_index.clone(),
+                                            &tool_ctx.working_dir,
+                                            &tool_ctx.config,
+                                            agent_access,
+                                        );
+                                        claurst_tui::update_terminal_title(
+                                            session.title.as_deref(),
+                                        );
+                                        let cleanup_notice = matches!(
+                                            repl_shutdown.cleanup,
+                                            claurst_tools::repl_tool::ReplCleanup::CleanupUnknown
+                                        )
+                                        .then(|| {
+                                            format!(
+                                                "REPL cleanup is unconfirmed ({} session{}).",
+                                                repl_shutdown.sessions,
+                                                if repl_shutdown.sessions == 1 { "" } else { "s" }
+                                            )
+                                        });
+                                        app.status_message =
+                                            Some(match (history_status, cleanup_notice) {
+                                                (Some(notice), Some(cleanup)) => format!(
+                                                    "Resumed session {}. {notice} {cleanup}",
+                                                    &session.id[..8]
+                                                ),
+                                                (Some(notice), None) => format!(
+                                                    "Resumed session {}. {notice}",
+                                                    &session.id[..8]
+                                                ),
+                                                (None, Some(cleanup)) => format!(
+                                                    "Resumed session {}. {cleanup}",
+                                                    &session.id[..8]
+                                                ),
+                                                (None, None) => {
+                                                    format!("Resumed session {}.", &session.id[..8])
+                                                }
+                                            });
                                     }
-                                    app.config.project_dir =
-                                        Some(tool_ctx.working_dir.clone());
-                                    app.attach_turn_diff_state(
-                                        tool_ctx.file_history.clone(),
-                                        tool_ctx.current_turn.clone(),
-                                    );
-                                    claurst_tui::update_terminal_title(
-                                        session.title.as_deref(),
-                                    );
-                                    app.status_message = Some(format!(
-                                        "Resumed session {}.",
-                                        &session.id[..8]
-                                    ));
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
                                     session.title = Some(title.clone());
                                     session.updated_at = chrono::Utc::now();
                                     cmd_ctx.session_title = session.title.clone();
-                                    let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                    let _ = claurst_core::history::save_session(&session).await;
+                                    claurst_tui::update_terminal_title(Some(&title));
+                                    app.status_message =
+                                        Some(format!("Session renamed to \"{}\".", title));
+                                }
+                                Some(CommandResult::RenameSessionWithNotice { title, notice }) => {
+                                    session.title = Some(title.clone());
+                                    session.updated_at = chrono::Utc::now();
+                                    cmd_ctx.session_title = session.title.clone();
+                                    let _ = claurst_core::history::save_session(&session).await;
                                     claurst_tui::update_terminal_title(Some(&title));
                                     app.status_message = Some(format!(
-                                        "Session renamed to \"{}\".",
-                                        title
+                                        "Session renamed to \"{}\". {}",
+                                        title, notice
                                     ));
                                 }
                                 Some(CommandResult::RefreshProviderState) => {
@@ -2578,7 +3674,16 @@ async fn run_interactive(
                                                 .to_string(),
                                         );
                                     } else {
-                                        match refresh_provider_runtime_state(&cmd_ctx.config).await {
+                                        let runtime_factory = base_query_config
+                                            .anthropic_client_factory
+                                            .clone()
+                                            .unwrap_or_default();
+                                        match refresh_provider_runtime_state(
+                                            &cmd_ctx.config,
+                                            &runtime_factory,
+                                        )
+                                        .await
+                                        {
                                             Ok(refreshed) => {
                                                 cmd_ctx.config = refreshed.config.clone();
                                                 tool_ctx.config = refreshed.config.clone();
@@ -2609,10 +3714,8 @@ async fn run_interactive(
                                                 );
                                             }
                                             Err(err) => {
-                                                app.status_message = Some(format!(
-                                                    "Error: {}",
-                                                    err
-                                                ));
+                                                app.status_message =
+                                                    Some(format!("Error: {}", err));
                                             }
                                         }
                                     }
@@ -2627,19 +3730,130 @@ async fn run_interactive(
                                         server_name, auth_url, redirect_uri
                                     ));
                                 }
+                                Some(CommandResult::PluginReload { summary, registry }) => {
+                                    let mut refreshed_config = cmd_ctx.config.clone();
+                                    let previous_plugin_mcp = accepted_plugin_mcp.clone();
+                                    let next_plugin_mcp = reconcile_plugin_mcp_config(
+                                        &mut refreshed_config,
+                                        &previous_plugin_mcp,
+                                        &registry,
+                                    );
+                                    let invalidated_plugin_mcp = plugin_mcp_identity_changes(
+                                        &previous_plugin_mcp,
+                                        &next_plugin_mcp,
+                                    );
+                                    accepted_plugin_mcp = next_plugin_mcp;
+                                    let store = claurst_core::mcp_trust::McpTrustStore::load();
+                                    let decision = claurst_core::mcp_trust::partition_mcp_servers(
+                                        &refreshed_config.mcp_servers,
+                                        app.mcp_project_root.as_deref(),
+                                        settings.trust_project_mcp_servers,
+                                        &app.mcp_session_trusted,
+                                        &store,
+                                    );
+                                    app.mcp_pending_project =
+                                        decision.pending.iter().cloned().collect();
+                                    let previous_manager = tool_ctx.mcp_manager.clone();
+                                    let outcome = if let Some(previous) = previous_manager.as_ref()
+                                    {
+                                        claurst_mcp::McpManager::reconcile_with_previous_invalidated(
+                                            previous,
+                                            &decision.allowed,
+                                            &invalidated_plugin_mcp,
+                                        )
+                                        .await
+                                    } else {
+                                        let manager = Arc::new(
+                                            claurst_mcp::McpManager::connect_all(&decision.allowed)
+                                                .await,
+                                        );
+                                        manager.clone().spawn_notification_poll_loop();
+                                        claurst_mcp::McpReconcileOutcome {
+                                            manager,
+                                            failures: Vec::new(),
+                                            reused: Vec::new(),
+                                            replaced: decision
+                                                .allowed
+                                                .iter()
+                                                .map(|server| server.name.clone())
+                                                .collect(),
+                                            removed: Vec::new(),
+                                        }
+                                    };
+                                    let new_mcp_manager = if decision.allowed.is_empty()
+                                        && outcome.failures.is_empty()
+                                    {
+                                        None
+                                    } else {
+                                        Some(outcome.manager.clone())
+                                    };
+                                    cmd_ctx.config = refreshed_config.clone();
+                                    tool_ctx.config = refreshed_config.clone();
+                                    app.config = refreshed_config;
+                                    tool_ctx.mcp_manager = new_mcp_manager.clone();
+                                    cmd_ctx.mcp_manager = new_mcp_manager.clone();
+                                    app.mcp_manager = new_mcp_manager.clone();
+                                    let agent_access = base_query_config
+                                        .agent_definition
+                                        .as_ref()
+                                        .map(|definition| definition.access.as_str());
+                                    (all_tools_arc, tools_arc) = build_policy_tools(
+                                        new_mcp_manager.clone(),
+                                        history_index.clone(),
+                                        &tool_ctx.working_dir,
+                                        &tool_ctx.config,
+                                        agent_access,
+                                    );
+                                    base_query_config.inventory_source =
+                                        Some(host_inventory.with_access(agent_access)?);
+                                    let cron_runtime_updated = cron_control
+                                        .update(claurst_query::CronSchedulerRuntime::new(
+                                            client.clone(),
+                                            build_cron_tool_factory(&tool_ctx, &base_query_config),
+                                            tool_ctx.clone(),
+                                            base_query_config.clone(),
+                                            history_root.clone(),
+                                            tool_ctx.working_dir.clone(),
+                                        ))
+                                        .is_ok();
+                                    if app.mcp_view.visible {
+                                        app.refresh_mcp_view();
+                                    }
+                                    let mut notice = summary;
+                                    if !outcome.failures.is_empty() {
+                                        notice.push_str("\nMCP reconcile failed closed:");
+                                        for (name, error) in &outcome.failures {
+                                            notice.push_str(&format!("\n- {name}: {error}"));
+                                        }
+                                    }
+                                    if !cron_runtime_updated {
+                                        notice.push_str(
+                                            "\nBackground scheduler is unavailable after reload.",
+                                        );
+                                    }
+                                    app.status_message = Some(notice);
+                                }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
                                     // overlay for this command (e.g. /stats opens dialog
                                     // AND would push a text message — drop the text).
                                     if !handled_by_tui {
-                                        app.push_message(
-                                            claurst_core::types::Message::assistant(msg),
-                                        );
+                                        app.push_message(claurst_core::types::Message::assistant(
+                                            msg,
+                                        ));
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    if cmd_name == "model" && applied_cfg.model.is_some() {
+                                        base_query_config.pin_provenance = base_query_config
+                                            .pin_provenance
+                                            .with_model_source(ValueProvenance::new(
+                                                ValueSource::ExplicitUser,
+                                                true,
+                                            ));
+                                    }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     app.config = applied_cfg.clone();
@@ -2648,7 +3862,8 @@ async fn run_interactive(
                                         app.set_model(model.clone());
                                     }
                                     // Sync fast_mode visual indicator.
-                                    app.fast_mode = applied_cfg.model
+                                    app.fast_mode = applied_cfg
+                                        .model
                                         .as_deref()
                                         .map(|m| m.contains("haiku"))
                                         .unwrap_or(false);
@@ -2661,12 +3876,19 @@ async fn run_interactive(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    app.status_message =
-                                        Some("Configuration updated.".to_string());
+                                    app.status_message = Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    if cmd_name == "model" && applied_cfg.model.is_some() {
+                                        base_query_config.pin_provenance = base_query_config
+                                            .pin_provenance
+                                            .with_model_source(ValueProvenance::new(
+                                                ValueSource::ExplicitUser,
+                                                true,
+                                            ));
+                                    }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     // Sync model/provider + fast_mode visual indicator.
@@ -2690,11 +3912,7 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
                                     claurst_tui::restore_terminal(&mut terminal).ok();
-                                    match oauth_flow::run_oauth_login_flow(
-                                        with_claude_ai,
-                                    )
-                                    .await
-                                    {
+                                    match oauth_flow::run_oauth_login_flow(with_claude_ai).await {
                                         Ok(_) => {
                                             app.status_message =
                                                 Some("Login successful!".to_string());
@@ -2708,7 +3926,9 @@ async fn run_interactive(
                                             eprintln!("\nLogin failed: {}", e);
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    terminal = claurst_tui::setup_terminal(
+                                        app.config.mouse_capture_enabled(),
+                                    )?;
                                     app.kitty_keyboard_active =
                                         claurst_tui::keyboard_enhancement_active();
                                 }
@@ -2719,9 +3939,10 @@ async fn run_interactive(
                                 }) => {
                                     claurst_tui::restore_terminal(&mut terminal).ok();
                                     if provider == claurst_core::accounts::PROVIDER_CODEX {
-                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<
-                                            claurst_tui::DeviceAuthEvent,
-                                        >(8);
+                                        let (tx, mut rx) =
+                                            tokio::sync::mpsc::channel::<
+                                                claurst_tui::DeviceAuthEvent,
+                                            >(8);
                                         tokio::spawn(async move {
                                             while let Some(evt) = rx.recv().await {
                                                 if let claurst_tui::DeviceAuthEvent::GotBrowserUrl {
@@ -2744,9 +3965,8 @@ async fn run_interactive(
                                         .await
                                         {
                                             Ok(_) => {
-                                                app.status_message = Some(
-                                                    "Codex login successful!".to_string(),
-                                                );
+                                                app.status_message =
+                                                    Some("Codex login successful!".to_string());
                                                 eprintln!("\nCodex login successful!");
                                                 break 'main;
                                             }
@@ -2775,12 +3995,18 @@ async fn run_interactive(
                                             }
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    terminal = claurst_tui::setup_terminal(
+                                        app.config.mouse_capture_enabled(),
+                                    )?;
                                     app.kitty_keyboard_active =
                                         claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::Error(e)) => {
-                                    app.status_message = Some(format!("Error: {}", e));
+                                    let message = format!("Error: {e}");
+                                    app.status_message = Some(message.clone());
+                                    app.push_message(claurst_core::types::Message::assistant(
+                                        message,
+                                    ));
                                 }
                                 Some(CommandResult::Silent) | None => {
                                     handled_by_cli = false;
@@ -2789,15 +4015,12 @@ async fn run_interactive(
 
                             // Sync effort visual + API level when CLI handled
                             // /effort with explicit args (/effort high).
-                            if handled_by_cli
-                                && cmd_name == "effort"
-                                && !cmd_args.is_empty()
-                            {
+                            if handled_by_cli && cmd_name == "effort" && !cmd_args.is_empty() {
                                 if let Some(level) =
                                     claurst_core::effort::EffortLevel::from_str(&cmd_args)
                                 {
                                     current_effort = Some(level);
-                                    app.effort_level = level;
+                                    app.mark_effort_selection(level);
                                     app.status_message = Some(format!(
                                         "Effort: {} {}",
                                         app.effort_level.symbol(),
@@ -2816,17 +4039,15 @@ async fn run_interactive(
                             }
 
                             if !handled_by_cli && !handled_by_tui {
-                                app.status_message = Some(format!(
-                                    "Unknown command: /{}",
-                                    cmd_name
-                                ));
+                                let message = format!("Unknown command: /{}", cmd_name);
+                                app.status_message = Some(message.clone());
+                                app.push_message(claurst_core::types::Message::assistant(message));
                             }
 
                             // If a UserMessage was queued (e.g. /compact), submit it.
                             if let Some(msg) = submit_user_msg {
-                                messages.push(claurst_core::types::Message::user(msg.clone()));
-                                app.push_message(claurst_core::types::Message::user(msg));
-                                // Fall through to the send path below.
+                                input = msg;
+                                // The common send path appends exactly one expanded turn.
                             } else {
                                 continue;
                             }
@@ -2869,22 +4090,42 @@ async fn run_interactive(
                             } else {
                                 app.config.file_injection_max_size
                             };
-                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
+                            let (within_limit, mut oversized) =
+                                parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
                             if was_force {
-                                oversized.retain(|f| !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                                oversized.retain(|f| {
+                                    !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory))
+                                });
                             }
 
                             if !oversized.is_empty() {
                                 // Show either the directory warning or the file warning, never both.
                                 // Directories take precedence: if any are present, show only those.
-                                let has_dirs = oversized.iter().any(|f| matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
-                                let oversized_summaries: Vec<(String, usize, claurst_tui::AtFileIssue)> = oversized
+                                let has_dirs = oversized.iter().any(|f| {
+                                    matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory))
+                                });
+                                let oversized_summaries: Vec<(
+                                    String,
+                                    usize,
+                                    claurst_tui::AtFileIssue,
+                                )> = oversized
                                     .iter()
                                     .filter(|f| {
-                                        let is_dir = matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory));
-                                        if has_dirs { is_dir } else { !is_dir }
+                                        let is_dir = matches!(
+                                            f.issue,
+                                            Some(claurst_tui::AtFileIssue::IsDirectory)
+                                        );
+                                        if has_dirs {
+                                            is_dir
+                                        } else {
+                                            !is_dir
+                                        }
                                     })
-                                    .filter_map(|f| f.issue.clone().map(|issue| (f.path.display().to_string(), f.size_kb, issue)))
+                                    .filter_map(|f| {
+                                        f.issue.clone().map(|issue| {
+                                            (f.path.display().to_string(), f.size_kb, issue)
+                                        })
+                                    })
                                     .collect();
 
                                 app.file_injection_dialog.show(
@@ -2899,19 +4140,24 @@ async fn run_interactive(
                             }
 
                             // No oversized files: inject within-limit files and send
-                            let file_prefix = claurst_tui::file_injection::build_file_blocks(&within_limit);
+                            let file_prefix =
+                                claurst_tui::file_injection::build_file_blocks(&within_limit);
 
                             let user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
                                 let mut blocks: Vec<claurst_core::types::ContentBlock> = Vec::new();
 
                                 // Add file blocks if there's any file content
                                 if !file_prefix.is_empty() {
-                                    blocks.push(claurst_core::types::ContentBlock::Text { text: file_prefix });
+                                    blocks.push(claurst_core::types::ContentBlock::Text {
+                                        text: file_prefix,
+                                    });
                                 }
 
                                 // Add image blocks
                                 for img in &pending_imgs {
-                                    if let Some(b64) = claurst_tui::image_paste::encode_image_base64(&img.path) {
+                                    if let Some(b64) =
+                                        claurst_tui::image_paste::encode_image_base64(&img.path)
+                                    {
                                         blocks.push(claurst_core::types::ContentBlock::Image {
                                             source: claurst_core::types::ImageSource {
                                                 source_type: "base64".to_string(),
@@ -2924,7 +4170,9 @@ async fn run_interactive(
                                 }
 
                                 // Add the original input text
-                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+                                blocks.push(claurst_core::types::ContentBlock::Text {
+                                    text: input.clone(),
+                                });
 
                                 claurst_core::types::Message::user_blocks(blocks)
                             } else {
@@ -2940,21 +4188,28 @@ async fn run_interactive(
                             let user_msg = if pending_imgs.is_empty() {
                                 claurst_core::types::Message::user(input.clone())
                             } else {
-                                let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
-                                    .iter()
-                                    .filter_map(|img| {
-                                        claurst_tui::image_paste::encode_image_base64(&img.path)
-                                            .map(|b64| claurst_core::types::ContentBlock::Image {
-                                                source: claurst_core::types::ImageSource {
-                                                    source_type: "base64".to_string(),
-                                                    media_type: Some("image/png".to_string()),
-                                                    data: Some(b64),
-                                                    url: None,
-                                                },
-                                            })
-                                    })
-                                    .collect();
-                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+                                let mut blocks: Vec<claurst_core::types::ContentBlock> =
+                                    pending_imgs
+                                        .iter()
+                                        .filter_map(|img| {
+                                            claurst_tui::image_paste::encode_image_base64(&img.path)
+                                                .map(|b64| {
+                                                    claurst_core::types::ContentBlock::Image {
+                                                        source: claurst_core::types::ImageSource {
+                                                            source_type: "base64".to_string(),
+                                                            media_type: Some(
+                                                                "image/png".to_string(),
+                                                            ),
+                                                            data: Some(b64),
+                                                            url: None,
+                                                        },
+                                                    }
+                                                })
+                                        })
+                                        .collect();
+                                blocks.push(claurst_core::types::ContentBlock::Text {
+                                    text: input.clone(),
+                                });
                                 claurst_core::types::Message::user_blocks(blocks)
                             };
 
@@ -2977,6 +4232,23 @@ async fn run_interactive(
                         app.is_streaming = true;
                         app.streaming_text.clear();
 
+                        if app.effort_revision != applied_effort_revision {
+                            current_effort = Some(app.effort_level);
+                            base_query_config.pin_provenance = base_query_config
+                                .pin_provenance
+                                .with_effort(ValueProvenance::new(ValueSource::ExplicitUser, true));
+                            applied_effort_revision = app.effort_revision;
+                        }
+                        // A model picker updates the TUI-owned config before a
+                        // command result is produced. Preserve that explicit
+                        // host choice even when the model string is unchanged.
+                        if app.config.model.as_deref() != cmd_ctx.config.model.as_deref() {
+                            base_query_config.pin_provenance =
+                                base_query_config.pin_provenance.with_model_source(
+                                    ValueProvenance::new(ValueSource::ExplicitUser, true),
+                                );
+                        }
+
                         let ct = CancellationToken::new();
                         cancel = Some(ct.clone());
 
@@ -2988,7 +4260,10 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let mut ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
-                        qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                        qcfg.model = claurst_api::effective_model_for_config(
+                            &cmd_ctx.config,
+                            &model_registry,
+                        );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
@@ -3005,12 +4280,13 @@ async fn run_interactive(
                         // Wire completion_notifier if a command queue is available.
                         if let Some(ref cq) = qcfg.command_queue {
                             let cq = cq.clone();
-                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                cq.push(
-                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                    claurst_query::CommandPriority::Normal,
-                                );
-                            }));
+                            ctx_clone.completion_notifier =
+                                Some(claurst_tools::CompletionNotifier::new(move |msg| {
+                                    cq.push(
+                                        claurst_query::QueuedCommand::InjectSystemMessage(msg),
+                                        claurst_query::CommandPriority::Normal,
+                                    );
+                                }));
                         }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
@@ -3052,9 +4328,20 @@ async fn run_interactive(
                                 .and_then(|p| p.request.path.clone());
                             let bash_prefix = if should_record_bash_prefix {
                                 match &pr.kind {
-                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
-                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-                                        if first_word.is_empty() { None } else { Some(first_word) }
+                                    claurst_tui::dialogs::PermissionDialogKind::Bash {
+                                        command,
+                                        ..
+                                    } => {
+                                        let first_word = command
+                                            .split_whitespace()
+                                            .next()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if first_word.is_empty() {
+                                            None
+                                        } else {
+                                            Some(first_word)
+                                        }
                                     }
                                     _ => None,
                                 }
@@ -3068,7 +4355,9 @@ async fn run_interactive(
                                 // "Always allow" must survive restarts: persist
                                 // the prefix to settings.json so it is reloaded
                                 // into the allowlist on the next launch.
-                                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
+                                if let Ok(mut settings) =
+                                    claurst_core::config::Settings::load_sync()
+                                {
                                     if !settings.allowed_bash_prefixes.contains(&prefix) {
                                         settings.allowed_bash_prefixes.push(prefix);
                                         let _ = settings.save_sync();
@@ -3076,9 +4365,13 @@ async fn run_interactive(
                                 }
                             }
 
-                            if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                            if let Some(mut pending) =
+                                pending_permissions.lock().waiting.remove(&tool_use_id)
+                            {
                                 let decision = match selected_key {
-                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                    Some('n') => {
+                                        claurst_core::permissions::PermissionDecision::Deny
+                                    }
                                     _ => claurst_core::permissions::PermissionDecision::Allow,
                                 };
 
@@ -3087,18 +4380,32 @@ async fn run_interactive(
                                         match selected_key {
                                             Some('Y') => {
                                                 if let Some(path) = selected_path.as_deref() {
-                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
+                                                    manager.add_session_allow_path(
+                                                        &pending.request.tool_name,
+                                                        path,
+                                                    );
                                                 } else {
-                                                    manager.add_session_allow(&pending.request.tool_name);
+                                                    manager.add_session_allow(
+                                                        &pending.request.tool_name,
+                                                    );
                                                 }
                                             }
                                             Some('p') => {
-                                                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
+                                                let mut settings =
+                                                    claurst_core::config::Settings::load_sync()
+                                                        .unwrap_or_default();
                                                 if let Some(path) = selected_path.as_deref() {
                                                     let pattern = format!("{}*", path);
-                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                    let _ = manager.add_persistent_allow_path(
+                                                        &pending.request.tool_name,
+                                                        &pattern,
+                                                        &mut settings,
+                                                    );
                                                 } else {
-                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                    let _ = manager.add_persistent_allow(
+                                                        &pending.request.tool_name,
+                                                        &mut settings,
+                                                    );
                                                 }
                                             }
                                             _ => {}
@@ -3116,6 +4423,11 @@ async fn run_interactive(
                     }
 
                     app.handle_key_event(key);
+                    if app.take_query_cancel_requested() {
+                        if let Some(ref ct) = cancel {
+                            ct.cancel();
+                        }
+                    }
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
                     if let Some(manager) = tool_ctx.permission_manager.as_ref() {
@@ -3138,13 +4450,26 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
+                            tools_arc = filter_tools_for_agent(
+                                all_tools_arc.clone(),
+                                &def.access,
+                                history_index.clone(),
+                                &tool_ctx.working_dir,
+                            );
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
                             tools_arc = all_tools_arc.clone();
                         }
+                        base_query_config.inventory_source = Some(
+                            host_inventory.with_access(
+                                base_query_config
+                                    .agent_definition
+                                    .as_ref()
+                                    .map(|definition| definition.access.as_str()),
+                            )?,
+                        );
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -3223,7 +4548,10 @@ async fn run_interactive(
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
                         let tool_use_id = pending.tool_use_id.clone();
                         app.permission_request = Some(permission_request_from_core(&pending));
-                        pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                        pending_permissions
+                            .lock()
+                            .waiting
+                            .insert(tool_use_id, pending);
                         break;
                     }
                     Some(decision) => {
@@ -3248,33 +4576,61 @@ async fn run_interactive(
                         delta: text.clone(),
                         message_id: format!("msg-{}", index),
                     }),
-                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
-                        Some(BridgeOutbound::ToolStart {
-                            id: tool_id.clone(),
-                            name: tool_name.clone(),
-                            input_preview: Some(input_json.clone()),
-                        })
-                    }
-                    QueryEvent::ToolEnd { tool_id, result, is_error, .. } => {
-                        Some(BridgeOutbound::ToolEnd {
-                            id: tool_id.clone(),
-                            output: result.clone(),
-                            is_error: *is_error,
-                        })
-                    }
-                    QueryEvent::TurnComplete { stop_reason, turn, .. } => {
-                        Some(BridgeOutbound::TurnComplete {
-                            message_id: format!("turn-{}", turn),
-                            stop_reason: stop_reason.clone(),
-                        })
-                    }
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                    } => Some(BridgeOutbound::ToolStart {
+                        id: tool_id.clone(),
+                        name: tool_name.clone(),
+                        input_preview: Some(input_json.clone()),
+                    }),
+                    QueryEvent::ToolEnd {
+                        tool_id,
+                        result,
+                        is_error,
+                        ..
+                    } => Some(BridgeOutbound::ToolEnd {
+                        id: tool_id.clone(),
+                        output: result.clone(),
+                        is_error: *is_error,
+                    }),
+                    QueryEvent::TurnComplete {
+                        stop_reason, turn, ..
+                    } => Some(BridgeOutbound::TurnComplete {
+                        message_id: format!("turn-{}", turn),
+                        stop_reason: stop_reason.clone(),
+                    }),
                     QueryEvent::Error(msg) => Some(BridgeOutbound::Error {
                         message: msg.clone(),
                     }),
+                    QueryEvent::EffortSelection(_) => None,
+                    QueryEvent::ProviderWireWitness(_) => None,
+                    QueryEvent::McpDiscovery(_) | QueryEvent::McpInvocation { .. } => None,
                     _ => None,
                 };
                 if let Some(ob) = outbound {
-                    let _ = runtime.outbound_tx.try_send(ob);
+                    match try_queue_bridge(&runtime.outbound_tx, ob) {
+                        BridgeDeliveryStatus::Queued => {}
+                        BridgeDeliveryStatus::Full => {
+                            bridge_delivery_drops = bridge_delivery_drops.saturating_add(1);
+                            warn!(
+                                bridge_delivery_drops,
+                                "Bridge outbound queue full; event dropped"
+                            );
+                            app.status_message = Some(format!(
+                                "Remote bridge is behind; {} event{} dropped.",
+                                bridge_delivery_drops,
+                                if bridge_delivery_drops == 1 { "" } else { "s" }
+                            ));
+                        }
+                        BridgeDeliveryStatus::Closed => {
+                            warn!("Bridge outbound queue closed; event dropped");
+                            app.status_message = Some(
+                                "Remote bridge disconnected; event delivery stopped.".to_string(),
+                            );
+                        }
+                    }
                 }
             }
             // Also forward to the BridgeSessionInfo relay channel (best-effort).
@@ -3284,106 +4640,80 @@ async fn run_interactive(
                     QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
                         delta: claurst_api::streaming::ContentDelta::TextDelta { text },
                         ..
-                    }) => Some(serde_json::json!({
-                        "type": "text_chunk",
-                        "text": text,
-                    }).to_string()),
-                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
-                        Some(serde_json::json!({
+                    }) => Some(
+                        serde_json::json!({
+                            "type": "text_chunk",
+                            "text": text,
+                        })
+                        .to_string(),
+                    ),
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                    } => Some(
+                        serde_json::json!({
                             "type": "tool_start",
                             "tool_name": tool_name,
                             "tool_id": tool_id,
                             "input": input_json,
-                        }).to_string())
-                    }
-                    QueryEvent::ToolEnd { tool_name, tool_id, result, is_error } => {
-                        Some(serde_json::json!({
+                        })
+                        .to_string(),
+                    ),
+                    QueryEvent::ToolEnd {
+                        tool_name,
+                        tool_id,
+                        result,
+                        is_error,
+                        execution_witness: _,
+                    } => Some(
+                        serde_json::json!({
                             "type": "tool_end",
                             "tool_name": tool_name,
                             "tool_id": tool_id,
                             "result": result,
                             "is_error": is_error,
-                        }).to_string())
-                    }
+                        })
+                        .to_string(),
+                    ),
                     _ => None,
                 };
                 if let Some(payload) = relay_payload {
-                    let _ = relay_ev_tx.try_send(payload);
+                    match try_queue_bridge(&relay_ev_tx, payload) {
+                        BridgeDeliveryStatus::Queued => {}
+                        BridgeDeliveryStatus::Full => {
+                            bridge_delivery_drops = bridge_delivery_drops.saturating_add(1);
+                            warn!(
+                                bridge_delivery_drops,
+                                "Bridge relay queue full; event dropped"
+                            );
+                            app.status_message = Some(format!(
+                                "Remote bridge is behind; {} event{} dropped.",
+                                bridge_delivery_drops,
+                                if bridge_delivery_drops == 1 { "" } else { "s" }
+                            ));
+                        }
+                        BridgeDeliveryStatus::Closed => {
+                            warn!("Bridge relay queue closed; event dropped");
+                        }
+                    }
                 }
             }
             app.handle_query_event(evt);
         }
 
-        // Auto-compact: when context usage hits 99% and no query is running,
-        // automatically submit a compact request.
-        if app.context_window_size > 0
-            && !app.is_streaming
-            && current_query.is_none()
-            && !app.auto_compact_running
-        {
-            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
-            if used_pct >= 99 {
-                app.auto_compact_running = true;
-                let msg_count = messages.len();
-                let compact_msg = format!(
-                    "[Auto-compact triggered ({} messages, {}% context used). \
-                     Provide a detailed summary of our conversation so far, \
-                     preserving all key technical details, decisions made, \
-                     file paths mentioned, and current task status.]",
-                    msg_count, used_pct
-                );
-                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
-                let user_msg = claurst_core::types::Message::user(compact_msg);
-                messages.push(user_msg.clone());
-                app.push_message(user_msg);
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-
-                // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                // Auto-compact is a maintenance turn, not a goal turn: never let
-                // it trigger in-loop goal continuation.
-                qcfg.continuation = claurst_query::ContinuationMode::Default;
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                app.is_streaming = true;
-
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-            }
-        }
+        // Context selection remains deterministic and finite inside the query loop.
+        // Explicit /compact continues to dispatch through CommandResult::UserMessage.
 
         // Drain TUI-facing bridge events.
         let mut disconnect_bridge = false;
         if let Some(runtime) = bridge_runtime.as_mut() {
             loop {
                 match runtime.tui_rx.try_recv() {
-                    Ok(TuiBridgeEvent::Connected { session_url, session_id: conn_sid }) => {
+                    Ok(TuiBridgeEvent::Connected {
+                        session_url,
+                        session_id: conn_sid,
+                    }) => {
                         let short = if session_url.len() > 60 {
                             format!("{}…", &session_url[..60])
                         } else {
@@ -3417,55 +4747,29 @@ async fn run_interactive(
                             bridge_session_info = Some(info.clone());
 
                             // Relay consumer: moves relay_ev_rx (taken from the Option)
-                            // into a background task that calls post_bridge_event per item.
+                            // into an owned, cancellable task that calls post_bridge_event
+                            // per item. The authoritative bridge worker already polls
+                            // inbound messages, so no second poller is spawned here.
                             if let Some(rx) = relay_ev_rx_opt.take() {
                                 let info_relay = info.clone();
-                                tokio::spawn(async move {
+                                let sidecar_cancel = runtime.sidecar_cancel.clone();
+                                runtime.relay_task = Some(tokio::spawn(async move {
                                     let mut rx = rx;
-                                    while let Some(payload) = rx.recv().await {
-                                        let _ = claurst_bridge::post_bridge_event(
-                                            &info_relay,
-                                            payload,
-                                        )
-                                        .await;
-                                    }
-                                });
-                            }
-
-                            // Poll task: periodically calls poll_bridge_messages and
-                            // forwards inbound user messages to remote_prompt_tx.
-                            let info_poll = info.clone();
-                            let poll_tx = remote_prompt_tx.clone();
-                            tokio::spawn(async move {
-                                let mut since_id: Option<String> = None;
-                                loop {
-                                    match claurst_bridge::poll_bridge_messages(
-                                        &info_poll,
-                                        since_id.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(msgs) if !msgs.is_empty() => {
-                                            for msg in &msgs {
-                                                since_id = Some(msg.id.clone());
-                                                if msg.role == "user"
-                                                    && poll_tx
-                                                        .send(msg.content.clone())
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        return;
-                                                    }
-                                            }
+                                    loop {
+                                        let payload = tokio::select! {
+                                            _ = sidecar_cancel.cancelled() => break,
+                                            payload = rx.recv() => payload,
+                                        };
+                                        let Some(payload) = payload else {
+                                            break;
+                                        };
+                                        tokio::select! {
+                                            _ = sidecar_cancel.cancelled() => break,
+                                            _ = claurst_bridge::post_bridge_event(&info_relay, payload) => {}
                                         }
-                                        _ => {}
                                     }
-                                    tokio::time::sleep(
-                                        std::time::Duration::from_secs(2),
-                                    )
-                                    .await;
-                                }
-                            });
+                                }));
+                            }
                         }
                     }
                     Ok(TuiBridgeEvent::Disconnected { reason }) => {
@@ -3486,6 +4790,14 @@ async fn run_interactive(
                         app.bridge_state = BridgeConnectionState::Reconnecting { attempt };
                     }
                     Ok(TuiBridgeEvent::InboundPrompt { content, .. }) => {
+                        if current_query.is_some() {
+                            app.queued_messages.push_back(content);
+                            app.status_message = Some(
+                                "Current response is still finishing; remote prompt queued."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         // Inject the remote prompt as if the user typed it, then
                         // trigger submission automatically.
                         app.set_prompt_text(content.clone());
@@ -3503,7 +4815,10 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
-                        qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                        qcfg.model = claurst_api::effective_model_for_config(
+                            &cmd_ctx.config,
+                            &model_registry,
+                        );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
@@ -3533,21 +4848,34 @@ async fn run_interactive(
                                 ct.cancel();
                             }
                             app.is_streaming = false;
-                            app.status_message =
-                                Some("Cancelled by remote control.".to_string());
+                            app.status_message = Some("Cancelled by remote control.".to_string());
                         }
                     }
-                    Ok(TuiBridgeEvent::PermissionResponse { tool_use_id, response }) => {
-                        // Resolve a pending permission dialog if IDs match.
-                        if let Some(ref pr) = app.permission_request {
-                            if pr.tool_use_id == tool_use_id {
-                                use claurst_bridge::PermissionResponseKind;
-                                let _allow = matches!(
-                                    response,
-                                    PermissionResponseKind::Allow | PermissionResponseKind::AllowSession
-                                );
-                                app.permission_request = None;
-                            }
+                    Ok(TuiBridgeEvent::PermissionResponse {
+                        tool_use_id,
+                        response,
+                    }) => {
+                        // Resolve the exact pending request through the same
+                        // oneshot path as local approval. Never clear a dialog
+                        // or grant trust when the remote ID is stale/mismatched.
+                        let matches_dialog = app
+                            .permission_request
+                            .as_ref()
+                            .is_some_and(|pr| pr.tool_use_id == tool_use_id);
+                        if matches_dialog
+                            && resolve_remote_permission(
+                                &pending_permissions,
+                                tool_ctx.permission_manager.as_ref(),
+                                &tool_use_id,
+                                response,
+                            )
+                        {
+                            app.permission_request = None;
+                        } else {
+                            warn!(
+                                tool_use_id,
+                                "Ignoring stale or unmatched bridge permission response"
+                            );
                         }
                     }
                     Ok(TuiBridgeEvent::SessionNameUpdate { title }) => {
@@ -3589,53 +4917,11 @@ async fn run_interactive(
             }
         }
         if disconnect_bridge {
-            bridge_runtime = None;
-        }
-
-        // Drain inbound prompts from the BridgeSessionInfo poll task.
-        // These are user messages received from the web UI via poll_bridge_messages
-        // and injected here just like TuiBridgeEvent::InboundPrompt.
-        while let Ok(content) = remote_prompt_rx.try_recv() {
-            if !app.is_streaming {
-                app.set_prompt_text(content.clone());
-                messages.push(claurst_core::types::Message::user(content.clone()));
-                app.push_message(claurst_core::types::Message::user(content.clone()));
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-                app.is_streaming = true;
-                app.streaming_text.clear();
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-                break; // process one prompt per frame
+            if let Some(mut runtime) = bridge_runtime.take() {
+                runtime.shutdown("disconnect").await;
             }
+            bridge_session_info = None;
+            bridge_token = None;
         }
 
         // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
@@ -3698,8 +4984,7 @@ async fn run_interactive(
                     app.model_picker.loading_models = false;
                     app.model_fetch_rx = None;
                 }
-                Ok(Err(()))
-                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Ok(Err(())) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     app.model_picker.loading_models = false;
                     app.model_fetch_rx = None;
                 }
@@ -3714,11 +4999,8 @@ async fn run_interactive(
         if let Some(ref mut rx) = app.user_question_rx {
             match rx.try_recv() {
                 Ok(event) => {
-                    app.ask_user_dialog.open(
-                        event.question,
-                        event.options,
-                        event.reply_tx,
-                    );
+                    app.ask_user_dialog
+                        .open(event.question, event.options, event.reply_tx);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -3836,13 +5118,6 @@ async fn run_interactive(
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
         }
 
-        // Check if the background update task has reported a result.
-        if app.update_available.is_none() {
-            if let Ok(Some(version)) = update_rx.try_recv() {
-                app.update_available = Some(version);
-            }
-        }
-
         // ---- Device code / OAuth auth: spawn background task when pending ----
         if let Some(provider_id) = app.device_auth_pending.take() {
             let _tx = device_auth_tx.clone();
@@ -3860,14 +5135,18 @@ async fn run_interactive(
                             COPILOT_CLIENT_ID,
                             "read:user",
                             "https://github.com/login/device/code",
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(resp) => {
-                                let _ = tx2.send(DeviceAuthEvent::GotCode {
-                                    user_code: resp.user_code,
-                                    verification_uri: resp.verification_uri,
-                                    device_code: resp.device_code.clone(),
-                                    interval: resp.interval,
-                                }).await;
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::GotCode {
+                                        user_code: resp.user_code,
+                                        verification_uri: resp.verification_uri,
+                                        device_code: resp.device_code.clone(),
+                                        interval: resp.interval,
+                                    })
+                                    .await;
                                 // Step 2: Poll for access token
                                 match claurst_core::device_code::poll_for_token(
                                     COPILOT_CLIENT_ID,
@@ -3875,9 +5154,12 @@ async fn run_interactive(
                                     "https://github.com/login/oauth/access_token",
                                     resp.interval,
                                     300,
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(token) => {
-                                        let _ = tx2.send(DeviceAuthEvent::TokenReceived(token)).await;
+                                        let _ =
+                                            tx2.send(DeviceAuthEvent::TokenReceived(token)).await;
                                     }
                                     Err(e) => {
                                         let _ = tx2.send(DeviceAuthEvent::Error(e)).await;
@@ -3923,14 +5205,17 @@ async fn run_interactive(
                     tokio::spawn(async move {
                         match crate::codex_oauth_flow::run_oauth_flow(tx2.clone()).await {
                             Ok(tokens) => {
-                                let _ = tx2.send(DeviceAuthEvent::TokenReceived(
-                                    tokens.access_token,
-                                )).await;
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(tokens.access_token))
+                                    .await;
                             }
                             Err(e) => {
-                                let _ = tx2.send(DeviceAuthEvent::Error(
-                                    format!("Codex OAuth failed: {}", e),
-                                )).await;
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::Error(format!(
+                                        "Codex OAuth failed: {}",
+                                        e
+                                    )))
+                                    .await;
                             }
                         }
                     });
@@ -3958,8 +5243,12 @@ async fn run_interactive(
                     // Auto-open the verification URL in the browser
                     let _ = open::that(&verification_uri);
 
-                    app.device_auth_dialog
-                        .set_code(user_code, verification_uri, device_code, interval);
+                    app.device_auth_dialog.set_code(
+                        user_code,
+                        verification_uri,
+                        device_code,
+                        interval,
+                    );
 
                     app.notifications.push(
                         claurst_tui::NotificationKind::Info,
@@ -4028,9 +5317,11 @@ async fn run_interactive(
                 messages = msgs_arc.lock().await.clone();
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
-                session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                session.model =
+                    claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 app.is_streaming = false;
+                cancel = None;
                 app.status_message = None;
                 // Drain one queued message into the prompt and request an
                 // auto-submit on the next loop iteration (issue #149).
@@ -4039,13 +5330,6 @@ async fn run_interactive(
                     app.prompt_input.cursor = app.prompt_input.text.len();
                     app.pending_auto_submit = true;
                 }
-                if app.auto_compact_running {
-                    app.auto_compact_running = false;
-                    // After auto-compact the context was summarised — reset usage.
-                    app.context_used_tokens = 0;
-                    app.status_message = Some("Auto-compact complete.".to_string());
-                }
-
                 // Save session to JSONL (primary storage)
                 let _ = claurst_core::history::save_session(&session).await;
 
@@ -4061,8 +5345,16 @@ async fn run_interactive(
                         for msg in &session.messages {
                             let content_str = match &msg.content {
                                 claurst_core::types::MessageContent::Text(t) => t.clone(),
-                                claurst_core::types::MessageContent::Blocks(blocks) => blocks.iter()
-                                    .filter_map(|b| if let claurst_core::types::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+                                claurst_core::types::MessageContent::Blocks(blocks) => blocks
+                                    .iter()
+                                    .filter_map(|b| {
+                                        if let claurst_core::types::ContentBlock::Text { text } = b
+                                        {
+                                            Some(text.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(" "),
                             };
@@ -4071,7 +5363,8 @@ async fn run_interactive(
                                 claurst_core::types::Role::Assistant => "assistant",
                             };
                             let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
-                            let _ = store.save_message(&session.id, msg_id, role, &content_str, None);
+                            let _ =
+                                store.save_message(&session.id, msg_id, role, &content_str, None);
                         }
                     }
                 }
@@ -4128,10 +5421,8 @@ async fn run_interactive(
                             ));
                         }
                         Err(error) => {
-                            app.status_message = Some(format!(
-                                "MCP auth failed for '{}': {}",
-                                server_name, error
-                            ));
+                            app.status_message =
+                                Some(format!("MCP auth failed for '{}': {}", server_name, error));
                         }
                     }
                 } else {
@@ -4152,12 +5443,15 @@ async fn run_interactive(
             // snapshot it as the resolution source — and snapshot up-front so we
             // don't hold a borrow of `app` across the await.
             let reload_source = app.config.clone();
-            match reload_provider_runtime_state(&reload_source).await {
+            let runtime_factory = base_query_config
+                .anthropic_client_factory
+                .clone()
+                .unwrap_or_default();
+            match reload_provider_runtime_state(&reload_source, &runtime_factory).await {
                 Ok(refreshed) => {
                     cmd_ctx.config = refreshed.config.clone();
                     tool_ctx.config = refreshed.config.clone();
-                    base_query_config.provider_registry =
-                        Some(refreshed.provider_registry.clone());
+                    base_query_config.provider_registry = Some(refreshed.provider_registry.clone());
                     base_query_config.model_registry = Some(refreshed.model_registry.clone());
                     base_query_config.model = claurst_api::effective_model_for_config(
                         &cmd_ctx.config,
@@ -4173,8 +5467,7 @@ async fn run_interactive(
                     app.has_credentials = true;
                 }
                 Err(err) => {
-                    app.status_message =
-                        Some(format!("Could not activate credentials: {}", err));
+                    app.status_message = Some(format!("Could not activate credentials: {}", err));
                 }
             }
         }
@@ -4193,8 +5486,30 @@ async fn run_interactive(
             );
             let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
+            cmd_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            let agent_access = base_query_config
+                .agent_definition
+                .as_ref()
+                .map(|definition| definition.access.as_str());
+            (all_tools_arc, tools_arc) = build_policy_tools(
+                new_mcp_manager.clone(),
+                history_index.clone(),
+                &tool_ctx.working_dir,
+                &tool_ctx.config,
+                agent_access,
+            );
+            base_query_config.inventory_source = Some(host_inventory.with_access(agent_access)?);
+            let cron_runtime_updated = cron_control
+                .update(claurst_query::CronSchedulerRuntime::new(
+                    client.clone(),
+                    build_cron_tool_factory(&tool_ctx, &base_query_config),
+                    tool_ctx.clone(),
+                    base_query_config.clone(),
+                    history_root.clone(),
+                    tool_ctx.working_dir.clone(),
+                ))
+                .is_ok();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
@@ -4203,7 +5518,9 @@ async fn run_interactive(
                 .as_ref()
                 .map(|manager| manager.server_count())
                 .unwrap_or(0);
-            app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
+            app.status_message = Some(if !cron_runtime_updated {
+                "Reconnected MCP runtime. Background scheduler is unavailable.".to_string()
+            } else if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
                 format!(
@@ -4217,10 +5534,7 @@ async fn run_interactive(
         // Prompt for any project-defined MCP servers awaiting approval (#123).
         // Hold off while the startup bypass-permissions dialog is up so the two
         // modals don't fight over the screen.
-        if !app.is_streaming
-            && current_query.is_none()
-            && !app.bypass_permissions_dialog.visible
-        {
+        if !app.is_streaming && current_query.is_none() && !app.bypass_permissions_dialog.visible {
             app.maybe_prompt_next_mcp_server();
         }
 
@@ -4229,9 +5543,42 @@ async fn run_interactive(
         }
     }
 
-    if let Some(runtime) = bridge_runtime.take() {
-        runtime.cancel.cancel();
+    // Cancellation is ordered before teardown. Await the owned query task for
+    // a bounded interval, then shut down every REPL rooted in this workspace
+    // and session. A cleanup timeout remains visibly unknown through the REPL
+    // pending-writer barrier; dropping a child task is never treated as clean.
+    if let Some(cancel_token) = cancel.take() {
+        cancel_token.cancel();
     }
+    if let Some((mut handle, _messages)) = current_query.take() {
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            warn!("query cancellation timed out; aborting before REPL teardown");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+    let child_shutdown =
+        claurst_tools::agent_tasks::shutdown_child_services(&tool_ctx, Duration::from_secs(5))
+            .await;
+    if matches!(
+        child_shutdown.cleanup,
+        claurst_tools::agent_tasks::ChildCleanup::CleanupUnknown
+    ) {
+        warn!(
+            repl_sessions = child_shutdown.repl_sessions,
+            background_processes = child_shutdown.background_processes,
+            "child service cleanup remained unconfirmed while closing interactive session"
+        );
+    }
+
+    if let Some(mut runtime) = bridge_runtime.take() {
+        runtime.shutdown("interactive teardown").await;
+    }
+    drop(bridge_session_info.take());
+    drop(bridge_token.take());
     restore_terminal(&mut terminal)?;
     Ok(())
 }
@@ -4357,13 +5704,23 @@ fn print_account_list(provider: &str, display_name: &str) {
     let active = registry.active(provider).map(String::from);
     if profiles.is_empty() {
         println!("No {} accounts stored.", display_name);
-        println!("Use `claurst {} login` to add one.",
-            if provider == "anthropic" { "auth" } else { provider });
+        println!(
+            "Use `claurst {} login` to add one.",
+            if provider == "anthropic" {
+                "auth"
+            } else {
+                provider
+            }
+        );
         return;
     }
     println!("{} accounts:", display_name);
     for p in profiles {
-        let marker = if active.as_deref() == Some(&p.id) { "*" } else { " " };
+        let marker = if active.as_deref() == Some(&p.id) {
+            "*"
+        } else {
+            " "
+        };
         let email = p.email.as_deref().unwrap_or("");
         let label = p
             .label
@@ -4391,8 +5748,14 @@ fn switch_account(provider: &str, display_name: &str, id: Option<&str>) -> ! {
                 std::process::exit(1);
             }
             // No id: print the picker and exit with usage.
-            eprintln!("Usage: claurst {} switch <profile-id>",
-                if provider == "anthropic" { "auth" } else { provider });
+            eprintln!(
+                "Usage: claurst {} switch <profile-id>",
+                if provider == "anthropic" {
+                    "auth"
+                } else {
+                    provider
+                }
+            );
             eprintln!();
             print_account_list(provider, display_name);
             std::process::exit(1);
@@ -4425,25 +5788,21 @@ async fn handle_codex_account_command(args: &[String]) -> anyhow::Result<()> {
             // login we still spin up the OAuth listener but route the URL
             // through a no-op channel; the user opens the URL in their browser
             // either way.
-            let (tx, mut rx) =
-                tokio::sync::mpsc::channel::<claurst_tui::DeviceAuthEvent>(8);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<claurst_tui::DeviceAuthEvent>(8);
             tokio::spawn(async move {
                 while let Some(evt) = rx.recv().await {
                     if let claurst_tui::DeviceAuthEvent::GotBrowserUrl { url } = evt {
                         println!("Opening browser for Codex authentication...");
-                        println!(
-                            "If the browser did not open, visit:\n\n  {}\n",
-                            url
-                        );
+                        println!("If the browser did not open, visit:\n\n  {}\n", url);
                     }
                 }
             });
-            match crate::codex_oauth_flow::run_oauth_flow_with_label(tx, label.as_deref()).await
-            {
+            match crate::codex_oauth_flow::run_oauth_flow_with_label(tx, label.as_deref()).await {
                 Ok(_) => {
                     let registry = claurst_core::accounts::AccountRegistry::load();
                     println!("Successfully logged in to Codex!");
-                    if let Some(p) = registry.active_profile(claurst_core::accounts::PROVIDER_CODEX) {
+                    if let Some(p) = registry.active_profile(claurst_core::accounts::PROVIDER_CODEX)
+                    {
                         if let Some(email) = &p.email {
                             println!("  Account: {}", email);
                         }
@@ -4457,18 +5816,16 @@ async fn handle_codex_account_command(args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
-        Some("logout") => {
-            match claurst_core::oauth_config::clear_codex_tokens() {
-                Ok(_) => {
-                    println!("Logged out of the active Codex account.");
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("Logout failed: {}", e);
-                    std::process::exit(1);
-                }
+        Some("logout") => match claurst_core::oauth_config::clear_codex_tokens() {
+            Ok(_) => {
+                println!("Logged out of the active Codex account.");
+                std::process::exit(0);
             }
-        }
+            Err(e) => {
+                eprintln!("Logout failed: {}", e);
+                std::process::exit(1);
+            }
+        },
         Some("list") | Some("ls") | Some("accounts") => {
             print_account_list(claurst_core::accounts::PROVIDER_CODEX, "Codex");
             std::process::exit(0);
@@ -4731,52 +6088,53 @@ async fn auth_status(json_output: bool) {
         }
 
         println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
-    } else {
-        if !logged_in {
-            let hint = if active_provider == "anthropic" {
-                "Run `claurst auth login` or set ANTHROPIC_API_KEY.".to_string()
-            } else if let Some(env_var) =
-                claurst_core::config::primary_api_key_env_var_for_provider(active_provider)
-            {
-                format!("Set {} or store a credential for {}.", env_var, api_provider)
-            } else {
-                format!("Configure credentials for {}.", api_provider)
-            };
-            println!("Not logged in for {}. {}", api_provider, hint);
+    } else if !logged_in {
+        let hint = if active_provider == "anthropic" {
+            "Run `claurst auth login` or set ANTHROPIC_API_KEY.".to_string()
+        } else if let Some(env_var) =
+            claurst_core::config::primary_api_key_env_var_for_provider(active_provider)
+        {
+            format!(
+                "Set {} or store a credential for {}.",
+                env_var, api_provider
+            )
         } else {
-            println!("Logged in.");
-            println!("  API provider: {}", api_provider);
-            println!("  Billing: {}", billing_mode);
-            if let Some(ref method) = login_method {
-                println!("  Login method: {}", method);
-            }
-            if let Some(ref source) = token_source {
-                println!("  Auth token: {}", source);
-            }
-            if let Some(ref source) = api_key_source {
-                println!("  API key: {}", source);
-            }
-            match auth_method.as_str() {
-                "claude.ai" | "oauth_token" => {
-                    if let Some(ref tokens) = oauth_tokens {
-                        if let Some(ref email) = tokens.email {
-                            println!("  Email: {}", email);
-                        }
-                        if let Some(ref org) = tokens.organization_uuid {
-                            println!("  Organization ID: {}", org);
-                        } else {
-                            println!("  Organization ID: unavailable");
-                        }
-                        if let Some(ref sub) = tokens.subscription_type {
-                            println!("  Subscription: {}", sub);
-                        }
+            format!("Configure credentials for {}.", api_provider)
+        };
+        println!("Not logged in for {}. {}", api_provider, hint);
+    } else {
+        println!("Logged in.");
+        println!("  API provider: {}", api_provider);
+        println!("  Billing: {}", billing_mode);
+        if let Some(ref method) = login_method {
+            println!("  Login method: {}", method);
+        }
+        if let Some(ref source) = token_source {
+            println!("  Auth token: {}", source);
+        }
+        if let Some(ref source) = api_key_source {
+            println!("  API key: {}", source);
+        }
+        match auth_method.as_str() {
+            "claude.ai" | "oauth_token" => {
+                if let Some(ref tokens) = oauth_tokens {
+                    if let Some(ref email) = tokens.email {
+                        println!("  Email: {}", email);
+                    }
+                    if let Some(ref org) = tokens.organization_uuid {
+                        println!("  Organization ID: {}", org);
+                    } else {
+                        println!("  Organization ID: unavailable");
+                    }
+                    if let Some(ref sub) = tokens.subscription_type {
+                        println!("  Subscription: {}", sub);
                     }
                 }
-                "api_key" => {
-                    println!("  Organization ID: unavailable for direct API key auth");
-                }
-                _ => {}
             }
+            "api_key" => {
+                println!("  Organization ID: unavailable for direct API key auth");
+            }
+            _ => {}
         }
     }
 
@@ -4846,6 +6204,69 @@ mod bare_mode_tests {
     use super::*;
 
     #[test]
+    fn plugin_mcp_merge_uses_case_insensitive_user_first_namespace() {
+        let mut config = Config::default();
+        config.mcp_servers = vec![
+            claurst_core::config::McpServerConfig {
+                name: "Foo".to_string(),
+                command: Some("project".to_string()),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: None,
+                server_type: "stdio".to_string(),
+                origin: claurst_core::config::McpServerOrigin::Project,
+            },
+            claurst_core::config::McpServerConfig {
+                name: "foo".to_string(),
+                command: Some("user".to_string()),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: None,
+                server_type: "stdio".to_string(),
+                origin: claurst_core::config::McpServerOrigin::User,
+            },
+        ];
+        dedupe_configured_mcp_servers(&mut config);
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "foo");
+        assert_eq!(config.mcp_servers[0].command.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn plugin_mcp_identity_changes_invalidate_owner_replacement_only() {
+        let config = claurst_core::config::McpServerConfig {
+            name: "Foo".to_string(),
+            command: Some("fixture".to_string()),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: claurst_core::config::McpServerOrigin::User,
+        };
+        let previous = [AcceptedPluginMcp {
+            owner_source_id: "plugin-a@user".to_string(),
+            config: config.clone(),
+            fingerprint: "same-definition".to_string(),
+        }];
+        let stable = [AcceptedPluginMcp {
+            owner_source_id: "plugin-a@user".to_string(),
+            config: config.clone(),
+            fingerprint: "same-definition".to_string(),
+        }];
+        assert!(plugin_mcp_identity_changes(&previous, &stable).is_empty());
+
+        let changed_owner = [AcceptedPluginMcp {
+            owner_source_id: "plugin-b@user".to_string(),
+            config,
+            fingerprint: "same-definition".to_string(),
+        }];
+        assert_eq!(
+            plugin_mcp_identity_changes(&previous, &changed_owner),
+            std::collections::HashSet::from(["foo".to_string()])
+        );
+    }
+
+    #[test]
     fn bare_flag_parses_and_implies_no_claude_md() {
         let cli = Cli::parse_from(["claurst", "--bare"]);
         assert!(cli.bare, "--bare should set cli.bare");
@@ -4878,7 +6299,10 @@ mod bare_mode_tests {
             .map(|v| v.len())
             .sum();
         assert_eq!(hook_count, 0, "no plugin hooks");
-        assert!(registry.all_mcp_servers().is_empty(), "no plugin MCP servers");
+        assert!(
+            registry.all_mcp_servers().is_empty(),
+            "no plugin MCP servers"
+        );
     }
 
     #[test]
@@ -4901,5 +6325,349 @@ mod bare_mode_tests {
         hooks.clear(); // mirrors `config.hooks.clear()` in bare mode
 
         assert!(hooks.is_empty(), "bare mode leaves no hooks to run");
+    }
+
+    #[test]
+    fn tool_flags_are_copied_into_config_with_deny_precedence() {
+        let cli = Cli::parse_from([
+            "forge",
+            "--allowed-tools",
+            "Read, mcp__demo__*",
+            "--disallowed-tools",
+            "mcp__demo__secret",
+        ]);
+        let mut config = Config::default();
+        let policy = ToolPolicy::from_cli(
+            cli.allowed_tools.as_deref(),
+            cli.disallowed_tools.as_deref(),
+        )
+        .expect("CLI selectors are valid");
+        policy.apply_cli_overrides(
+            &mut config,
+            cli.allowed_tools.is_some(),
+            cli.disallowed_tools.is_some(),
+        );
+
+        assert_eq!(config.allowed_tools, vec!["Read", "mcp__demo__*"]);
+        assert_eq!(config.disallowed_tools, vec!["mcp__demo__secret"]);
+        let effective = ToolPolicy::from_config(&config).expect("config selectors are valid");
+        assert!(effective.allows("Read"));
+        assert!(effective.allows("mcp__demo__read"));
+        assert!(!effective.allows("mcp__demo__secret"));
+    }
+
+    #[test]
+    fn forge_help_identity_is_used_by_clap() {
+        use clap::CommandFactory;
+
+        assert_eq!(Cli::command().get_name(), PRODUCT_NAME);
+        assert!(Cli::command()
+            .get_about()
+            .is_some_and(|about| about.to_string().contains("Forge")));
+    }
+
+    #[test]
+    fn verified_policy_flag_preserves_explicit_path() {
+        let cli = Cli::try_parse_from(["forge", "--verified-policy", "policy.json"])
+            .expect("verified policy flag should parse");
+        assert_eq!(cli.verified_policy, Some(PathBuf::from("policy.json")));
+    }
+
+    #[test]
+    fn invalid_effort_remains_unknown_wire_pin() {
+        let provenance = effort_cli_provenance(Some("invalid-level"));
+        assert_eq!(provenance.source(), ValueSource::Unknown);
+        assert!(provenance.raw_present());
+        assert_eq!(
+            PinProvenance::default()
+                .with_effort(provenance)
+                .blocking_pin(),
+            Some(claurst_query::effort_policy::PinReason::UnknownWireOverride)
+        );
+    }
+
+    #[test]
+    fn disabled_selected_provider_is_rejected_before_startup_work() {
+        let mut config = Config {
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        config.provider_configs.insert(
+            "openai".to_string(),
+            claurst_core::config::ProviderConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let error = ensure_selected_provider_enabled(&config).expect_err("provider is disabled");
+        assert_eq!(error.to_string(), "selected provider is disabled");
+    }
+
+    #[test]
+    fn finite_budget_flags_parse_without_touching_model_overrides() {
+        let cli = Cli::parse_from([
+            "forge",
+            "--context-limit",
+            "64000",
+            "--wire-limit-bytes",
+            "1048576",
+        ]);
+        assert_eq!(cli.context_limit, Some(64_000));
+        assert_eq!(cli.wire_limit_bytes, Some(1_048_576));
+
+        let mut config = Config::default();
+        config.model_overrides.insert(
+            "anthropic/claude-test".to_string(),
+            claurst_core::config::ModelOverride {
+                context_window: Some(123_456),
+                ..Default::default()
+            },
+        );
+        let mut query_config = claurst_query::QueryConfig::from_config(&config);
+        query_config.context_budget.context_limit_tokens = cli.context_limit;
+        query_config.context_budget.wire_byte_limit = cli.wire_limit_bytes.unwrap();
+        assert_eq!(
+            config.model_overrides["anthropic/claude-test"].context_window,
+            Some(123_456)
+        );
+        assert_eq!(
+            query_config.context_budget.context_limit_tokens,
+            Some(64_000)
+        );
+        assert_eq!(query_config.context_budget.wire_byte_limit, 1_048_576);
+    }
+
+    #[test]
+    fn invalid_budget_flags_fail_during_argument_parsing() {
+        assert!(Cli::try_parse_from(["forge", "--context-limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["forge", "--wire-limit-bytes", "1023"]).is_err());
+        assert!(Cli::try_parse_from(["forge", "--context-limit", "100000001"]).is_err());
+    }
+
+    #[test]
+    fn concurrent_inference_flag_is_finite_and_bounded() {
+        let cli = Cli::try_parse_from(["forge", "--max-concurrent-inference", "7"]).unwrap();
+        assert_eq!(cli.max_concurrent_inference, 7);
+        assert!(Cli::try_parse_from(["forge", "--max-concurrent-inference", "0"]).is_err());
+        assert!(Cli::try_parse_from(["forge", "--max-concurrent-inference", "65"]).is_err());
+    }
+
+    fn pending_permission_fixture(
+        tool_use_id: &str,
+        decision_tx: tokio::sync::oneshot::Sender<claurst_core::permissions::PermissionDecision>,
+    ) -> claurst_tools::PendingPermissionRequest {
+        claurst_tools::PendingPermissionRequest {
+            tool_use_id: tool_use_id.to_string(),
+            request: claurst_core::permissions::PermissionRequest {
+                tool_name: "Read".to_string(),
+                description: "read fixture".to_string(),
+                details: None,
+                is_read_only: true,
+                path: Some("/tmp/fixture".into()),
+                working_dir: Some("/tmp".into()),
+                allowed_roots: vec!["/tmp".into()],
+                context_description: None,
+            },
+            reason: "fixture permission".to_string(),
+            decision_tx: Some(decision_tx),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_permission_resolves_exact_allow_and_deny_waiters() {
+        for (response, expected) in [
+            (
+                claurst_bridge::PermissionResponseKind::Allow,
+                claurst_core::permissions::PermissionDecision::Allow,
+            ),
+            (
+                claurst_bridge::PermissionResponseKind::Deny,
+                claurst_core::permissions::PermissionDecision::Deny,
+            ),
+        ] {
+            let store = Arc::new(ParkingMutex::new(
+                claurst_tools::PendingPermissionStore::default(),
+            ));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            store.lock().waiting.insert(
+                "perm-exact".to_string(),
+                pending_permission_fixture("perm-exact", tx),
+            );
+
+            assert!(resolve_remote_permission(
+                &store,
+                None,
+                "perm-exact",
+                response
+            ));
+            assert_eq!(rx.await.unwrap(), expected);
+            assert!(store.lock().waiting.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_permission_ignores_stale_ids_without_consuming_waiter() {
+        let store = Arc::new(ParkingMutex::new(
+            claurst_tools::PendingPermissionStore::default(),
+        ));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        store.lock().waiting.insert(
+            "perm-live".to_string(),
+            pending_permission_fixture("perm-live", tx),
+        );
+
+        assert!(!resolve_remote_permission(
+            &store,
+            None,
+            "perm-stale",
+            claurst_bridge::PermissionResponseKind::Allow
+        ));
+        assert!(store.lock().waiting.contains_key("perm-live"));
+        drop(store.lock().waiting.remove("perm-live"));
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bridge_runtime_shutdown_joins_owned_relay_task() {
+        let (_, tui_rx) = tokio::sync::mpsc::channel(1);
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            worker_cancel.cancelled().await;
+        });
+        let sidecar_cancel = tokio_util::sync::CancellationToken::new();
+        let relay_cancel = sidecar_cancel.clone();
+        let relay_task = tokio::spawn(async move {
+            relay_cancel.cancelled().await;
+        });
+        let mut runtime = BridgeRuntime {
+            tui_rx,
+            outbound_tx,
+            cancel,
+            task,
+            sidecar_cancel,
+            relay_task: Some(relay_task),
+        };
+
+        runtime.shutdown("test").await;
+        assert!(runtime.task.is_finished());
+        assert!(runtime.relay_task.is_none());
+    }
+
+    #[test]
+    fn bridge_delivery_reports_full_and_closed_channels() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        assert_eq!(try_queue_bridge(&sender, 1u8), BridgeDeliveryStatus::Queued);
+        assert_eq!(try_queue_bridge(&sender, 2u8), BridgeDeliveryStatus::Full);
+        drop(receiver);
+        assert_eq!(try_queue_bridge(&sender, 3u8), BridgeDeliveryStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn history_read_registration_respects_policy_and_scope() {
+        let root =
+            std::env::temp_dir().join(format!("forge-history-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("history test root");
+        let workspace_scope = workspace_scope_id(&root);
+        let index = Arc::new(ParkingMutex::new(
+            claurst_query::HistoryIndex::open(&root, &workspace_scope, "session-a")
+                .expect("history index"),
+        ));
+
+        let read_only = ToolPolicy::from_cli(Some("Read"), None).expect("valid policy");
+        let read_tools = build_tools_with_history(None, Some(index.clone()), &root, &read_only);
+        assert!(read_tools.iter().all(|tool| tool.name() != "HistoryRead"));
+        let denied = ToolPolicy::from_cli(None, Some("HistoryRead")).expect("valid policy");
+        let denied_tools = build_tools_with_history(None, Some(index.clone()), &root, &denied);
+        assert!(denied_tools.iter().all(|tool| tool.name() != "HistoryRead"));
+
+        let history_policy =
+            ToolPolicy::from_cli(Some("HistoryRead"), None).expect("valid history policy");
+        let history_tools = build_tools_with_history(None, Some(index), &root, &history_policy);
+        let history_tool = history_tools
+            .iter()
+            .find(|tool| tool.name() == "HistoryRead")
+            .expect("HistoryRead is registered when explicitly allowed");
+
+        let context = ToolContext {
+            working_dir: root.clone(),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: CostTracker::new(),
+            session_id: "session-a".to_string(),
+            file_history: Arc::new(ParkingMutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            catalog_view: None,
+            trusted_checker_catalog: Arc::new(claurst_tools::TrustedCheckerCatalog::empty()),
+        };
+        let result = history_tool
+            .execute(serde_json::json!({"query": ""}), &context)
+            .await;
+        assert!(!result.is_error, "matching scope should be readable");
+
+        let mut wrong_session = context;
+        wrong_session.session_id = "session-b".to_string();
+        let result = history_tool
+            .execute(serde_json::json!({"query": ""}), &wrong_session)
+            .await;
+        assert!(
+            result.is_error,
+            "a resumed session must not read another scope"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod bounded_stream_json_tests {
+    use super::*;
+    #[test]
+    fn escaping_cannot_expand_a_record_past_the_bound() {
+        let mut output = Vec::new();
+        let value = serde_json::json!({"type":"text_delta","text":"\"".repeat(600000)});
+        assert!(write_bounded_stream_json(&mut output, &value).is_err());
+        assert!(output.is_empty());
+    }
+    #[test]
+    fn valid_stream_record_preserves_json_and_newline() {
+        let mut output = Vec::new();
+        let value = serde_json::json!({"type":"text_delta","text":"a\"b\nc"});
+        write_bounded_stream_json(&mut output, &value).unwrap();
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            value
+        );
+    }
+    #[test]
+    fn closed_output_returns_a_forwarding_error() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(
+            write_bounded_stream_json(Closed, &serde_json::json!({"type":"message_stop"})).is_err()
+        );
     }
 }

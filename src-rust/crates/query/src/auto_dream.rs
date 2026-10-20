@@ -8,11 +8,11 @@
 //!   2. Sessions: transcript count with mtime > last_consolidated_at >= min_sessions
 //!   3. Lock:     no other process mid-consolidation (stale after 1 hour)
 
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
 // Scan throttle: when time-gate passes but session-gate doesn't, the lock
 // mtime doesn't advance, so the time-gate keeps passing every turn.
@@ -255,23 +255,22 @@ impl AutoDream {
         }))
     }
 
-    /// Persist the updated consolidation state and release the lock.
-    /// Call this after the consolidation subagent completes (or fails).
-    pub async fn finish_consolidation(task: &ConsolidationTask) {
-        let updated = ConsolidationState {
-            last_consolidated_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::ZERO)
-                    .as_secs(),
-            ),
-            lock_etag: None,
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&updated) {
-            if let Some(parent) = task.state_file.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+    /// Persist a successful consolidation state and release the lock.
+    ///
+    /// Failed or cancelled runs release their lock while leaving the last
+    /// successful timestamp untouched, allowing the next run to retry.
+    pub async fn finish_consolidation(task: &ConsolidationTask, succeeded: bool) {
+        if succeeded {
+            let updated = ConsolidationState {
+                last_consolidated_at: Some(now_secs()),
+                lock_etag: None,
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&updated) {
+                if let Some(parent) = task.state_file.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&task.state_file, json).await;
             }
-            let _ = tokio::fs::write(&task.state_file, json).await;
         }
         if task.lock_file.exists() {
             let _ = tokio::fs::remove_file(&task.lock_file).await;
@@ -374,14 +373,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dream = make_dream(&tmp);
         let state = ConsolidationState::default();
-        assert!(dream.time_gate_passes(&state), "no prior consolidation → gate passes");
+        assert!(
+            dream.time_gate_passes(&state),
+            "no prior consolidation → gate passes"
+        );
     }
 
     #[test]
     fn test_time_gate_recent_consolidation() {
         let tmp = TempDir::new().unwrap();
         let dream = AutoDream::with_config(
-            AutoDreamConfig { min_hours: 24.0, min_sessions: 5 },
+            AutoDreamConfig {
+                min_hours: 24.0,
+                min_sessions: 5,
+            },
             tmp.path().join("memory"),
             tmp.path().join("conversations"),
         );
@@ -389,14 +394,20 @@ mod tests {
             last_consolidated_at: Some(now_secs()), // just now
             lock_etag: None,
         };
-        assert!(!dream.time_gate_passes(&state), "just consolidated → gate blocked");
+        assert!(
+            !dream.time_gate_passes(&state),
+            "just consolidated → gate blocked"
+        );
     }
 
     #[test]
     fn test_time_gate_old_consolidation() {
         let tmp = TempDir::new().unwrap();
         let dream = AutoDream::with_config(
-            AutoDreamConfig { min_hours: 24.0, min_sessions: 5 },
+            AutoDreamConfig {
+                min_hours: 24.0,
+                min_sessions: 5,
+            },
             tmp.path().join("memory"),
             tmp.path().join("conversations"),
         );
@@ -406,7 +417,10 @@ mod tests {
             last_consolidated_at: Some(old),
             lock_etag: None,
         };
-        assert!(dream.time_gate_passes(&state), "consolidated 25h ago → gate passes");
+        assert!(
+            dream.time_gate_passes(&state),
+            "consolidated 25h ago → gate passes"
+        );
     }
 
     // --- lock_gate_passes (sync-friendly via tokio::test) ---
@@ -469,5 +483,68 @@ mod tests {
 
         dream.release_lock().await.unwrap();
         assert!(!dream.lock_file.exists());
+    }
+
+    fn task_for(dream: &AutoDream) -> ConsolidationTask {
+        ConsolidationTask {
+            prompt: String::new(),
+            memory_dir: dream.memory_dir.clone(),
+            state_file: dream.state_file.clone(),
+            lock_file: dream.lock_file.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finish_success_persists_state_and_releases_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dream = make_dream(&tmp);
+        let task = task_for(&dream);
+        dream.acquire_lock().await.unwrap();
+
+        AutoDream::finish_consolidation(&task, true).await;
+
+        assert!(!dream.lock_file.exists());
+        let state = dream.load_state().await;
+        assert!(state.last_consolidated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_finish_failure_preserves_existing_state_and_releases_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dream = make_dream(&tmp);
+        let task = task_for(&dream);
+        let existing = ConsolidationState {
+            last_consolidated_at: Some(123),
+            lock_etag: Some("existing".to_owned()),
+        };
+        std::fs::create_dir_all(&dream.memory_dir).unwrap();
+        std::fs::write(
+            &dream.state_file,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+        dream.acquire_lock().await.unwrap();
+
+        AutoDream::finish_consolidation(&task, false).await;
+
+        assert!(!dream.lock_file.exists());
+        assert_eq!(dream.load_state().await.last_consolidated_at, Some(123));
+        assert_eq!(
+            dream.load_state().await.lock_etag,
+            Some("existing".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finish_failure_without_state_leaves_state_absent() {
+        let tmp = TempDir::new().unwrap();
+        let dream = make_dream(&tmp);
+        let task = task_for(&dream);
+        dream.acquire_lock().await.unwrap();
+
+        AutoDream::finish_consolidation(&task, false).await;
+
+        assert!(!dream.lock_file.exists());
+        assert!(!dream.state_file.exists());
     }
 }

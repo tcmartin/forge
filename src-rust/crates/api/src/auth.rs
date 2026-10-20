@@ -35,6 +35,9 @@ pub struct LoginFlow {
 /// Implementors handle credential storage, token refresh, and interactive
 /// login/logout flows.  The trait is intentionally coarse-grained so that
 /// both simple API-key stores and full OAuth implementations can satisfy it.
+// async-trait emits a bare `#[must_use]` on its boxed futures;
+// Rust 1.99 Clippy sees the boxed future's own marker and reports a duplicate.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Retrieve the current credentials for this provider, refreshing OAuth

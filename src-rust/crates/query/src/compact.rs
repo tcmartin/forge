@@ -21,7 +21,10 @@
 //   the most recent `keep_recent_messages` intact.  This is lighter than a
 //   full compaction and can fire proactively at 75 % capacity.
 
-use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
+use claurst_api::{
+    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
+    SystemPrompt,
+};
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
@@ -57,8 +60,8 @@ const KEEP_RECENT_TOKENS: u64 = 16_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 // Percentage thresholds for token warning states (mirrors TS autoCompact.ts)
-const WARNING_PCT: f64 = 0.80;   // 80 % full → yellow warning
-const CRITICAL_PCT: f64 = 0.95;  // 95 % full → red critical
+const WARNING_PCT: f64 = 0.80; // 80 % full → yellow warning
+const CRITICAL_PCT: f64 = 0.95; // 95 % full → red critical
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -130,7 +133,11 @@ impl MessageGroup {
     fn from_messages(messages: Vec<Message>) -> Self {
         let topic_hint = extract_topic_hint(&messages);
         let token_estimate = estimate_tokens_for_messages(&messages);
-        Self { messages, topic_hint, token_estimate }
+        Self {
+            messages,
+            topic_hint,
+            token_estimate,
+        }
     }
 }
 
@@ -166,10 +173,7 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
         .iter()
         .map(|m| match &m.content {
             MessageContent::Text(t) => t.len(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .map(estimate_block_chars)
-                .sum(),
+            MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
         })
         .sum();
     // chars / 4 = rough tokens, then * 4/3 padding
@@ -179,9 +183,7 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
 fn estimate_block_chars(block: &ContentBlock) -> usize {
     match block {
         ContentBlock::Text { text } => text.len(),
-        ContentBlock::ToolUse { name, input, .. } => {
-            name.len() + input.to_string().len()
-        }
+        ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
         ContentBlock::ToolResult { content, .. } => match content {
             claurst_core::types::ToolResultContent::Text(t) => t.len(),
             claurst_core::types::ToolResultContent::Blocks(blocks) => {
@@ -303,8 +305,8 @@ pub async fn micro_compact_if_needed(
             );
             Some(new_msgs)
         }
-        Err(e) => {
-            warn!(error = %e, "MicroCompact failed");
+        Err(_) => {
+            warn!("MicroCompact failed");
             None
         }
     }
@@ -324,7 +326,8 @@ const NO_TOOLS_PREAMBLE: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call a
 \n";
 
 /// The trailing reminder that reinforces the no-tools instruction.
-const NO_TOOLS_TRAILER: &str = "\n\nREMINDER: Do NOT call any tools. Respond with plain text only — \
+const NO_TOOLS_TRAILER: &str =
+    "\n\nREMINDER: Do NOT call any tools. Respond with plain text only — \
 an <analysis> block followed by a <summary> block. \
 Tool calls will be rejected and you will fail the task.";
 
@@ -918,7 +921,9 @@ pub fn calculate_token_warning_state_for_window(
 
     if pct >= CRITICAL_PCT {
         TokenWarningState::Critical
-    } else if pct >= WARNING_PCT || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS {
+    } else if pct >= WARNING_PCT
+        || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS
+    {
         TokenWarningState::Warning
     } else {
         TokenWarningState::Ok
@@ -992,18 +997,32 @@ async fn summarise_head(
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 match block {
-                    ContentBlock::ToolUse { name, input, id, .. } => {
+                    ContentBlock::ToolUse {
+                        name, input, id, ..
+                    } => {
                         transcript.push_str(&format!(
                             "[Tool Call: {} (id={})]\nInput: {}\n\n",
                             name, id, input
                         ));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         let result_text = match content {
-                            claurst_core::types::ToolResultContent::Text(t) => t.as_str().to_string(),
-                            claurst_core::types::ToolResultContent::Blocks(_) => "[complex content]".to_string(),
+                            claurst_core::types::ToolResultContent::Text(t) => {
+                                t.as_str().to_string()
+                            }
+                            claurst_core::types::ToolResultContent::Blocks(_) => {
+                                "[complex content]".to_string()
+                            }
                         };
-                        let error_flag = if is_error.unwrap_or(false) { " [ERROR]" } else { "" };
+                        let error_flag = if is_error.unwrap_or(false) {
+                            " [ERROR]"
+                        } else {
+                            ""
+                        };
                         transcript.push_str(&format!(
                             "[Tool Result (id={}){}]\n{}\n\n",
                             tool_use_id, error_flag, result_text
@@ -1018,9 +1037,7 @@ async fn summarise_head(
     // Feed the prior summary WITHOUT its files-touched manifest: the manifest is
     // re-appended deterministically below (parsed + unioned), so echoing it in
     // the prompt would only risk the model drifting the file list.
-    let previous_summary_for_prompt = previous_summary
-        .as_deref()
-        .map(strip_files_touched_section);
+    let previous_summary_for_prompt = previous_summary.as_deref().map(strip_files_touched_section);
 
     // Select the UPDATE prompt variant when a prior summary is present.
     let compact_prompt = get_compact_prompt(None, previous_summary_for_prompt.as_deref());
@@ -1049,8 +1066,11 @@ async fn summarise_head(
         content: Value::String(user_content),
     }];
 
+    let wire_budget = crate::default_wire_budget(u64::from(max_summary_tokens))
+        .map_err(|error| ClaudeError::Config(error.to_string()))?;
     let request = CreateMessageRequest::builder(model, max_summary_tokens)
         .messages(api_msgs)
+        .wire_budget(wire_budget)
         .system(SystemPrompt::Text(
             "You are a helpful assistant that creates concise yet thorough conversation summaries. \
              Preserve all technical details, file names, code snippets, and decisions that would \
@@ -1229,8 +1249,8 @@ pub async fn auto_compact_if_needed(
             );
             Some(new_msgs)
         }
-        Err(e) => {
-            warn!(error = %e, "Auto-compact failed");
+        Err(_) => {
+            warn!("Auto-compact failed");
             state.on_failure();
             None
         }
@@ -1259,7 +1279,10 @@ pub async fn auto_compact_if_needed(
 #[derive(Debug, Clone)]
 pub enum CompactTrigger {
     /// Normal 90 %-threshold compact.
-    TokenThreshold { tokens_used: u64, context_limit: u64 },
+    TokenThreshold {
+        tokens_used: u64,
+        context_limit: u64,
+    },
     /// Caller requested an unconditional compact.
     Forced,
 }
@@ -1308,7 +1331,10 @@ pub fn should_context_collapse(tokens_used: u64, context_limit: u64) -> bool {
 /// Returns `(new_messages, rough_tokens_freed)`.
 ///
 /// Mirrors `snipCompact` from TypeScript (no API call required — purely local).
-pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: usize) -> (Vec<claurst_core::types::Message>, u64) {
+pub fn snip_compact(
+    messages: Vec<claurst_core::types::Message>,
+    keep_n_newest: usize,
+) -> (Vec<claurst_core::types::Message>, u64) {
     let total = messages.len();
     if total <= keep_n_newest + 1 {
         // Nothing to snip.
@@ -1324,8 +1350,7 @@ pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: 
     }
 
     // Estimate how many tokens the snipped range held.
-    let snipped_tokens =
-        estimate_tokens_for_messages(&messages[snip_start..snip_end]) as u64;
+    let snipped_tokens = estimate_tokens_for_messages(&messages[snip_start..snip_end]) as u64;
 
     let mut result = Vec::with_capacity(1 + keep_n_newest);
     result.push(messages[0].clone());
@@ -1340,7 +1365,10 @@ pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: 
 /// Returns the cut index (0 = keep everything, messages.len() = keep nothing).
 /// Iterates from the newest message backwards, accumulating token estimates
 /// until the budget is exhausted.
-pub fn calculate_messages_to_keep_index(messages: &[claurst_core::types::Message], token_budget: u64) -> usize {
+pub fn calculate_messages_to_keep_index(
+    messages: &[claurst_core::types::Message],
+    token_budget: u64,
+) -> usize {
     if messages.is_empty() {
         return 0;
     }
@@ -1362,24 +1390,87 @@ pub fn calculate_messages_to_keep_index(messages: &[claurst_core::types::Message
     keep_from
 }
 
-/// Remove image blocks from a message list before compacting.
-///
-/// Image tokens are expensive and carry no information that a text summary
-/// needs.  Mirrors the TypeScript `stripImages` helper used inside
-/// `reactiveCompact.ts`.
-fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
-    use claurst_core::types::{ContentBlock, MessageContent};
+#[derive(Debug, Default, Clone, Copy)]
+struct MediaOmission {
+    images: usize,
+    documents: usize,
+}
 
+impl MediaOmission {
+    fn is_empty(self) -> bool {
+        self.images == 0 && self.documents == 0
+    }
+}
+
+fn bounded_media_omission_notice(omitted: MediaOmission) -> String {
+    let notice = format!(
+        "[media omitted for compaction: {} image(s), {} document(s)]",
+        omitted.images, omitted.documents
+    );
+    notice.chars().take(256).collect()
+}
+
+fn strip_media_blocks(blocks: &mut Vec<ContentBlock>) -> MediaOmission {
+    let mut kept = Vec::with_capacity(blocks.len());
+    let mut omitted = MediaOmission::default();
+    let mut directly_omitted = MediaOmission::default();
+
+    for block in blocks.drain(..) {
+        match block {
+            ContentBlock::Image { .. } => {
+                directly_omitted.images = directly_omitted.images.saturating_add(1);
+                omitted.images = omitted.images.saturating_add(1);
+            }
+            ContentBlock::Document { .. } => {
+                directly_omitted.documents = directly_omitted.documents.saturating_add(1);
+                omitted.documents = omitted.documents.saturating_add(1);
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let content = match content {
+                    claurst_core::types::ToolResultContent::Text(text) => {
+                        claurst_core::types::ToolResultContent::Text(text)
+                    }
+                    claurst_core::types::ToolResultContent::Blocks(mut nested) => {
+                        let nested_omitted = strip_media_blocks(&mut nested);
+                        omitted.images = omitted.images.saturating_add(nested_omitted.images);
+                        omitted.documents =
+                            omitted.documents.saturating_add(nested_omitted.documents);
+                        claurst_core::types::ToolResultContent::Blocks(nested)
+                    }
+                };
+                kept.push(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                });
+            }
+            other => kept.push(other),
+        }
+    }
+
+    if !directly_omitted.is_empty() {
+        kept.push(ContentBlock::Text {
+            text: bounded_media_omission_notice(directly_omitted),
+        });
+    }
+    *blocks = kept;
+    omitted
+}
+
+/// Remove image and document blocks from a cloned message list before
+/// compacting. Durable canonical history remains untouched by this view.
+/// Each removed block is represented by bounded metadata in the compacted
+/// input, including nested typed tool-result blocks.
+fn strip_media(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
     messages
         .into_iter()
         .map(|mut msg| {
             if let MessageContent::Blocks(ref mut blocks) = msg.content {
-                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
-                // If stripping left only an empty block list, collapse to a
-                // placeholder text so the conversation remains parseable.
-                if blocks.is_empty() {
-                    msg.content = MessageContent::Text("[image removed for compaction]".to_string());
-                }
+                strip_media_blocks(blocks);
             }
             msg
         })
@@ -1414,8 +1505,8 @@ pub async fn reactive_compact(
         });
     }
 
-    // Phase 2: strip images before the compact API call.
-    let stripped = strip_images(messages.clone());
+    // Phase 2: strip media before the compact API call.
+    let stripped = strip_media(messages.clone());
 
     // Phase 1 + 3: summarise the head (everything older than the ~KEEP_RECENT_TOKENS
     // recent tail, cut on a pairing-safe boundary), then replace the old head with
@@ -1430,8 +1521,7 @@ pub async fn reactive_compact(
         });
     }
 
-    let original_token_estimate =
-        estimate_tokens_for_messages(&stripped[..split_at]) as u64;
+    let original_token_estimate = estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
     let mut new_messages =
         summarise_head(client, &stripped, split_at, &config.model, 20_000).await?;
@@ -1489,7 +1579,10 @@ pub async fn context_collapse(
     client: &claurst_api::AnthropicClient,
     config: &crate::QueryConfig,
 ) -> Result<CompactResult, claurst_core::error::ClaudeError> {
-    use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
+    use claurst_api::{
+        AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
+        SystemPrompt,
+    };
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -1534,8 +1627,11 @@ pub async fn context_collapse(
         content: Value::String(collapse_prompt),
     }];
 
+    let wire_budget = crate::default_wire_budget(1_000)
+        .map_err(|error| ClaudeError::Config(error.to_string()))?;
     let request = CreateMessageRequest::builder(&config.model, 1_000)
         .messages(api_msgs)
+        .wire_budget(wire_budget)
         .system(SystemPrompt::Text(
             "You are a conversation summariser. Produce an emergency ultra-short \
              summary as instructed. Plain text only."
@@ -1605,7 +1701,9 @@ const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 ///
 /// When the same file is read more than once in the conversation, replaces
 /// all but the last read with `[Content shown N time(s); showing last occurrence only]`.
-pub fn collapse_read_tool_results(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
+pub fn collapse_read_tool_results(
+    messages: Vec<claurst_core::types::Message>,
+) -> Vec<claurst_core::types::Message> {
     use claurst_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashMap;
 
@@ -1665,7 +1763,9 @@ pub fn collapse_read_tool_results(messages: Vec<claurst_core::types::Message>) -
 ///
 /// If the same search was run more than once (same query), keep only the
 /// most recent result; replace earlier results with a truncation notice.
-pub fn collapse_search_results(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
+pub fn collapse_search_results(
+    messages: Vec<claurst_core::types::Message>,
+) -> Vec<claurst_core::types::Message> {
     use claurst_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashSet;
 
@@ -1747,6 +1847,83 @@ mod tests {
         }])
     }
 
+    #[test]
+    fn strip_media_omits_images_and_documents_without_mutating_history() {
+        let original = vec![Message::user_blocks(vec![
+            ContentBlock::Image {
+                source: claurst_core::types::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("image/png".to_string()),
+                    data: Some("opaque-image-data".to_string()),
+                    url: None,
+                },
+            },
+            ContentBlock::Document {
+                source: claurst_core::types::DocumentSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("application/pdf".to_string()),
+                    data: Some("opaque-document-data".to_string()),
+                    url: None,
+                },
+                title: Some("report.pdf".to_string()),
+                context: None,
+                citations: None,
+            },
+        ])];
+
+        let stripped = strip_media(original.clone());
+        let MessageContent::Blocks(stripped_blocks) = &stripped[0].content else {
+            panic!("stripped media should remain a block message");
+        };
+        assert_eq!(stripped_blocks.len(), 1);
+        let ContentBlock::Text { text } = &stripped_blocks[0] else {
+            panic!("media omission should produce bounded text metadata");
+        };
+        assert_eq!(
+            text,
+            "[media omitted for compaction: 1 image(s), 1 document(s)]"
+        );
+        assert!(matches!(
+            &original[0].content,
+            MessageContent::Blocks(blocks) if blocks.len() == 2
+        ));
+    }
+
+    #[test]
+    fn strip_media_handles_nested_typed_tool_results() {
+        let messages = vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: ToolResultContent::Blocks(vec![ContentBlock::Document {
+                source: claurst_core::types::DocumentSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("application/pdf".to_string()),
+                    data: Some("opaque-document-data".to_string()),
+                    url: None,
+                },
+                title: None,
+                context: None,
+                citations: None,
+            }]),
+            is_error: None,
+        }])];
+
+        let stripped = strip_media(messages);
+        let MessageContent::Blocks(blocks) = &stripped[0].content else {
+            panic!("nested typed result should remain a block message");
+        };
+        let ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(nested),
+            ..
+        } = &blocks[0]
+        else {
+            panic!("nested typed result should remain nested blocks");
+        };
+        assert!(matches!(
+            nested.as_slice(),
+            [ContentBlock::Text { text }] if text == "[media omitted for compaction: 0 image(s), 1 document(s)]"
+        ));
+    }
+
     // ---- TokenWarningState --------------------------------------------------
 
     #[test]
@@ -1788,7 +1965,10 @@ mod tests {
 
     #[test]
     fn test_should_not_compact_when_disabled() {
-        let state = AutoCompactState { disabled: true, ..Default::default() };
+        let state = AutoCompactState {
+            disabled: true,
+            ..Default::default()
+        };
         assert!(!should_auto_compact(195_000, "claude-sonnet-4-6", &state));
     }
 
@@ -1964,7 +2144,10 @@ mod tests {
         let reg = registry_from_json(TEST_SNAPSHOT);
         // Sanity: the registry really carries the 1M window.
         assert_eq!(
-            reg.get("testprov", "big-context-model").unwrap().info.context_window,
+            reg.get("testprov", "big-context-model")
+                .unwrap()
+                .info
+                .context_window,
             1_000_000
         );
         assert_eq!(
@@ -1995,8 +2178,14 @@ mod tests {
             resolve_context_window(None, "anthropic", "claude-opus-4-8"),
             context_window_for_model("claude-opus-4-8")
         );
-        assert_eq!(resolve_context_window(None, "anthropic", "claude-opus-4-8"), 200_000);
-        assert_eq!(resolve_context_window(None, "some-provider", "some-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(None, "anthropic", "claude-opus-4-8"),
+            200_000
+        );
+        assert_eq!(
+            resolve_context_window(None, "some-provider", "some-model"),
+            100_000
+        );
     }
 
     #[test]
@@ -2007,7 +2196,10 @@ mod tests {
             resolve_context_window(Some(&reg), "nope", "ghost-model"),
             context_window_for_model("ghost-model")
         );
-        assert_eq!(resolve_context_window(Some(&reg), "nope", "ghost-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(Some(&reg), "nope", "ghost-model"),
+            100_000
+        );
     }
 
     #[test]
@@ -2015,7 +2207,10 @@ mod tests {
         let reg = registry_from_json(TEST_SNAPSHOT);
         // The registry stores the models.dev-omission placeholder (4096)...
         assert_eq!(
-            reg.get("testprov", "tiny-model").unwrap().info.context_window,
+            reg.get("testprov", "tiny-model")
+                .unwrap()
+                .info
+                .context_window,
             4096
         );
         // ...but resolve treats it as "unknown" and uses the heuristic instead
@@ -2024,7 +2219,10 @@ mod tests {
             resolve_context_window(Some(&reg), "testprov", "tiny-model"),
             context_window_for_model("tiny-model")
         );
-        assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "tiny-model"),
+            100_000
+        );
     }
 
     // ---- estimate_tokens_for_messages --------------------------------------
@@ -2078,10 +2276,10 @@ mod tests {
         // A round whose tool_use is huge, so the raw budget cut lands right on
         // the tool_result — which would orphan it from its call.
         let msgs = vec![
-            Message::user(filler(400)),                                       // 0
+            Message::user(filler(400)), // 0
             assistant_tool_use("t1", "Bash", serde_json::json!({ "command": filler(8000) })), // 1 (BIG)
-            user_tool_result("t1", &filler(400)),                            // 2 (tool_result)
-            Message::assistant(filler(400)),                                 // 3
+            user_tool_result("t1", &filler(400)), // 2 (tool_result)
+            Message::assistant(filler(400)),      // 3
         ];
 
         // Raw token-budget index lands ON the tool_result (index 2).
@@ -2247,7 +2445,10 @@ mod tests {
             .collect();
         let manifest = format_files_touched(&extract_file_operations(&msgs));
 
-        assert!(manifest.contains("(+5 more)"), "expected overflow marker:\n{manifest}");
+        assert!(
+            manifest.contains("(+5 more)"),
+            "expected overflow marker:\n{manifest}"
+        );
         // Exactly MAX_MANIFEST_FILES paths are shown before the marker.
         let modified_line = manifest
             .lines()

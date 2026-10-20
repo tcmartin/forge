@@ -1,8 +1,8 @@
-//! Windows process-tree ownership primitive for `ProcessGroupGuard`.
+//! Shared Windows process-tree ownership primitive.
 //!
-//! This file is a source-only candidate.  It intentionally uses only the
-//! Kernel32 ABI and standard-library owned handles; the tools crate must not
-//! import a transitive `windows-sys` or `process-wrap` dependency.
+//! The checked factory is the only launch entry point. It creates the child
+//! suspended, establishes Job Object ownership and identity, then resumes it.
+//! Callers never receive an armed guard for an already-running child.
 
 #![cfg(windows)]
 
@@ -11,7 +11,7 @@ use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::process::Child;
+use tokio::process::{Child, Command};
 
 type Bool = i32;
 type Dword = u32;
@@ -19,6 +19,7 @@ type Long = i32;
 
 const TRUE: Bool = 1;
 const CREATE_SNAPSHOT_THREAD: Dword = 0x0000_0004;
+const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
 const ERROR_NO_MORE_FILES: i32 = 18;
 const STILL_ACTIVE: Dword = 259;
@@ -275,7 +276,7 @@ fn sole_initial_thread(process_id: Dword) -> io::Result<OwnedHandle> {
     )
 }
 
-pub(crate) struct JobObjectGuard {
+pub struct JobObjectGuard {
     job: Option<OwnedHandle>,
     process: OwnedHandle,
     direct_pid: Dword,
@@ -285,11 +286,47 @@ pub(crate) struct JobObjectGuard {
     empty_verified: AtomicBool,
 }
 
+#[cfg(test)]
+static FAIL_BEFORE_RESUME: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_arm_before_resume() {
+    FAIL_BEFORE_RESUME.store(true, Ordering::Release);
+}
+
+pub enum SpawnOwnedError {
+    Spawn(io::Error),
+    Arm { child: Child, error: io::Error },
+}
+
+impl SpawnOwnedError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Spawn(error) => format!("owned child spawn failed: {error}"),
+            Self::Arm { error, .. } => format!("owned job arm failed: {error}"),
+        }
+    }
+}
+
+/// Spawn a Windows child through the complete suspended -> owned -> resumed
+/// sequence. The returned child is still owned by the caller when arming
+/// fails, allowing bounded cleanup and an explicit Unknown result.
+pub fn spawn_owned_command_checked(
+    mut command: Command,
+) -> Result<(Child, JobObjectGuard), SpawnOwnedError> {
+    command.creation_flags(CREATE_SUSPENDED);
+    let child = command.spawn().map_err(SpawnOwnedError::Spawn)?;
+    match JobObjectGuard::arm(&child) {
+        Ok(job) => Ok((child, job)),
+        Err(error) => Err(SpawnOwnedError::Arm { child, error }),
+    }
+}
+
 impl JobObjectGuard {
     /// Arm ownership while the Tokio child is still suspended.  Every failure
     /// leaves the child suspended or kill-on-drop owned by Tokio; the job's
     /// close-on-drop rule handles the assigned-process case.
-    pub(crate) fn arm(child: &Child) -> io::Result<Self> {
+    fn arm(child: &Child) -> io::Result<Self> {
         let direct_pid = child
             .id()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child exited before arm"))?;
@@ -350,6 +387,13 @@ impl JobObjectGuard {
                 "initial thread identity does not match retained child handle",
             ));
         }
+        #[cfg(test)]
+        if FAIL_BEFORE_RESUME.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "test-only pre-resume arm failure",
+            ));
+        }
         let previous_suspend_count = unsafe { ResumeThread(thread.as_raw_handle()) };
         if previous_suspend_count != 1 {
             return Err(io::Error::new(
@@ -368,11 +412,11 @@ impl JobObjectGuard {
         })
     }
 
-    pub(crate) fn ownership_lost(&self) -> bool {
+    pub fn ownership_lost(&self) -> bool {
         self.ownership_lost.load(Ordering::Acquire)
     }
 
-    pub(crate) fn kill_now(&mut self) {
+    pub fn kill_now(&mut self) {
         if self.kill_requested {
             return;
         }
@@ -388,7 +432,7 @@ impl JobObjectGuard {
         }
     }
 
-    pub(crate) fn child_running(&mut self) -> io::Result<bool> {
+    pub fn child_running(&mut self) -> io::Result<bool> {
         let process = self.process.as_raw_handle();
         let pid = unsafe { GetProcessId(process) };
         let creation_time = process_creation_time(process)?;
@@ -408,7 +452,7 @@ impl JobObjectGuard {
         Ok(exit_code == STILL_ACTIVE)
     }
 
-    pub(crate) async fn confirmed_empty(&self) -> bool {
+    pub async fn confirmed_empty(&self) -> bool {
         if self.ownership_lost() {
             return false;
         }
@@ -441,7 +485,27 @@ impl JobObjectGuard {
         }
     }
 
-    pub(crate) fn disarm(&mut self) -> bool {
+    /// Kill any remaining owned process, prove the Job Object is empty, then
+    /// release the job authority. Failure keeps the guard armed for Drop.
+    pub async fn finish(&mut self) -> io::Result<()> {
+        if self.ownership_lost() {
+            return Err(io::Error::other("owned Job Object identity was lost"));
+        }
+        if !self.confirmed_empty().await {
+            self.kill_now();
+            if !self.confirmed_empty().await {
+                return Err(io::Error::other(
+                    "owned Job Object did not reach a confirmed empty state",
+                ));
+            }
+        }
+        if !self.disarm() {
+            return Err(io::Error::other("owned Job Object could not be disarmed"));
+        }
+        Ok(())
+    }
+
+    pub fn disarm(&mut self) -> bool {
         if !self.empty_verified.load(Ordering::Acquire) {
             return false;
         }
@@ -449,5 +513,35 @@ impl JobObjectGuard {
         // authority.  A non-empty job is never disarmed.
         self.job.take();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn pre_resume_arm_failure_returns_owned_child_without_resuming_it() {
+        fail_next_arm_before_resume();
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "exit", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let result = spawn_owned_command_checked(command);
+        let SpawnOwnedError::Arm { mut child, error } = result else {
+            panic!("pre-resume fault must be returned as an arm error");
+        };
+        assert!(error.to_string().contains("pre-resume"));
+        child
+            .kill()
+            .await
+            .expect("the returned suspended child remains cleanup-owned");
+        child
+            .wait()
+            .await
+            .expect("cleanup must reap the returned child");
     }
 }

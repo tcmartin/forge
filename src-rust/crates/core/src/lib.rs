@@ -13,6 +13,9 @@
 
 pub mod dispatch;
 
+#[cfg(windows)]
+pub mod windows_job_object;
+
 // Branded provider / model identifier newtypes.
 pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
@@ -4414,10 +4417,14 @@ pub mod cost {
 // ---------------------------------------------------------------------------
 pub mod hooks {
     use crate::config::{HookEntry, HookEvent};
+    #[cfg(windows)]
+    use crate::windows_job_object;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::io;
     use std::path::Path;
+    use std::pin::Pin;
     use std::process::ExitStatus;
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -4498,26 +4505,84 @@ pub mod hooks {
 
     struct HookChild {
         child: Child,
+        #[cfg(windows)]
+        job: Option<windows_job_object::JobObjectGuard>,
         #[cfg(unix)]
         group: Option<i32>,
     }
 
+    #[cfg(windows)]
+    async fn read_optional_bounded<R: AsyncRead + Unpin>(pipe: Option<R>) -> io::Result<Vec<u8>> {
+        match pipe {
+            Some(pipe) => read_bounded(pipe).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn cleanup_unarmed_hook_child(mut child: Child) -> (bool, bool) {
+        let _ = child.start_kill();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let wait = tokio::time::timeout(Duration::from_secs(2), child.wait());
+        let pipes = async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::try_join!(read_optional_bounded(stdout), read_optional_bounded(stderr),)
+            })
+            .await
+        };
+        let (wait, pipes) = tokio::join!(wait, pipes);
+        (
+            wait.is_ok_and(|result| result.is_ok()),
+            pipes.is_ok_and(|result| result.is_ok()),
+        )
+    }
+
     impl HookChild {
-        fn new(mut command: Command) -> io::Result<Self> {
+        async fn new(mut command: Command) -> io::Result<Self> {
             command.kill_on_drop(true);
             #[cfg(unix)]
-            command.process_group(0);
-            let child = command.spawn()?;
-            #[cfg(unix)]
-            let group = child
-                .id()
-                .and_then(|pid| i32::try_from(pid).ok())
-                .filter(|pid| *pid > 1);
-            Ok(Self {
-                child,
-                #[cfg(unix)]
-                group,
-            })
+            {
+                command.process_group(0);
+                let child = command.spawn()?;
+                let group = child
+                    .id()
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 1);
+                return Ok(Self { child, group });
+            }
+            #[cfg(windows)]
+            {
+                let (child, job) = match windows_job_object::spawn_owned_command_checked(command) {
+                    Ok(pair) => pair,
+                    Err(windows_job_object::SpawnOwnedError::Spawn(error)) => return Err(error),
+                    Err(windows_job_object::SpawnOwnedError::Arm { child, error }) => {
+                        // The factory returns the still-owned child. Finish
+                        // bounded direct-child and pipe cleanup before the
+                        // hook caller sees the arm failure. No hook code can
+                        // be reported as started or successful on this path.
+                        // The tree remains Unknown because the Job guard did
+                        // not survive arming, even when direct cleanup works.
+                        let (direct_child, pipes) = cleanup_unarmed_hook_child(child).await;
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "hook ownership arm failed: {error}; cleanup remains unknown \
+                                 (direct_child={direct_child}, pipes={pipes})"
+                            ),
+                        ));
+                    }
+                };
+                return Ok(Self {
+                    child,
+                    job: Some(job),
+                });
+            }
+            #[allow(unreachable_code)]
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "owned hook launch unavailable on this platform",
+            ))
         }
 
         #[cfg(unix)]
@@ -4532,19 +4597,23 @@ pub mod hooks {
             }
         }
 
-        fn terminate_owned_group(&self) {
-            // Keep the process-group identity until both signals have been
-            // issued. On Unix this is the only safe cleanup point after the
-            // direct child has reaped; a surviving descendant keeps the group
-            // identity alive while it is being terminated.
+        fn terminate_owned_group(&mut self) {
+            // Keep the process-group identity until cleanup is proven. On
+            // Windows this is the Job Object authority; on Unix it is the
+            // process-group identity anchor.
             #[cfg(unix)]
-            self.signal_group(15); // SIGTERM
-            #[cfg(unix)]
-            self.signal_group(9); // SIGKILL
+            {
+                self.signal_group(15); // SIGTERM
+                self.signal_group(9); // SIGKILL
+            }
+            #[cfg(windows)]
+            if let Some(job) = self.job.as_mut() {
+                job.kill_now();
+            }
         }
 
-        async fn stop_and_reap(&mut self) {
-            // Escalate before waiting so a descendant that ignores TERM cannot
+        async fn stop_and_reap(&mut self) -> io::Result<()> {
+            // Escalate before waiting so descendants that ignore TERM cannot
             // keep inherited pipes open.
             self.terminate_owned_group();
             let _ = self.child.start_kill();
@@ -4558,27 +4627,80 @@ pub mod hooks {
                     .await
                     .is_err()
                 {
-                    warn!("Hook process reap did not finish within shutdown grace");
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "hook direct-child reap remained unconfirmed",
+                    ));
                 }
             }
+            #[cfg(windows)]
+            {
+                let Some(job) = self.job.as_mut() else {
+                    return Err(io::Error::other("hook Job Object authority is missing"));
+                };
+                if !job.confirmed_empty().await || !job.disarm() {
+                    return Err(io::Error::other(
+                        "hook Job Object cleanup remained unconfirmed",
+                    ));
+                }
+                self.job = None;
+            }
             #[cfg(unix)]
             {
                 self.group = None;
             }
+            Ok(())
         }
 
-        async fn finish(&mut self) {
-            // A successful anchor can still have redirected descendants that
-            // no longer hold our pipes. Tear down the owned group before
-            // clearing its identity; otherwise those descendants outlive the
-            // hook unnoticed.
-            self.terminate_owned_group();
+        async fn finish(&mut self) -> io::Result<()> {
+            #[cfg(windows)]
+            {
+                let Some(job) = self.job.as_mut() else {
+                    return Err(io::Error::other("hook Job Object authority is missing"));
+                };
+                job.finish().await?;
+                self.job = None;
+            }
             #[cfg(unix)]
             {
-                // Do not retain a group identity after teardown, where a later
-                // process could reuse the identifier.
+                // A successful hook can still have redirected descendants.
+                // Tear down the owned group before clearing its identity.
+                self.terminate_owned_group();
                 self.group = None;
             }
+            Ok(())
+        }
+    }
+
+    async fn hook_cleanup_error<F>(
+        process: &mut HookChild,
+        pipes: Option<Pin<&mut F>>,
+        error: io::Error,
+    ) -> io::Error
+    where
+        F: Future<Output = io::Result<(StdinWriteOutcome, Vec<u8>, Vec<u8>)>>,
+    {
+        let cleanup = process.stop_and_reap().await;
+        let pipes = match pipes {
+            Some(pipes) => tokio::time::timeout(HOOK_SHUTDOWN_GRACE, pipes)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "hook pipe closure remained unconfirmed",
+                    )
+                }),
+            None => Ok(()),
+        };
+        match (cleanup, pipes) {
+            (Ok(()), Ok(())) => error,
+            (Err(cleanup), _) => {
+                io::Error::other(format!("{error}; hook cleanup remains unknown: {cleanup}"))
+            }
+            (Ok(()), Err(pipes)) => io::Error::other(format!(
+                "{error}; hook pipe closure remains unknown: {pipes}"
+            )),
         }
     }
 
@@ -4586,6 +4708,12 @@ pub mod hooks {
         fn drop(&mut self) {
             #[cfg(unix)]
             self.signal_group(9); // SIGKILL as the cancellation fallback
+            #[cfg(windows)]
+            if let Some(job) = self.job.as_mut() {
+                // Closing the armed Job Object is the synchronous kill-on-close
+                // backstop when an async cleanup future is dropped.
+                job.kill_now();
+            }
             let _ = self.child.start_kill();
             // Task abort can drop this guard after the async cancellation
             // handler has stopped being polled. Reap through the owned child
@@ -4719,7 +4847,8 @@ pub mod hooks {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             cmd
-        })?;
+        })
+        .await?;
 
         let stdin = process
             .child
@@ -4753,28 +4882,38 @@ pub mod hooks {
         let io_result = tokio::select! {
             result = &mut io => result,
             _ = &mut deadline => {
-                process.stop_and_reap().await;
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "hook deadline exceeded"));
+                return Err(hook_cleanup_error(
+                    &mut process,
+                    Some(io.as_mut()),
+                    io::Error::new(io::ErrorKind::TimedOut, "hook deadline exceeded"),
+                )
+                .await);
             }
             _ = cancel.cancelled() => {
-                process.stop_and_reap().await;
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "hook cancelled"));
+                return Err(hook_cleanup_error(
+                    &mut process,
+                    Some(io.as_mut()),
+                    io::Error::new(io::ErrorKind::Interrupted, "hook cancelled"),
+                )
+                .await);
             }
         };
 
         let (stdin_result, stdout, stderr) = match io_result {
             Ok(result) => result,
             Err(error) => {
-                process.stop_and_reap().await;
-                return Err(error);
+                return Err(
+                    hook_cleanup_error::<std::future::Ready<_>>(&mut process, None, error).await,
+                );
             }
         };
         let remaining = hook_deadline.saturating_sub(started.elapsed());
         let status = match wait_child_with_cancel(&mut process, cancel, remaining).await {
             Ok(status) => status,
             Err(error) => {
-                process.stop_and_reap().await;
-                return Err(error);
+                return Err(
+                    hook_cleanup_error::<std::future::Ready<_>>(&mut process, None, error).await,
+                );
             }
         };
         // A hook may intentionally close stdin before consuming the JSON and
@@ -4782,7 +4921,7 @@ pub mod hooks {
         // status (including blocking exit 1/2) instead of turning BrokenPipe
         // into a supervisor failure after the child has been reaped.
         let _ = stdin_result;
-        process.finish().await;
+        process.finish().await?;
         Ok(HookProcessOutput {
             status,
             stdout,
@@ -5102,12 +5241,11 @@ pub mod hooks {
                 .enable_all()
                 .build()
                 .expect("hook test runtime");
-            let child = {
-                let _entered = runtime.enter();
+            let child = runtime.block_on(async {
                 let mut command = Command::new("sh");
                 command.args(["-c", "trap '' TERM; exec sleep 30"]);
-                HookChild::new(command).expect("owned hook child")
-            };
+                HookChild::new(command).await.expect("owned hook child")
+            });
             let pid = child.child.id().expect("live child id") as i32;
             runtime.shutdown_timeout(Duration::from_millis(100));
             let started = std::time::Instant::now();
@@ -5455,11 +5593,42 @@ pub mod hooks {
             let _ = std::fs::remove_file(marker);
         }
 
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn pre_resume_arm_failure_does_not_run_hook_and_reports_unknown_tree_cleanup() {
+            let root = tempfile::tempdir().expect("hook arm-failure fixture");
+            let marker = root.path().join("hook-resumed.txt");
+            let command = format!("echo resumed > \"{}\"", marker.display());
+            windows_job_object::fail_next_arm_before_resume();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                execute_hook_with_deadline(
+                    &command,
+                    root.path(),
+                    b"{}",
+                    &CancellationToken::new(),
+                    Duration::from_secs(2),
+                    &[],
+                ),
+            )
+            .await
+            .expect("arm-failure cleanup must be bounded");
+            let error = result.expect_err("pre-resume arm failure must reject hook");
+            let message = error.to_string();
+            assert!(message.contains("cleanup remains unknown"));
+            assert!(message.contains("direct_child=true"));
+            assert!(message.contains("pipes=true"));
+            assert!(
+                !marker.exists(),
+                "hook command ran before ownership was armed"
+            );
+        }
+
         #[tokio::test]
         async fn output_overflow_is_rejected_before_unbounded_capture() {
             let entry = HookEntry {
                 command: if cfg!(windows) {
-                    "for /L %i in (1,1,400000) do @echo x".to_string()
+                    format!("for /L %i in (1,1,1024) do @echo {}", "x".repeat(1024))
                 } else {
                     "yes x".to_string()
                 },

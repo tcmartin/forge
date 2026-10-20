@@ -9,9 +9,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
-#[cfg(windows)]
-#[path = "windows_job_object.rs"]
-mod windows_job_object;
 
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
@@ -24,7 +21,7 @@ pub(crate) struct ProcessGroupGuard {
     #[cfg(unix)]
     pid: Option<u32>,
     #[cfg(windows)]
-    job: Option<windows_job_object::JobObjectGuard>,
+    job: Option<claurst_core::windows_job_object::JobObjectGuard>,
     armed: bool,
     ownership_lost: bool,
 }
@@ -39,20 +36,14 @@ impl ProcessGroupGuard {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn arm(child: &Child) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            return Ok(Self::new(child.id()));
-        }
-        #[cfg(windows)]
-        {
-            return Ok(Self {
-                job: Some(windows_job_object::JobObjectGuard::arm(child)?),
-                armed: true,
-                ownership_lost: false,
-            });
-        }
-        #[allow(unreachable_code)]
+        Ok(Self::new(child.id()))
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    pub(crate) fn arm(child: &Child) -> io::Result<Self> {
+        let _ = child;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "owned process identity unavailable on this platform",
@@ -239,20 +230,7 @@ pub(crate) enum ProcessCleanup {
 }
 
 #[cfg(windows)]
-pub(crate) enum SpawnOwnedError {
-    Spawn(io::Error),
-    Arm { child: Child, error: io::Error },
-}
-
-#[cfg(windows)]
-impl SpawnOwnedError {
-    pub(crate) fn message(&self) -> String {
-        match self {
-            Self::Spawn(error) => format!("owned child spawn failed: {error}"),
-            Self::Arm { error, .. } => format!("owned job arm failed: {error}"),
-        }
-    }
-}
+pub(crate) use claurst_core::windows_job_object::SpawnOwnedError;
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
@@ -338,13 +316,19 @@ pub(crate) fn spawn_owned_argv_checked_with_stdio(
 
 #[cfg(windows)]
 pub(crate) fn spawn_owned_command_checked(
-    mut command: Command,
+    command: Command,
 ) -> Result<(Child, ProcessGroupGuard), SpawnOwnedError> {
-    command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
-    let child = command.spawn().map_err(SpawnOwnedError::Spawn)?;
-    match ProcessGroupGuard::arm(&child) {
-        Ok(group) => Ok((child, group)),
-        Err(error) => Err(SpawnOwnedError::Arm { child, error }),
+    match claurst_core::windows_job_object::spawn_owned_command_checked(command) {
+        Ok((child, job)) => Ok((
+            child,
+            ProcessGroupGuard {
+                job: Some(job),
+                armed: true,
+                ownership_lost: false,
+            },
+        )),
+        Err(SpawnOwnedError::Spawn(error)) => Err(SpawnOwnedError::Spawn(error)),
+        Err(SpawnOwnedError::Arm { child, error }) => Err(SpawnOwnedError::Arm { child, error }),
     }
 }
 

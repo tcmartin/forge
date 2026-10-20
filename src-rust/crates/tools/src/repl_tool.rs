@@ -170,6 +170,11 @@ static REPL_CANCELS: Lazy<Arc<DashMap<ReplKey, (Weak<Mutex<ReplSession>>, Cancel
     Lazy::new(|| Arc::new(DashMap::new()));
 static REPL_REGISTRATION: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
 
+#[cfg(windows)]
+const PYTHON_INTERPRETER: &str = "python";
+#[cfg(not(windows))]
+const PYTHON_INTERPRETER: &str = "python3";
+
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -185,7 +190,7 @@ fn key_for(ctx: &ToolContext, language: &str) -> ReplKey {
 
 fn interpreter_for(language: &str) -> Option<(&'static str, Vec<&'static str>)> {
     match language {
-        "python" | "python3" => Some(("python3", vec!["-u", "-i"])),
+        "python" | "python3" => Some((PYTHON_INTERPRETER, vec!["-u", "-i"])),
         // Keep fd 3 attached to the original control pipe. The driver uses a
         // persistent vm context rather than Node's line-oriented REPL.
         "javascript" | "node" => Some((
@@ -892,12 +897,14 @@ async fn get_or_spawn_session(key: &ReplKey) -> Result<Arc<Mutex<ReplSession>>, 
             ) {
                 Ok(pair) => pair,
                 Err(crate::command_capture::SpawnOwnedError::Spawn(error)) => {
+                    drop(_registration);
                     return Err(confirm_unspawned_pending(
                         pending,
                         format!("Failed to spawn '{program}': {error}"),
                     ));
                 }
                 Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
+                    drop(_registration);
                     let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                     return Err(format!(
                         "Failed to arm REPL interpreter '{program}': {error}; cleanup remains unknown ({cleanup:?})"
@@ -920,6 +927,7 @@ async fn get_or_spawn_session(key: &ReplKey) -> Result<Arc<Mutex<ReplSession>>, 
             let child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    drop(_registration);
                     return Err(confirm_unspawned_pending(
                         pending,
                         format!("Failed to spawn '{program}': {error}"),
@@ -1421,6 +1429,22 @@ mod tests {
         let wrapped = wrap_code("python", "try:\n    value = 1", "marker");
         assert!(wrapped.starts_with("exec("));
         assert!(wrapped.contains("marker"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_python_aliases_use_python() {
+        for alias in ["python", "python3"] {
+            assert_eq!(interpreter_for(alias).unwrap().0, "python");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_python_aliases_use_python3() {
+        for alias in ["python", "python3"] {
+            assert_eq!(interpreter_for(alias).unwrap().0, "python3");
+        }
     }
 
     #[tokio::test]

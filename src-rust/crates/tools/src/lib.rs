@@ -732,7 +732,28 @@ pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std
                 .set_permissions(metadata.permissions())?;
         }
         temporary.as_file().sync_all()?;
-        // NamedTempFile removes its own unique scratch file on any error.
+        // Windows cannot replace a destination while another writer still
+        // holds its handle. Retry only that transient rename failure within a
+        // short bound; all other errors remain hard failures and the test's
+        // atomic-write assertion stays intact.
+        #[cfg(windows)]
+        {
+            let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match temporary.persist(&path) {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.error.kind() == std::io::ErrorKind::PermissionDenied
+                            && std::time::Instant::now() < retry_deadline =>
+                    {
+                        temporary = error.file;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.error),
+                }
+            }
+        }
+        #[cfg(not(windows))]
         temporary.persist(&path).map_err(|error| error.error)?;
         #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;

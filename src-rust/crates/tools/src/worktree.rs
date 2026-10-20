@@ -1298,9 +1298,19 @@ mod tests {
         init_git_repo(tmp.path()).await;
         let mut ctx = allow_all_context(tmp.path().into());
         ctx.session_id = uuid::Uuid::new_v4().to_string();
-        let result = EnterWorktreeTool.execute(json!({
-            "branch":"broker-cwd", "post_create_command":"printf worktree-marker > marker; printf verified-worktree"
-        }), &ctx).await;
+        let post_create_command = if cfg!(windows) {
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath marker -Value 'worktree-marker'; Write-Output verified-worktree"#
+        } else {
+            "printf worktree-marker > marker; printf verified-worktree"
+        };
+        let result = EnterWorktreeTool
+            .execute(
+                json!({
+                    "branch":"broker-cwd", "post_create_command":post_create_command
+                }),
+                &ctx,
+            )
+            .await;
         assert!(!result.is_error);
         assert_eq!(
             result.metadata.as_ref().unwrap()["post_create_status"],
@@ -1346,12 +1356,14 @@ mod tests {
             "worktree-only"
         );
         assert!(!tmp.path().join("marker").exists());
-        let command = crate::execute_authorized(
-            &crate::PtyBashTool,
-            json!({"command":"printf shell-marker > shell-file; printf worktree-evidence"}),
-            &ctx,
-        )
-        .await;
+        let shell_command = if cfg!(windows) {
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath shell-file -Value 'shell-marker'; Write-Output worktree-evidence"#
+        } else {
+            "printf shell-marker > shell-file; printf worktree-evidence"
+        };
+        let command =
+            crate::execute_authorized(&crate::PtyBashTool, json!({"command":shell_command}), &ctx)
+                .await;
         assert!(!command.is_error, "{}", command.content);
         assert!(wt.join("shell-file").exists());
         assert!(!tmp.path().join("shell-file").exists());
@@ -1365,12 +1377,14 @@ mod tests {
             crate::execute_authorized(&crate::EvidenceReadTool, json!({"id":id}), &ctx).await;
         assert!(!evidence.is_error, "{}", evidence.content);
         assert!(evidence.content.contains("worktree-evidence"));
-        let command = crate::execute_authorized(
-            &crate::PtyBashTool,
-            json!({"command":"printf parent-marker > parent-file"}),
-            &ctx,
-        )
-        .await;
+        let parent_command = if cfg!(windows) {
+            r#"powershell -NoProfile -NonInteractive -Command "Set-Content -NoNewline -LiteralPath parent-file -Value 'parent-marker'"#
+        } else {
+            "printf parent-marker > parent-file"
+        };
+        let command =
+            crate::execute_authorized(&crate::PtyBashTool, json!({"command":parent_command}), &ctx)
+                .await;
         assert!(!command.is_error, "{}", command.content);
         assert!(tmp.path().join("parent-file").exists());
         assert!(!wt.join("parent-file").exists());
@@ -1391,12 +1405,12 @@ mod tests {
                 .await;
         assert!(!entered.is_error, "{}", entered.content);
 
-        let repl = crate::execute_authorized(
-            &crate::ReplTool,
-            json!({"code":"printf persistent-repl"}),
-            &ctx,
-        )
-        .await;
+        let repl_input = if cfg!(windows) {
+            json!({"language":"python", "code":"print('persistent-repl')"})
+        } else {
+            json!({"code":"printf persistent-repl"})
+        };
+        let repl = crate::execute_authorized(&crate::ReplTool, repl_input, &ctx).await;
         assert!(!repl.is_error, "{}", repl.content);
 
         let exited =

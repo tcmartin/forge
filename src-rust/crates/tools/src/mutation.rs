@@ -1812,8 +1812,11 @@ mod tests {
 
     fn mutating_checker_command(path: &Path) -> String {
         if cfg!(windows) {
-            // cmd.exe's set /p emits the prompt without a trailing newline.
-            format!("echo|set /p=\"changed\" > \"{}\"", path.display())
+            let escaped_path = path.display().to_string().replace('\'', "''");
+            format!(
+                "powershell -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -NoNewline -Value 'changed'\"",
+                escaped_path
+            )
         } else {
             format!("printf changed > \"{}\"", path.display())
         }

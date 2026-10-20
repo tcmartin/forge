@@ -6983,8 +6983,6 @@ mod tests {
             std::fs::read(root.path().join("checker-runs")).unwrap(),
             b"x"
         );
-        #[cfg(not(unix))]
-        assert!(!root.path().join("checker-runs").exists());
     }
 
     #[tokio::test]

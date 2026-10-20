@@ -10,6 +10,7 @@
 /// accepted.
 use crate::manifest::{PluginHooksConfig, PluginManifest};
 use crate::plugin::{LoadedPlugin, PluginError, PluginSource};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -113,19 +114,35 @@ pub fn try_load_from_path(
     // Resolve sub-paths.
     let commands_path = {
         let p = plugin_dir.join("commands");
-        if p.is_dir() { Some(p) } else { None }
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
     };
     let agents_path = {
         let p = plugin_dir.join("agents");
-        if p.is_dir() { Some(p) } else { None }
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
     };
     let skills_path = {
         let p = plugin_dir.join("skills");
-        if p.is_dir() { Some(p) } else { None }
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
     };
     let output_styles_path = {
         let p = plugin_dir.join("output-styles");
-        if p.is_dir() { Some(p) } else { None }
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
     };
 
     // Load hooks config (hooks/hooks.json takes priority over inline manifest field).
@@ -214,14 +231,32 @@ pub fn load_hooks_config(
 // Command definitions collected from a plugin
 // ---------------------------------------------------------------------------
 
-/// Scan a plugin's commands directory and return all `PluginCommandDef` items.
+/// Collect plugin commands and skill entrypoints under the plugin namespace.
 pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginCommandDef> {
     let mut defs: Vec<crate::plugin::PluginCommandDef> = Vec::new();
     let capabilities = plugin.manifest.capabilities.clone();
 
     // Commands from the `commands/` directory.
     if let Some(ref cmd_dir) = plugin.commands_path {
-        collect_markdown_commands(cmd_dir, &plugin.name, capabilities.clone(), &mut defs);
+        collect_markdown_commands(
+            cmd_dir,
+            &plugin.path,
+            &plugin.name,
+            capabilities.clone(),
+            &mut defs,
+        );
+    }
+
+    if let Some(ref skill_dir) = plugin.skills_path {
+        for entrypoint in claurst_core::skill_discovery::discover_skill_files(skill_dir) {
+            collect_markdown_commands(
+                &entrypoint,
+                &plugin.path,
+                &plugin.name,
+                capabilities.clone(),
+                &mut defs,
+            );
+        }
     }
 
     // Extra commands declared in the manifest.
@@ -231,8 +266,15 @@ pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginC
             let cmd_name = command_name_from_file(&abs, &plugin.name);
             defs.push(crate::plugin::PluginCommandDef {
                 name: cmd_name,
-                description: extract_description_from_markdown_file(&abs)
-                    .unwrap_or_else(|| "Plugin command".to_string()),
+                description: if crate::plugin_capability_granted(
+                    capabilities.as_deref(),
+                    "read_files",
+                ) {
+                    extract_description_from_markdown_file(&abs)
+                        .unwrap_or_else(|| "Plugin command".to_string())
+                } else {
+                    "Plugin command".to_string()
+                },
                 plugin_name: plugin.name.clone(),
                 plugin_source_id: plugin.source_id.clone(),
                 run_action: crate::plugin::CommandRunAction::MarkdownPrompt {
@@ -242,7 +284,13 @@ pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginC
                 plugin_capabilities: capabilities.clone(),
             });
         } else if abs.is_dir() {
-            collect_markdown_commands(&abs, &plugin.name, capabilities.clone(), &mut defs);
+            collect_markdown_commands(
+                &abs,
+                &plugin.path,
+                &plugin.name,
+                capabilities.clone(),
+                &mut defs,
+            );
         }
     }
 
@@ -252,6 +300,7 @@ pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginC
 /// Recursively collect .md files from `dir` into `PluginCommandDef` items.
 fn collect_markdown_commands(
     dir: &Path,
+    plugin_root: &Path,
     plugin_name: &str,
     capabilities: Option<Vec<String>>,
     defs: &mut Vec<crate::plugin::PluginCommandDef>,
@@ -259,7 +308,7 @@ fn collect_markdown_commands(
     use walkdir::WalkDir;
 
     for entry in WalkDir::new(dir)
-        .min_depth(1)
+        .min_depth(usize::from(dir.is_dir()))
         .into_iter()
         .filter_map(|e| e.ok())
     {
@@ -279,13 +328,20 @@ fn collect_markdown_commands(
             let cmd_name = format!("{}:{}", plugin_name, base_name);
             defs.push(crate::plugin::PluginCommandDef {
                 name: cmd_name,
-                description: extract_description_from_markdown_file(path)
-                    .unwrap_or_else(|| "Plugin skill".to_string()),
+                description: if crate::plugin_capability_granted(
+                    capabilities.as_deref(),
+                    "read_files",
+                ) {
+                    extract_description_from_markdown_file(path)
+                        .unwrap_or_else(|| "Plugin skill".to_string())
+                } else {
+                    "Plugin skill".to_string()
+                },
                 plugin_name: plugin_name.to_string(),
                 plugin_source_id: String::new(),
                 run_action: crate::plugin::CommandRunAction::MarkdownPrompt {
                     file_path: path.to_string_lossy().into_owned(),
-                    plugin_root: dir.to_string_lossy().into_owned(),
+                    plugin_root: plugin_root.to_string_lossy().into_owned(),
                 },
                 plugin_capabilities: capabilities.clone(),
             });
@@ -296,13 +352,20 @@ fn collect_markdown_commands(
             let cmd_name = command_name_from_file(path, plugin_name);
             defs.push(crate::plugin::PluginCommandDef {
                 name: cmd_name,
-                description: extract_description_from_markdown_file(path)
-                    .unwrap_or_else(|| "Plugin command".to_string()),
+                description: if crate::plugin_capability_granted(
+                    capabilities.as_deref(),
+                    "read_files",
+                ) {
+                    extract_description_from_markdown_file(path)
+                        .unwrap_or_else(|| "Plugin command".to_string())
+                } else {
+                    "Plugin command".to_string()
+                },
                 plugin_name: plugin_name.to_string(),
                 plugin_source_id: String::new(),
                 run_action: crate::plugin::CommandRunAction::MarkdownPrompt {
                     file_path: path.to_string_lossy().into_owned(),
-                    plugin_root: dir.to_string_lossy().into_owned(),
+                    plugin_root: plugin_root.to_string_lossy().into_owned(),
                 },
                 plugin_capabilities: capabilities.clone(),
             });
@@ -314,21 +377,82 @@ fn collect_markdown_commands(
 ///
 /// e.g. `<plugin_dir>/commands/build/deploy.md` → `myplugin:build:deploy`
 fn command_name_from_file(path: &Path, plugin_name: &str) -> String {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("cmd");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cmd");
     format!("{}:{}", plugin_name, stem)
 }
 
-/// Pull the first non-empty line from a markdown file as a description.
+/// Read a short description from the first 4 KiB without loading the prompt body.
 fn extract_description_from_markdown_file(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines() {
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file.take(4096)).lines() {
+        let line = line.ok()?;
         let trimmed = line.trim_start_matches('#').trim();
         if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+            return Some(trimmed.chars().take(200).collect());
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_entrypoints_share_plugin_namespace_and_capability_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir_all(skills.join("review/references")).unwrap();
+        std::fs::write(
+            root.path().join("plugin.json"),
+            r#"{"name":"fixture","capabilities":["read_files"]}"#,
+        )
+        .unwrap();
+        std::fs::write(skills.join("review/SKILL.md"), "Review the change.").unwrap();
+        std::fs::write(
+            skills.join("review/references/example.md"),
+            "Reference material.",
+        )
+        .unwrap();
+        std::fs::write(skills.join("flat.md"), "Flat skill.").unwrap();
+        let mut plugin = try_load_from_path(root.path(), PluginSource::Project)
+            .unwrap()
+            .unwrap();
+        let defs = collect_command_defs(&plugin);
+        assert_eq!(defs.len(), 2);
+        let entry = defs
+            .iter()
+            .find(|def| def.name == "fixture:review")
+            .unwrap();
+        assert!(crate::check_plugin_capability(entry).is_ok());
+        assert!(
+            matches!(&entry.run_action, crate::plugin::CommandRunAction::MarkdownPrompt {
+            file_path, plugin_root,
+        } if Path::new(file_path) == skills.join("review/SKILL.md") && Path::new(plugin_root) == root.path())
+        );
+        plugin.manifest.capabilities = None;
+        let denied = collect_command_defs(&plugin);
+        assert!(denied
+            .iter()
+            .all(|def| crate::check_plugin_capability(def).is_err()));
+        assert!(denied
+            .iter()
+            .all(|def| matches!(def.description.as_str(), "Plugin skill" | "Plugin command")));
+    }
+
+    #[test]
+    fn metadata_descriptions_are_bounded_and_unicode_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("large.md");
+        std::fs::write(&file, format!("# {}\nBody.", "界".repeat(500))).unwrap();
+        let description = extract_description_from_markdown_file(&file).unwrap();
+        assert_eq!(description.chars().count(), 200);
+        assert!(description.chars().all(|c| c == '界'));
+        std::fs::write(
+            &file,
+            format!("{}Outside metadata window.", "\n".repeat(4096)),
+        )
+        .unwrap();
+        assert!(extract_description_from_markdown_file(&file).is_none());
+    }
 }

@@ -5,9 +5,8 @@
 // tasks, checking the status or output of a specific task, and cancelling a
 // running task.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{agent_tasks, background_processes, PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::tasks::{global_registry, TaskStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -43,7 +42,7 @@ impl Tool for MonitorTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
+        PermissionLevel::Execute
     }
 
     fn input_schema(&self) -> Value {
@@ -64,7 +63,7 @@ impl Tool for MonitorTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let parsed: MonitorInput = match serde_json::from_value(input) {
             Ok(v) => v,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -72,19 +71,19 @@ impl Tool for MonitorTool {
 
         match parsed.action {
             MonitorAction::List => {
-                let tasks = global_registry().list();
+                let mut tasks = background_processes::list(ctx).await;
+                tasks.extend(agent_tasks::list(ctx).await);
                 if tasks.is_empty() {
                     return ToolResult::success("No background tasks.");
                 }
                 let mut lines = vec!["Background tasks:".to_string()];
                 for t in &tasks {
-                    let status = match &t.status {
-                        TaskStatus::Running => "running".to_string(),
-                        TaskStatus::Completed => "completed".to_string(),
-                        TaskStatus::Failed(msg) => format!("failed: {}", msg),
-                        TaskStatus::Cancelled => "cancelled".to_string(),
-                    };
-                    lines.push(format!("  {} [{}] {}", t.id, status, t.name));
+                    lines.push(format!(
+                        "  {} [{}] {}",
+                        t["id"].as_str().unwrap_or("unknown"),
+                        t["status"].as_str().unwrap_or("unknown"),
+                        t["description"].as_str().unwrap_or("unknown")
+                    ));
                 }
                 ToolResult::success(lines.join("\n"))
             }
@@ -94,23 +93,16 @@ impl Tool for MonitorTool {
                     Some(id) => id,
                     None => return ToolResult::error("task_id required for status action"),
                 };
-                match global_registry().get(&id) {
-                    None => ToolResult::error(format!("Task {} not found", id)),
-                    Some(t) => {
-                        let status = match &t.status {
-                            TaskStatus::Running => "running".to_string(),
-                            TaskStatus::Completed => "completed (exit 0)".to_string(),
-                            TaskStatus::Failed(msg) => format!("failed: {}", msg),
-                            TaskStatus::Cancelled => "cancelled".to_string(),
-                        };
-                        ToolResult::success(format!(
-                            "Task: {}\nStatus: {}\nCommand: {}\nOutput lines: {}",
-                            t.id,
-                            status,
-                            t.name,
-                            t.output.len()
-                        ))
+                let status = if agent_tasks::contains(&id) {
+                    agent_tasks::status(&id, ctx).await
+                } else {
+                    background_processes::status(&id, ctx).await
+                };
+                match status {
+                    Ok(task) => {
+                        ToolResult::success(serde_json::to_string_pretty(&task).unwrap_or_default())
                     }
+                    Err(error) => ToolResult::error(error),
                 }
             }
 
@@ -119,16 +111,19 @@ impl Tool for MonitorTool {
                     Some(id) => id,
                     None => return ToolResult::error("task_id required for output action"),
                 };
-                match global_registry().get(&id) {
-                    None => ToolResult::error(format!("Task {} not found", id)),
-                    Some(t) => {
-                        let output = t.output.join("\n");
-                        if output.is_empty() {
-                            ToolResult::success("(no output yet)")
-                        } else {
-                            ToolResult::success(output)
-                        }
-                    }
+                let output = if agent_tasks::contains(&id) {
+                    agent_tasks::output(&id, ctx, true).await
+                } else {
+                    background_processes::output(&id, ctx, true).await
+                };
+                match output {
+                    Ok(task) => ToolResult::success(
+                        task["task"]["output"]
+                            .as_str()
+                            .filter(|output| !output.is_empty())
+                            .unwrap_or("(no output yet)"),
+                    ),
+                    Err(error) => ToolResult::error(error),
                 }
             }
 
@@ -137,41 +132,14 @@ impl Tool for MonitorTool {
                     Some(id) => id,
                     None => return ToolResult::error("task_id required for cancel action"),
                 };
-                match global_registry().get(&id) {
-                    None => ToolResult::error(format!("Task {} not found", id)),
-                    Some(t) => {
-                        if let TaskStatus::Running = t.status {
-                            // Kill by PID if available.
-                            if let Some(pid) = t.pid {
-                                // On Windows use taskkill; on Unix send SIGTERM.
-                                #[cfg(windows)]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .output();
-                                }
-                                #[cfg(unix)]
-                                {
-                                    use std::process::Command;
-                                    let _ = Command::new("kill")
-                                        .args(["-TERM", &pid.to_string()])
-                                        .output();
-                                }
-                            }
-                            // Signal the task's cancellation token (if any) and
-                            // mark it Cancelled. For an in-process background
-                            // agent this is what actually stops the running loop
-                            // (issue #219); the pid-kill above covers external
-                            // OS child processes.
-                            global_registry().cancel(&id);
-                            ToolResult::success(format!("Task {} cancelled.", id))
-                        } else {
-                            ToolResult::error(format!(
-                                "Task {} is not running (status: {})",
-                                id, t.status
-                            ))
-                        }
-                    }
+                let stop = if agent_tasks::contains(&id) {
+                    agent_tasks::stop(&id, ctx).await
+                } else {
+                    background_processes::stop(&id, ctx)
+                };
+                match stop {
+                    Ok(()) => ToolResult::success(format!("Task {} cancellation requested.", id)),
+                    Err(error) => ToolResult::error(error),
                 }
             }
         }
@@ -192,11 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn monitor_requires_execute_permission() {
+        assert_eq!(MonitorTool.permission_level(), PermissionLevel::Execute);
+    }
+
+    #[test]
     fn monitor_schema_has_action_and_task_id() {
         let schema = MonitorTool.input_schema();
         let props = &schema["properties"];
-        assert!(props["action"].is_object(), "schema should have 'action' property");
-        assert!(props["task_id"].is_object(), "schema should have 'task_id' property");
+        assert!(
+            props["action"].is_object(),
+            "schema should have 'action' property"
+        );
+        assert!(
+            props["task_id"].is_object(),
+            "schema should have 'task_id' property"
+        );
     }
 
     #[test]
@@ -215,7 +194,11 @@ mod tests {
         let ctx = make_test_ctx();
         let result = tool.execute(input, &ctx).await;
         // Either "No background tasks." or a list — both are successes.
-        assert!(!result.is_error, "list action should not return an error: {}", result.content);
+        assert!(
+            !result.is_error,
+            "list action should not return an error: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -248,12 +231,52 @@ mod tests {
         assert!(result.content.contains("not found"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn monitor_scopes_list_output_and_cancel_to_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut owner = make_test_ctx();
+        owner.working_dir = workspace.path().to_path_buf();
+        owner.session_id = "monitor-owner".to_string();
+        let mut foreign = make_test_ctx();
+        foreign.working_dir = workspace.path().to_path_buf();
+        foreign.session_id = "monitor-foreign".to_string();
+
+        let id = crate::background_processes::spawn(
+            "sleep 10".to_string(),
+            workspace.path().to_path_buf(),
+            30_000,
+            &owner,
+        )
+        .expect("owner can register a background process");
+        let tool = MonitorTool;
+
+        let listed = tool.execute(json!({"action": "list"}), &foreign).await;
+        assert!(!listed.is_error);
+        assert!(!listed.content.contains(&id));
+
+        let output = tool
+            .execute(json!({"action": "output", "task_id": id}), &foreign)
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not available"));
+
+        let cancel = tool
+            .execute(json!({"action": "cancel", "task_id": id}), &foreign)
+            .await;
+        assert!(cancel.is_error);
+        assert!(cancel.content.contains("not available"));
+
+        crate::background_processes::stop(&id, &owner).unwrap();
+        let _ = crate::background_processes::output(&id, &owner, true).await;
+    }
+
     fn make_test_ctx() -> ToolContext {
         use claurst_core::config::Config;
         use claurst_core::permissions::AutoPermissionHandler;
         use std::path::PathBuf;
-        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
 
         let handler = Arc::new(AutoPermissionHandler {
             mode: claurst_core::config::PermissionMode::Default,
@@ -277,6 +300,8 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            trusted_checker_catalog: Default::default(),
+            catalog_view: None,
         }
     }
 }

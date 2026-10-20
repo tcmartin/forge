@@ -17,8 +17,8 @@ export class ChatPanel {
       return ChatPanel.current;
     }
     const panel = vscode.window.createWebviewPanel(
-      'claurstChat',
-      'Claurst',
+      'forgeChat',
+      'Forge',
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')] },
     );
@@ -50,12 +50,12 @@ export class ChatPanel {
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
   <link href="${styleUri}" rel="stylesheet" />
-  <title>Claurst</title>
+  <title>Forge</title>
 </head>
 <body>
   <div id="messages"></div>
   <div id="input-row">
-    <textarea id="input-box" rows="1" placeholder="Ask claurst..."></textarea>
+    <textarea id="input-box" rows="1" placeholder="Ask Forge..."></textarea>
     <button id="send-btn" title="Send (Enter)">Send</button>
     <button id="stop-btn" title="Cancel the current turn">Stop</button>
   </div>
@@ -69,7 +69,7 @@ export class ChatPanel {
     // open — fall back to the user's home directory so the panel is always
     // usable, matching how a plain terminal session would behave.
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
-    const executablePath = vscode.workspace.getConfiguration('claurst').get<string>('executablePath', 'claurst');
+    const executablePath = vscode.workspace.getConfiguration('forge').get<string>('executablePath', 'forge');
 
     this.client = new AcpClient(executablePath, cwd, {
       onTextChunk: (text, isThought) => this.postToWebview({ type: 'textChunk', text, isThought }),
@@ -78,7 +78,7 @@ export class ChatPanel {
       onRequestPermission: (toolCall, options) => this.promptForPermission(toolCall, options),
       onStderr: (line) => this.outputChannel.appendLine(line),
       onExit: (code) => {
-        this.postToWebview({ type: 'status', text: `claurst process exited (code ${code ?? 'unknown'}).` });
+        this.postToWebview({ type: 'status', text: `Forge process exited (code ${code ?? 'unknown'}).` });
       },
     });
 
@@ -100,7 +100,7 @@ export class ChatPanel {
   private async promptForPermission(toolCall: ToolCallUpdate, options: PermissionOption[]): Promise<string | undefined> {
     const picked = await vscode.window.showQuickPick(
       options.map((o) => ({ label: o.name, description: o.kind, optionId: o.optionId })),
-      { placeHolder: toolCall.title ?? 'Claurst is requesting permission', ignoreFocusOut: true },
+      { placeHolder: toolCall.title ?? 'Forge is requesting permission', ignoreFocusOut: true },
     );
     return picked?.optionId;
   }
@@ -142,7 +142,7 @@ export class ChatPanel {
 
   private reportError(e: unknown): void {
     const message = e instanceof Error ? e.message : String(e);
-    this.outputChannel.appendLine(`[claurst-vscode] ${message}`);
+    this.outputChannel.appendLine(`[forge-vscode] ${message}`);
     this.postToWebview({ type: 'status', text: `Error: ${message}` });
   }
 

@@ -1,12 +1,11 @@
 // WebFetch tool: HTTP GET with HTML-to-text conversion and LLM-powered semantic extraction
 // for edge cases (JS-heavy pages, minimal content).
 
+use crate::evidence::EvidenceStore;
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::fs;
-use std::path::PathBuf;
 use tracing::{debug, warn};
 
 pub struct WebFetchTool;
@@ -19,53 +18,29 @@ struct WebFetchInput {
     prompt: Option<String>,
 }
 
-/// Compute a simple hash of the URL for cache purposes.
-fn url_hash(url: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+fn capture_evidence(ctx: &ToolContext, text: &str) -> Option<Value> {
+    EvidenceStore::for_context(ctx)
+        .and_then(|store| store.capture(text, false))
+        .map(|reference| json!(reference))
+        .map_err(|_| debug!("Failed to retain web observation"))
+        .ok()
 }
 
-/// Get the cache directory for web_fetch content.
-fn get_cache_dir() -> PathBuf {
-    claurst_core::config::Settings::config_dir().join("web_cache")
+fn safe_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
-/// Attempt to load cached extracted content for a URL.
-fn load_cached_extraction(url: &str) -> Option<String> {
-    let cache_dir = get_cache_dir();
-    let cache_file = cache_dir.join(format!("{}.txt", url_hash(url)));
-
-    if cache_file.exists() {
-        match fs::read_to_string(&cache_file) {
-            Ok(content) => {
-                debug!(file = ?cache_file, "Loaded cached web content");
-                return Some(content);
-            }
-            Err(e) => {
-                debug!(file = ?cache_file, error = %e, "Failed to load cache");
-            }
-        }
-    }
-    None
-}
-
-/// Save extracted content to cache.
-fn save_cached_extraction(url: &str, content: &str) {
-    let cache_dir = get_cache_dir();
-    if let Err(e) = fs::create_dir_all(&cache_dir) {
-        warn!(dir = ?cache_dir, error = %e, "Failed to create cache directory");
-        return;
-    }
-
-    let cache_file = cache_dir.join(format!("{}.txt", url_hash(url)));
-    if let Err(e) = fs::write(&cache_file, content) {
-        warn!(file = ?cache_file, error = %e, "Failed to write cache file");
-    } else {
-        debug!(file = ?cache_file, "Cached extracted web content");
-    }
+fn semantic_extraction_allowed(ctx: &ToolContext, prompt: Option<&str>) -> bool {
+    std::env::var("FORGE_ALLOW_WEB_EXTRACTION").as_deref() == Ok("1")
+        && prompt.is_some_and(|value| !value.trim().is_empty())
+        && ctx.config.selected_provider_id() == "anthropic"
 }
 
 /// Detect if HTML is likely a JS-heavy page with minimal semantic content.
@@ -79,9 +54,8 @@ fn is_edge_case_html(html: &str, extracted_text: &str) -> bool {
 
     // Check for semantic HTML tags
     let lower = html.to_lowercase();
-    let has_semantic = lower.contains("<article") ||
-                      lower.contains("<main") ||
-                      lower.contains("<body");
+    let has_semantic =
+        lower.contains("<article") || lower.contains("<main") || lower.contains("<body");
 
     if !has_semantic {
         debug!("Edge case: no semantic HTML tags");
@@ -91,27 +65,77 @@ fn is_edge_case_html(html: &str, extracted_text: &str) -> bool {
     false
 }
 
+const EXTRACTION_MODEL: &str = "claude-haiku-4-5";
+const EXTRACTION_OUTPUT_TOKENS: u32 = 2_000;
+
+fn extraction_wire_budget(
+    config: &claurst_core::config::Config,
+) -> Result<claurst_api::WireBudget, String> {
+    let explicit = config
+        .model_overrides
+        .get(&format!("anthropic/{EXTRACTION_MODEL}"))
+        .and_then(|entry| entry.context_window);
+    let registry = claurst_api::ModelRegistry::new();
+    let (context_limit, source) = match explicit {
+        Some(limit) => (u64::from(limit), "explicit"),
+        None => {
+            let limit = registry
+                .get("anthropic", EXTRACTION_MODEL)
+                .map(|entry| u64::from(entry.info.context_window))
+                .filter(|limit| *limit > 0 && *limit <= 100_000_000)
+                .ok_or_else(|| {
+                    "Web extraction model has no known finite context limit".to_string()
+                })?;
+            (limit, "registry")
+        }
+    };
+    if context_limit == 0 || context_limit > 100_000_000 {
+        return Err("Web extraction context override is invalid".into());
+    }
+    let output_reserve = u64::from(EXTRACTION_OUTPUT_TOKENS);
+    let input_limit = context_limit
+        .checked_sub(output_reserve)
+        .ok_or_else(|| "Web extraction context does not leave room for input".to_string())?;
+    claurst_api::WireBudget::finite(
+        context_limit,
+        input_limit,
+        output_reserve,
+        8 * 1024 * 1024,
+        claurst_api::MediaAccounting::None,
+    )
+    .and_then(|budget| budget.with_source(source))
+    .map_err(|error| error.to_string())
+}
+
 /// Call Claude Haiku to extract main content from HTML.
-async fn semantic_extraction(html: &str, ctx: &ToolContext) -> Option<String> {
+async fn semantic_extraction(html: &str, prompt: &str, ctx: &ToolContext) -> Option<String> {
+    let wire_budget = match extraction_wire_budget(&ctx.config) {
+        Ok(budget) => budget,
+        Err(_) => {
+            warn!("Skipping semantic extraction without a valid finite budget");
+            return None;
+        }
+    };
     // Try to create an Anthropic client from the config
     let client = match claurst_api::AnthropicClient::from_config(&ctx.config) {
         Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Failed to create Anthropic client for semantic extraction");
+        Err(_) => {
+            warn!("Failed to create Anthropic client for semantic extraction");
             return None;
         }
     };
 
     // Truncate HTML to avoid exceeding token limits
     let html_excerpt = if html.len() > 20000 {
-        format!("{}...", &html[..20000])
+        format!("{}...", safe_prefix(html, 20000))
     } else {
         html.to_string()
     };
 
     let system = "You are a content extraction expert. Given HTML, extract and return only the main text content. Return just plain text, no markdown or formatting.";
     let user_message = format!(
-        "Extract the main content from this HTML and return only the text:\n\n{}",
+        "{}\n\nExtract the main content from this HTML and return only the text:\n\n{}",
+        prompt.trim(),
         html_excerpt
     );
 
@@ -121,10 +145,12 @@ async fn semantic_extraction(html: &str, ctx: &ToolContext) -> Option<String> {
         content: serde_json::Value::String(user_message),
     }];
 
-    let request = claurst_api::CreateMessageRequest::builder("claude-haiku-4-5", 2000)
-        .messages(api_messages)
-        .system(claurst_api::SystemPrompt::Text(system.to_string()))
-        .build();
+    let request =
+        claurst_api::CreateMessageRequest::builder(EXTRACTION_MODEL, EXTRACTION_OUTPUT_TOKENS)
+            .wire_budget(wire_budget)
+            .messages(api_messages)
+            .system(claurst_api::SystemPrompt::Text(system.to_string()))
+            .build();
 
     match client.create_message(request).await {
         Ok(response) => {
@@ -139,15 +165,18 @@ async fn semantic_extraction(html: &str, ctx: &ToolContext) -> Option<String> {
             });
 
             if let Some(extracted) = text {
-                debug!(extracted_len = extracted.len(), "Semantic extraction successful");
+                debug!(
+                    extracted_len = extracted.len(),
+                    "Semantic extraction successful"
+                );
                 return Some(extracted);
             }
 
             warn!("No text block in semantic extraction response");
             None
         }
-        Err(e) => {
-            warn!(error = %e, "Semantic extraction API call failed");
+        Err(_) => {
+            warn!("Semantic extraction API call failed");
             None
         }
     }
@@ -182,9 +211,9 @@ fn strip_html(html: &str) -> String {
             }
             // Block tags => newline
             let block_tags = [
-                "<br", "<p ", "<p>", "</p>", "<div", "</div>", "<h1", "<h2", "<h3",
-                "<h4", "<h5", "<h6", "</h1", "</h2", "</h3", "</h4", "</h5", "</h6",
-                "<li", "</li", "<tr", "</tr", "<hr",
+                "<br", "<p ", "<p>", "</p>", "<div", "</div>", "<h1", "<h2", "<h3", "<h4", "<h5",
+                "<h6", "</h1", "</h2", "</h3", "</h4", "</h5", "</h6", "<li", "</li", "<tr",
+                "</tr", "<hr",
             ];
             for tag in &block_tags {
                 if rest.starts_with(tag) {
@@ -264,7 +293,9 @@ fn strip_html(html: &str) -> String {
 #[async_trait]
 impl Tool for WebFetchTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_WEB_FETCH
@@ -306,13 +337,13 @@ impl Tool for WebFetchTool {
         // Permission check
         if let Err(e) = ctx.check_permission(
             self.name(),
-            &format!("Fetch {}", params.url),
+            "Fetch requested web URL",
             true, // read-only
         ) {
             return ToolResult::error(e.to_string());
         }
 
-        debug!(url = %params.url, "Fetching web page");
+        debug!("Fetching web page");
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -324,21 +355,22 @@ impl Tool for WebFetchTool {
             Err(e) => return ToolResult::error(format!("Failed to create HTTP client: {}", e)),
         };
 
-        let resp = match client.get(&params.url)
-            .header("User-Agent", "Claude-Code/1.0")
+        let resp = match client
+            .get(&params.url)
+            .header(
+                "User-Agent",
+                concat!("Forge/", env!("CARGO_PKG_VERSION"), " (web-fetch)"),
+            )
             .send()
             .await
         {
             Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("Failed to fetch {}: {}", params.url, e)),
+            Err(_e) => return ToolResult::error("Failed to fetch requested URL"),
         };
 
         let status = resp.status();
         if !status.is_success() {
-            return ToolResult::error(format!(
-                "HTTP {} when fetching {}",
-                status, params.url
-            ));
+            return ToolResult::error(format!("HTTP {} when fetching requested URL", status));
         }
 
         let content_type = resp
@@ -350,46 +382,197 @@ impl Tool for WebFetchTool {
 
         let body = match resp.text().await {
             Ok(b) => b,
-            Err(e) => return ToolResult::error(format!("Failed to read response body: {}", e)),
+            Err(_) => return ToolResult::error("Failed to read response body"),
         };
 
-        // Try to load from cache first
-        if let Some(cached) = load_cached_extraction(&params.url) {
-            return ToolResult::success(cached);
-        }
+        let source_evidence = capture_evidence(ctx, &body);
 
-        // Convert HTML to text if applicable
+        // Convert HTML to text if applicable. Semantic extraction is opt-in:
+        // it requires the explicit environment switch, a non-empty prompt in
+        // this tool request, and the Anthropic provider that supports Haiku.
         let mut text = if content_type.contains("html") {
             strip_html(&body)
         } else {
             body.clone()
         };
+        let mut extraction = if content_type.contains("html") {
+            "deterministic_html"
+        } else {
+            "identity"
+        };
 
         // Detect and handle edge cases with semantic extraction
-        if content_type.contains("html") && is_edge_case_html(&body, &text) {
-            debug!(url = %params.url, "Attempting semantic extraction for edge case");
-            if let Some(extracted) = semantic_extraction(&body, ctx).await {
+        if content_type.contains("html")
+            && is_edge_case_html(&body, &text)
+            && semantic_extraction_allowed(ctx, params.prompt.as_deref())
+        {
+            debug!("Attempting opted-in semantic extraction for edge case");
+            if let Some(extracted) =
+                semantic_extraction(&body, params.prompt.as_deref().unwrap_or_default(), ctx).await
+            {
                 text = extracted;
+                extraction = "semantic_model";
             } else {
                 debug!("Semantic extraction failed, using basic HTML stripping");
             }
         }
 
+        let text_evidence = capture_evidence(ctx, &text);
+
         // Truncate very long content
         const MAX_LEN: usize = 100_000;
         let text = if text.len() > MAX_LEN {
             format!(
-                "{}\n\n... (truncated, {} total characters)",
-                &text[..MAX_LEN],
+                "{}\n\n... (truncated, {} total UTF-8 bytes)",
+                safe_prefix(&text, MAX_LEN),
                 text.len()
             )
         } else {
             text
         };
 
-        // Cache the final result
-        save_cached_extraction(&params.url, &text);
+        let mut provenance = json!({"extraction": extraction});
+        if let Some(reference) = source_evidence {
+            provenance["source_evidence"] = reference;
+        }
+        if let Some(reference) = text_evidence {
+            provenance["text_evidence"] = reference;
+        }
+        ToolResult::success(text).with_metadata(json!({"web_fetch": provenance}))
+    }
+}
 
-        ToolResult::success(text)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_responses(
+        responses: Vec<(String, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let server = tokio::spawn(async move {
+            for (body, content_type) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 8192];
+                let length = stream.read(&mut buffer).await.unwrap();
+                captured
+                    .lock()
+                    .push(String::from_utf8_lossy(&buffer[..length]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            captured.lock().clone()
+        });
+        let url = format!("http://{address}/fixture");
+        (url, server)
+    }
+
+    fn context(tempdir: &TempDir) -> ToolContext {
+        let mut ctx = allow_all_context(tempdir.path().to_path_buf());
+        // The default test configuration is Anthropic-compatible, while this
+        // fixture proves deterministic HTML conversion does not make an
+        // auxiliary model call under another configured provider.
+        ctx.config.provider = Some("openai".to_string());
+        ctx
+    }
+
+    #[test]
+    fn extraction_budget_honors_finite_override_and_rejects_invalid_pin() {
+        let mut config = claurst_core::config::Config::default();
+        config.model_overrides.insert(
+            format!("anthropic/{EXTRACTION_MODEL}"),
+            claurst_core::config::ModelOverride {
+                context_window: Some(12_000),
+                ..Default::default()
+            },
+        );
+        let budget = extraction_wire_budget(&config).unwrap();
+        assert_eq!(budget.context_limit_tokens, 12_000);
+        assert_eq!(budget.input_limit_tokens, 10_000);
+        assert_eq!(budget.budget_source, "explicit");
+        assert_eq!(budget.media, claurst_api::MediaAccounting::None);
+        config
+            .model_overrides
+            .get_mut(&format!("anthropic/{EXTRACTION_MODEL}"))
+            .unwrap()
+            .context_window = Some(0);
+        assert!(extraction_wire_budget(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn large_utf8_response_keeps_source_and_normalized_evidence() {
+        let middle = "中".repeat(60_000);
+        let body = format!("<html><body>head {middle} MIDDLE tail</body></html>");
+        let (url, server) = serve_responses(vec![(body.clone(), "text/html".to_string())]).await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = context(&tempdir);
+
+        let result = WebFetchTool.execute(json!({"url": url}), &ctx).await;
+        let _requests = server.await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.len() <= 100_000 + 80);
+        let provenance = &result.metadata.unwrap()["web_fetch"];
+        assert_eq!(provenance["extraction"], "deterministic_html");
+        let source_id = provenance["source_evidence"]["id"].as_str().unwrap();
+        let text_id = provenance["text_evidence"]["id"].as_str().unwrap();
+        let store = EvidenceStore::for_context(&ctx).unwrap();
+        let (_, source) = store.read(source_id).unwrap();
+        let (_, normalized) = store.read(text_id).unwrap();
+        assert_eq!(source, body);
+        assert!(normalized.contains("MIDDLE"));
+        assert!(normalized.ends_with("tail"));
+    }
+
+    #[tokio::test]
+    async fn fresh_response_is_not_replaced_by_stale_cached_text() {
+        let (url, server) = serve_responses(vec![
+            ("fresh-one".to_string(), "text/plain".to_string()),
+            ("fresh-two".to_string(), "text/plain".to_string()),
+        ])
+        .await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = context(&tempdir);
+
+        let first = WebFetchTool.execute(json!({"url": url}), &ctx).await;
+        let second = WebFetchTool.execute(json!({"url": url}), &ctx).await;
+        let requests = server.await.unwrap();
+
+        assert!(first.content.starts_with("fresh-one"));
+        assert!(second.content.starts_with("fresh-two"));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn default_small_html_is_one_get_without_auxiliary_inference() {
+        let (url, server) = serve_responses(vec![(
+            "<html><body>Hello fixture</body></html>".to_string(),
+            "text/html".to_string(),
+        )])
+        .await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = context(&tempdir);
+
+        let result = WebFetchTool.execute(json!({"url": url}), &ctx).await;
+        let requests = server.await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.starts_with("Hello fixture"));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /fixture HTTP/1.1"));
+        let headers = requests[0].to_ascii_lowercase();
+        assert!(headers.contains("user-agent: forge/"));
+        assert!(!requests[0].contains("Claude-Code"));
     }
 }

@@ -11,22 +11,27 @@
 // - list_models via GET /v1beta/models
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use claurst_core::provider_id::ProviderId;
-use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo};
+use claurst_core::types::{
+    ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo,
+};
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::error_handling::parse_error_response as parse_http_error;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamEvent, SystemPrompt, SystemPromptStyle,
 };
+use crate::provider_wire::{preflight_provider_request, tool_result_text};
 
 use super::request_options::merge_google_options;
 
@@ -39,6 +44,7 @@ pub struct GoogleProvider {
     api_key: String,
     base_url: String,
     http_client: reqwest::Client,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl GoogleProvider {
@@ -48,7 +54,31 @@ impl GoogleProvider {
             api_key,
             base_url: "https://generativelanguage.googleapis.com".to_string(),
             http_client: reqwest::Client::new(),
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Override the API base URL while retaining the Google REST path layout.
+    /// The default remains the public Generative Language endpoint.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -57,22 +87,27 @@ impl GoogleProvider {
 
     /// Returns true if the model supports thinking config (Gemini 2.5+ / 3.0+).
     fn supports_thinking(model: &str) -> bool {
-        model.contains("2.5") || model.contains("3.0") || model.contains("3.1") || model.contains("gemini-3")
+        model.contains("2.5")
+            || model.contains("3.0")
+            || model.contains("3.1")
+            || model.contains("gemini-3")
     }
 
     /// Build the full generateContent URL for non-streaming.
     fn generate_url(&self, model: &str) -> String {
         format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.base_url, model, self.api_key
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url.trim_end_matches('/'),
+            model
         )
     }
 
     /// Build the full streamGenerateContent URL for streaming.
     fn stream_url(&self, model: &str) -> String {
         format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, model, self.api_key
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url.trim_end_matches('/'),
+            model
         )
     }
 
@@ -87,7 +122,11 @@ impl GoogleProvider {
                 }
             })
             .collect();
-        let base = if sanitized.is_empty() { "tool" } else { sanitized.as_str() };
+        let base = if sanitized.is_empty() {
+            "tool"
+        } else {
+            sanitized.as_str()
+        };
         if occurrence == 0 {
             format!("call_{}", base)
         } else {
@@ -144,12 +183,16 @@ impl GoogleProvider {
                             "mimeType": mime
                         }
                     }))
-                } else { source.url.as_ref().map(|url| json!({
-                        "fileData": {
-                            "fileUri": url,
-                            "mimeType": source.media_type.as_deref().unwrap_or("image/jpeg")
-                        }
-                    })) }
+                } else {
+                    source.url.as_ref().map(|url| {
+                        json!({
+                            "fileData": {
+                                "fileUri": url,
+                                "mimeType": source.media_type.as_deref().unwrap_or("image/jpeg")
+                            }
+                        })
+                    })
+                }
             }
 
             ContentBlock::ToolUse {
@@ -187,12 +230,14 @@ impl GoogleProvider {
                             "mimeType": mime
                         }
                     }))
-                } else { source.url.as_ref().map(|url| json!({
+                } else {
+                    source.url.as_ref().map(|url| json!({
                         "fileData": {
                             "fileUri": url,
                             "mimeType": source.media_type.as_deref().unwrap_or("application/pdf")
                         }
-                    })) }
+                    }))
+                }
             }
 
             // Render UI-only / metadata blocks as text so context is not lost.
@@ -208,10 +253,16 @@ impl GoogleProvider {
             ContentBlock::SystemAPIError { message, .. } => Some(json!({
                 "text": format!("[error] {}", message)
             })),
-            ContentBlock::CollapsedReadSearch { tool_name, paths, .. } => Some(json!({
+            ContentBlock::CollapsedReadSearch {
+                tool_name, paths, ..
+            } => Some(json!({
                 "text": format!("[{}] {}", tool_name, paths.join(", "))
             })),
-            ContentBlock::TaskAssignment { id, subject, description } => Some(json!({
+            ContentBlock::TaskAssignment {
+                id,
+                subject,
+                description,
+            } => Some(json!({
                 "text": format!("[task:{}] {}: {}", id, subject, description)
             })),
 
@@ -224,28 +275,46 @@ impl GoogleProvider {
     fn tool_result_to_part(tool_name: &str, content: &ToolResultContent) -> Value {
         let response_content = match content {
             ToolResultContent::Text(t) => json!({ "content": t }),
-            ToolResultContent::Blocks(blocks) => {
-                // Concatenate all text blocks for the response payload.
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                json!({ "content": text })
+            ToolResultContent::Blocks(_) => {
+                json!({ "content": tool_result_text(content) })
             }
         };
-        json!({
+        let mut result = json!({
             "functionResponse": {
                 "name": tool_name,
                 "response": response_content
             }
-        })
+        });
+        let mut images = Vec::new();
+        Self::append_result_images(content, &mut images, 0);
+        if !images.is_empty() {
+            // GenerateContent supports native multimodal function responses
+            // on the explicitly mapped Gemini 3 profiles. Preflight rejects
+            // this placement on earlier models before building the body.
+            result["functionResponse"]["parts"] = Value::Array(images);
+        }
+        result
+    }
+
+    fn append_result_images(content: &ToolResultContent, parts: &mut Vec<Value>, depth: usize) {
+        if depth > claurst_core::media::MediaLimits::default().max_nesting {
+            return;
+        }
+        if let ToolResultContent::Blocks(blocks) = content {
+            for block in blocks {
+                match block {
+                    ContentBlock::Image { .. } => {
+                        if let Some(part) = Self::content_block_to_part(block) {
+                            parts.push(part);
+                        }
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        Self::append_result_images(content, parts, depth + 1);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Sanitize a JSON Schema object for Google's stricter requirements:
@@ -303,11 +372,7 @@ impl GoogleProvider {
 
                         let filtered: Vec<Value> = req_arr
                             .into_iter()
-                            .filter(|v| {
-                                v.as_str()
-                                    .map(|s| prop_keys.contains(s))
-                                    .unwrap_or(false)
-                            })
+                            .filter(|v| v.as_str().map(|s| prop_keys.contains(s)).unwrap_or(false))
                             .collect();
                         map.insert("required".to_string(), Value::Array(filtered));
                     }
@@ -322,8 +387,10 @@ impl GoogleProvider {
                     if let Some(items) = map.get_mut("items") {
                         if let Value::Object(ref mut items_map) = items {
                             if !items_map.contains_key("type") {
-                                items_map
-                                    .insert("type".to_string(), Value::String("string".to_string()));
+                                items_map.insert(
+                                    "type".to_string(),
+                                    Value::String("string".to_string()),
+                                );
                             }
                             // Recurse sanitize into items.
                             let sanitized = Self::sanitize_schema(Value::Object(items_map.clone()));
@@ -430,18 +497,12 @@ impl GoogleProvider {
 
         // ---- Generation config ----
         let mut gen_config = serde_json::Map::new();
-        gen_config.insert(
-            "maxOutputTokens".to_string(),
-            json!(request.max_tokens),
-        );
+        gen_config.insert("maxOutputTokens".to_string(), json!(request.max_tokens));
         if let Some(temp) = request.temperature {
             gen_config.insert("temperature".to_string(), json!(temp));
         }
         if !request.stop_sequences.is_empty() {
-            gen_config.insert(
-                "stopSequences".to_string(),
-                json!(request.stop_sequences),
-            );
+            gen_config.insert("stopSequences".to_string(), json!(request.stop_sequences));
         }
         if let Some(top_p) = request.top_p {
             gen_config.insert("topP".to_string(), json!(top_p));
@@ -469,10 +530,7 @@ impl GoogleProvider {
         // ---- Assemble body ----
         let mut body = serde_json::Map::new();
         body.insert("contents".to_string(), Value::Array(contents));
-        body.insert(
-            "generationConfig".to_string(),
-            Value::Object(gen_config),
-        );
+        body.insert("generationConfig".to_string(), Value::Object(gen_config));
         if let Some(si) = system_instruction {
             body.insert("systemInstruction".to_string(), si);
         }
@@ -593,7 +651,6 @@ impl GoogleProvider {
             cache_read_input_tokens: 0,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -614,24 +671,31 @@ impl LlmProvider for GoogleProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let selected = preflight_provider_request("google", &request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
         let url = self.generate_url(&request.model);
         let model = request.model.clone();
         let body = self.build_request_body(&request);
 
-        debug!("Google create_message: POST {}", url);
+        debug!("Google create_message: POST generateContent");
+        let prepared = selected
+            .prepare_json(&url, false, &body)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = self
             .http_client
             .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::ServerError {
                 provider: self.id.clone(),
                 status: None,
-                message: e.to_string(),
+                message: e.without_url().to_string(),
                 is_retryable: true,
             })?;
 
@@ -639,7 +703,7 @@ impl LlmProvider for GoogleProvider {
         let resp_body = resp.text().await.map_err(|e| ProviderError::ServerError {
             provider: self.id.clone(),
             status: Some(status),
-            message: e.to_string(),
+            message: e.without_url().to_string(),
             is_retryable: true,
         })?;
 
@@ -661,37 +725,42 @@ impl LlmProvider for GoogleProvider {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let selected = preflight_provider_request("google", &request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
         let url = self.stream_url(&request.model);
         let model = request.model.clone();
         let body = self.build_request_body(&request);
 
-        debug!("Google create_message_stream: POST {}", url);
+        debug!("Google create_message_stream: POST streamGenerateContent");
+        let prepared = selected
+            .prepare_json(&url, true, &body)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let admission = self.acquire_inference().await?;
         let resp = self
             .http_client
             .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::ServerError {
                 provider: self.id.clone(),
                 status: None,
-                message: e.to_string(),
+                message: e.without_url().to_string(),
                 is_retryable: true,
             })?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
-            let resp_body =
-                resp.text()
-                    .await
-                    .unwrap_or_else(|_| "<unreadable>".to_string());
+            let resp_body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(self.parse_error_response(status, &resp_body));
         }
 
@@ -725,7 +794,7 @@ impl LlmProvider for GoogleProvider {
                     Err(e) => {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id_for_stream.clone(),
-                            message: e.to_string(),
+                            message: e.without_url().to_string(),
                             partial_response: None,
                         });
                         return;
@@ -746,7 +815,7 @@ impl LlmProvider for GoogleProvider {
                         let parsed: Value = match serde_json::from_str(data) {
                             Ok(v) => v,
                             Err(e) => {
-                                warn!("Google SSE: JSON parse error: {}: {}", e, data);
+                                warn!(error_kind = ?e.classify(), "Google SSE: invalid JSON event");
                                 continue;
                             }
                         };
@@ -915,13 +984,13 @@ impl LlmProvider for GoogleProvider {
             }
         };
 
-        Ok(Box::pin(stream))
+        Ok(crate::inference_admission::hold_stream(stream, admission))
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         // Lightweight liveness probe: a models-listing GET on the live endpoint.
         // (Model *listing* for the picker comes from the catalog, not here.)
-        let url = format!("{}/v1beta/models?key={}", self.base_url, self.api_key);
+        let url = format!("{}/v1beta/models", self.base_url.trim_end_matches('/'));
         let resp = self
             .http_client
             .get(&url)
@@ -934,19 +1003,17 @@ impl LlmProvider for GoogleProvider {
                 let status = r.status().as_u16();
                 let body = r.text().await.unwrap_or_default();
                 match self.parse_error_response(status, &body) {
-                    ProviderError::AuthFailed { message, .. } => {
-                        Err(ProviderError::AuthFailed {
-                            provider: self.id.clone(),
-                            message,
-                        })
-                    }
+                    ProviderError::AuthFailed { message, .. } => Err(ProviderError::AuthFailed {
+                        provider: self.id.clone(),
+                        message,
+                    }),
                     e => Ok(ProviderStatus::Unavailable {
                         reason: e.to_string(),
                     }),
                 }
             }
             Err(e) => Ok(ProviderStatus::Unavailable {
-                reason: e.to_string(),
+                reason: e.without_url().to_string(),
             }),
         }
     }
@@ -957,9 +1024,9 @@ impl LlmProvider for GoogleProvider {
             tool_calling: true,
             thinking: true,
             image_input: true,
-            pdf_input: true,
+            pdf_input: false,
             audio_input: false,
-            video_input: true,
+            video_input: false,
             caching: false,
             structured_output: true,
             system_prompt_style: SystemPromptStyle::SystemInstruction,
@@ -1015,7 +1082,30 @@ mod tests {
             stop_sequences: vec![],
             thinking: None,
             provider_options: json!({}),
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: None,
+            dispatch: None,
         }
+    }
+
+    #[test]
+    fn configured_base_retargets_generate_stream_and_health_paths() {
+        let provider = GoogleProvider::new("test".to_string())
+            .with_base_url("http://127.0.0.1:43123/fixture/");
+
+        assert_eq!(
+            provider.generate_url("gemini-3-flash-preview"),
+            "http://127.0.0.1:43123/fixture/v1beta/models/gemini-3-flash-preview:generateContent"
+        );
+        assert_eq!(
+            provider.stream_url("gemini-3-flash-preview"),
+            "http://127.0.0.1:43123/fixture/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            format!("{}/v1beta/models", provider.base_url.trim_end_matches('/')),
+            "http://127.0.0.1:43123/fixture/v1beta/models"
+        );
     }
 
     #[test]
@@ -1066,8 +1156,103 @@ mod tests {
         assert_eq!(contents.len(), 3);
         assert_eq!(contents[0]["role"], json!("user"));
         assert_eq!(contents[0]["parts"][0]["text"], json!("before"));
-        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], json!("search"));
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            json!("search")
+        );
         assert_eq!(contents[2]["parts"][0]["text"], json!("after"));
+    }
+
+    #[test]
+    fn function_response_text_keeps_empty_and_nested_slots_without_newlines() {
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_nested".into(),
+                name: "search".into(),
+                input: json!({}),
+                thought_signature: None,
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_nested".into(),
+                content: ToolResultContent::Blocks(vec![
+                    ContentBlock::Text { text: "a".into() },
+                    ContentBlock::Text {
+                        text: String::new(),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "inner".into(),
+                        content: ToolResultContent::Blocks(vec![
+                            ContentBlock::Text { text: "é".into() },
+                            ContentBlock::Text { text: "b".into() },
+                        ]),
+                        is_error: None,
+                    },
+                ]),
+                is_error: None,
+            }]),
+        ]);
+
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"]["content"],
+            "aéb"
+        );
+    }
+
+    #[test]
+    fn native_function_image_parts_bind_to_selected_content_and_model() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        let provider = GoogleProvider::new("fixture-key".into());
+        let mut request = test_request(vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_Read".into(),
+                name: "Read".into(),
+                input: json!({}),
+                thought_signature: None,
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_Read".into(),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                    source: claurst_core::types::ImageSource {
+                        source_type: "base64".into(),
+                        media_type: Some("image/png".into()),
+                        data: Some(PNG.into()),
+                        url: None,
+                    },
+                }]),
+                is_error: None,
+            }]),
+        ]);
+        request.wire_budget = Some(
+            crate::WireBudget::finite(30_000, 20_000, 1_000, 50_000, crate::MediaAccounting::None)
+                .unwrap(),
+        );
+        let selected = preflight_provider_request("google", &request).unwrap();
+        let body = provider.build_request_body(&request);
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(response["name"], "Read");
+        assert_eq!(response["parts"][0]["inlineData"]["data"], PNG);
+        let prepared = selected
+            .prepare_json("/generateContent", false, &body)
+            .unwrap();
+        assert!(
+            matches!(prepared.media(), crate::MediaAccounting::Images(images) if images.tokens()==1120)
+        );
+        let mut dropped = body.clone();
+        dropped["contents"][1]["parts"][0]["functionResponse"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parts");
+        assert!(matches!(
+            selected.prepare_json("/generateContent", false, &dropped),
+            Err(crate::WireBudgetError::MediaMismatch)
+        ));
+        request.model = "gemini-2.5-flash".into();
+        assert!(matches!(
+            preflight_provider_request("google", &request),
+            Err(crate::WireBudgetError::UnsupportedMedia)
+        ));
     }
 
     #[test]
@@ -1253,3 +1438,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "google_privacy_tests.rs"]
+mod privacy_tests;

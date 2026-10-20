@@ -30,7 +30,10 @@ pub enum DisplayMessage {
     /// A real conversation turn.
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
-    System { text: String, style: SystemMessageStyle },
+    System {
+        text: String,
+        style: SystemMessageStyle,
+    },
 }
 
 /// Context menu state: position and currently selected item index.
@@ -242,4 +245,3 @@ pub fn recent_session_label(title: Option<String>, last_prompt: Option<String>) 
         .or_else(|| last_prompt.and_then(pick))
         .unwrap_or_else(|| "(untitled)".to_string())
 }
-

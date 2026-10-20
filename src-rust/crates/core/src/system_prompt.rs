@@ -5,8 +5,8 @@
 //! volatile, session-specific sections follow it.
 
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Dynamic boundary marker
@@ -47,7 +47,11 @@ pub struct SystemPromptSection {
 impl SystemPromptSection {
     /// Create a memoizable (cacheable) section.
     pub fn cached(tag: &'static str, content: impl Into<String>) -> Self {
-        Self { tag, content: Some(content.into()), cache_break: false }
+        Self {
+            tag,
+            content: Some(content.into()),
+            cache_break: false,
+        }
     }
 
     /// Create a volatile section that re-evaluates every turn.
@@ -97,9 +101,9 @@ impl OutputStyle {
                 "Be maximally concise. Skip preamble, summaries, and filler. \
                 Lead with the answer. One sentence is better than three.",
             ),
-            OutputStyle::Formal => Some(
-                "Maintain a formal, professional tone. Use precise technical language.",
-            ),
+            OutputStyle::Formal => {
+                Some("Maintain a formal, professional tone. Use precise technical language.")
+            }
             OutputStyle::Casual => Some("Use a casual, conversational tone."),
             OutputStyle::Default => None,
         }
@@ -174,14 +178,14 @@ impl SystemPromptPrefix {
     pub fn attribution_text(self) -> &'static str {
         match self {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
-                "You are Claurst, Anthropic's official CLI for Claude."
+                "You are Forge, an independent open-source coding assistant."
             }
             Self::SdkPreset => {
-                "You are Claurst, Anthropic's official CLI for Claude, \
-                running within the Claude Agent SDK."
+                "You are Forge, an independent open-source coding assistant, \
+                running in headless mode."
             }
             Self::Sdk => {
-                "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+                "You are Forge, an independent open-source coding assistant in headless mode."
             }
         }
     }
@@ -227,9 +231,8 @@ pub struct SystemPromptOptions {
     /// When `Some`, the "Tool use guidelines" section only emits the
     /// per-tool guidance blocks for tools present in this list, so we don't
     /// pay the fixed prompt tax for guidance about tools that aren't loaded.
-    /// When `None` (the default), the enabled set is treated as *unknown* and
-    /// all per-tool guidance is emitted — preserving the previous behaviour
-    /// for callers that don't yet thread the tool list through.
+    /// When `None` (the default), the enabled set is unknown and no
+    /// tool-specific claim is emitted.
     pub enabled_tools: Option<Vec<String>>,
 }
 
@@ -251,14 +254,9 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         }
     }
 
-    let prefix = opts
-        .prefix
-        .unwrap_or_else(|| {
-            SystemPromptPrefix::detect(
-                opts.is_non_interactive,
-                opts.has_append_system_prompt,
-            )
-        });
+    let prefix = opts.prefix.unwrap_or_else(|| {
+        SystemPromptPrefix::detect(opts.is_non_interactive, opts.has_append_system_prompt)
+    });
 
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
@@ -320,10 +318,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // 12. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
-        parts.push(format!(
-            "\n<memory>\n{}\n</memory>",
-            opts.memory_content
-        ));
+        parts.push(format!("\n<memory>\n{}\n</memory>", opts.memory_content));
     }
 
     // 13. Active goal addendum (dynamic — changes each session)
@@ -472,15 +467,9 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
 const CORE_CAPABILITIES: &str = r#"
 ## Capabilities
 
-You have access to powerful tools for software engineering tasks:
-- **Read/Write files**: Read any file, write new files, edit existing files with precise diffs
-- **Execute commands**: Run bash commands, PowerShell scripts, background processes
-- **Search**: Glob patterns, regex grep, web search, file content search
-- **Web**: Fetch URLs, search the internet
-- **Agents**: Spawn parallel sub-agents for complex multi-step work
-- **Memory**: Persistent notes across sessions via the memory system
-- **MCP servers**: Connect to external tools and APIs via Model Context Protocol
-- **Jupyter notebooks**: Read and edit notebook cells
+Your callable capabilities are exactly the tools presented with the current
+request. Treat a tool that is absent from that inventory as unavailable for
+this turn.
 
 ## How to approach tasks
 
@@ -505,6 +494,7 @@ You have access to powerful tools for software engineering tasks:
 /// Tools we ship a dedicated guideline block for, in the order they should
 /// appear.  A tool not in this list simply contributes no per-tool guidance.
 const GUIDELINE_TOOLS: &[&str] = &[
+    "ToolSearch",
     "Bash",
     "Read",
     "Edit",
@@ -523,8 +513,9 @@ const GUIDELINE_TOOLS: &[&str] = &[
 /// The per-tool guidance line for `tool`, or `None` if we ship no block for it.
 fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
     Some(match tool {
+        "ToolSearch" => "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one.",
         "Bash" => "- Bash commands time out after 2 minutes; use background mode for long-running operations.",
-        "Read" => "- Read a file with the Read tool before editing it; Read also handles images and large files.",
+        "Read" => "- Read a file with the Read tool before editing it; Read supports text plus PNG and JPEG images.",
         "Edit" => "- For edits, read the file first, then make targeted string replacements with Edit.",
         "Write" => "- Use Write to create new files or fully overwrite; prefer Edit for partial changes.",
         "Glob" => "- To find files by name or pattern, prefer the Glob tool over `find`/`ls`.",
@@ -544,7 +535,7 @@ fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
 ///
 /// `enabled` is the set of tool names active for the session:
 /// * `Some(names)` → emit per-tool blocks only for tools in `names`.
-/// * `None` → enabled set unknown; emit every per-tool block (backwards-compatible behaviour).
+/// * `None` → enabled set unknown; emit no per-tool claims.
 ///
 /// The general, tool-agnostic guidance is always emitted unchanged.
 fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
@@ -556,13 +547,11 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
             .to_string(),
         "- Parallelize independent tool calls by issuing them together in a single response."
             .to_string(),
-        "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
-            .to_string(),
     ];
 
     for &tool in GUIDELINE_TOOLS {
         let include = match enabled {
-            None => true,
+            None => false,
             Some(names) => names.iter().any(|n| n == tool),
         };
         if include {
@@ -632,7 +621,10 @@ mod tests {
     #[test]
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
-        assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
+        assert!(
+            prompt.contains("Forge"),
+            "Default prompt must contain attribution"
+        );
     }
 
     #[test]
@@ -722,26 +714,26 @@ mod tests {
     fn test_sdk_prefix_non_interactive_no_append() {
         let prefix = SystemPromptPrefix::detect(true, false);
         assert_eq!(prefix, SystemPromptPrefix::Sdk);
-        assert!(prefix.attribution_text().contains("Claude agent"));
+        assert!(prefix.attribution_text().contains("Forge"));
     }
 
     #[test]
     fn test_sdk_preset_prefix_non_interactive_with_append() {
         let prefix = SystemPromptPrefix::detect(true, true);
         assert_eq!(prefix, SystemPromptPrefix::SdkPreset);
-        assert!(prefix.attribution_text().contains("Claude Agent SDK"));
+        assert!(prefix.attribution_text().contains("headless mode"));
     }
 
     #[test]
-    fn test_no_enabled_set_emits_all_tool_guidelines() {
-        // enabled_tools = None (default) → every per-tool block is emitted.
+    fn test_unknown_enabled_set_omits_tool_specific_claims() {
+        // enabled_tools = None (default) means the inventory is unknown.
         let prompt = build_system_prompt(&default_opts());
-        assert!(prompt.contains("Bash commands time out"));
-        assert!(prompt.contains("prefer the Grep tool"));
-        assert!(prompt.contains("prefer the Glob tool"));
-        assert!(prompt.contains("Read a file with the Read tool"));
-        assert!(prompt.contains("Use WebSearch"));
-        // General guidance is always present.
+        assert!(!prompt.contains("Bash commands time out"));
+        assert!(!prompt.contains("prefer the Grep tool"));
+        assert!(!prompt.contains("prefer the Glob tool"));
+        assert!(!prompt.contains("Read a file with the Read tool"));
+        assert!(!prompt.contains("Use WebSearch"));
+        assert!(!prompt.contains("use ToolSearch"));
         assert!(prompt.contains("Parallelize independent tool calls"));
     }
 
@@ -784,6 +776,37 @@ mod tests {
         // General, tool-agnostic guidance stays regardless of the enabled set.
         assert!(prompt.contains("## Tool use guidelines"));
         assert!(prompt.contains("Parallelize independent tool calls"));
+        assert!(prompt.contains("Your callable capabilities are exactly the tools presented"));
+        assert!(prompt.contains("absent from that inventory as unavailable"));
+        assert!(!prompt.contains("MCP servers"));
+        assert!(!prompt.contains("Jupyter notebooks"));
+        assert!(!prompt.contains("Execute commands"));
+        assert!(!prompt.contains("use ToolSearch"));
+    }
+
+    #[test]
+    fn test_tool_search_guidance_requires_tool_search() {
+        let absent = build_system_prompt(&SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string()]),
+            ..Default::default()
+        });
+        assert!(!absent.contains("use ToolSearch"));
+
+        let present = build_system_prompt(&SystemPromptOptions {
+            enabled_tools: Some(vec!["ToolSearch".to_string()]),
+            ..Default::default()
+        });
+        assert!(present.contains("use ToolSearch"));
+    }
+
+    #[test]
+    fn test_read_guideline_names_only_supported_image_formats() {
+        let prompt = build_system_prompt(&SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string()]),
+            ..Default::default()
+        });
+        assert!(prompt.contains("PNG and JPEG images"));
+        assert!(!prompt.contains("PDF"));
     }
 
     #[test]

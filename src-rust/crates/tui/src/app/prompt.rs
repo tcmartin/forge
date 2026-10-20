@@ -1,9 +1,9 @@
 //! Prompt input state machine and voice hold-to-talk.
 
+use super::commands::PROMPT_SLASH_COMMANDS;
+use super::App;
 use crate::overlays::SelectorMessage;
 use crate::prompt_input::InputMode;
-use super::App;
-use super::commands::PROMPT_SLASH_COMMANDS;
 
 impl App {
     /// Open the rewind flow with the current message list converted to
@@ -54,7 +54,11 @@ impl App {
         }
         let file_autocomplete_limit = self.config.file_autocomplete_limit;
         let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS, file_autocomplete_limit, file_autocomplete_show_hidden);
+        self.prompt_input.update_suggestions(
+            PROMPT_SLASH_COMMANDS,
+            file_autocomplete_limit,
+            file_autocomplete_show_hidden,
+        );
         self.sync_legacy_prompt_fields();
     }
 
@@ -83,7 +87,8 @@ impl App {
                 }
             });
         }
-        self.status_message = Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
+        self.status_message =
+            Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
     }
 
     /// Stop PTT recording: flip the AtomicBool inside VoiceRecorder so the
@@ -153,5 +158,4 @@ impl App {
             }
         }
     }
-
 }

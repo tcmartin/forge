@@ -3,6 +3,10 @@ name = "claurst-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+a016-openai-loopback = []
+
 [dependencies]
 claurst-core = { workspace = true }
 tokio = { workspace = true }

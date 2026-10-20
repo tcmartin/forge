@@ -1,35 +1,32 @@
 {
-  "name": "claurst",
+  "name": "forge-coding-agent-local",
   "version": "0.1.7",
-  "description": "Open-source, multi-provider terminal coding agent built in Rust",
+  "private": true,
+  "description": "Local package for the Forge terminal coding agent",
   "license": "GPL-3.0-only",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Kuberwastaken/claurst.git"
-  },
-  "homepage": "https://claurst.kuber.studio",
-  "bugs": {
-    "url": "https://github.com/kuberwastaken/claurst/issues"
-  },
+  "author": "Forge hard-fork maintainers",
+  "contributors": [
+    "Kuber Mehta (original Claurst author)"
+  ],
   "keywords": [
     "ai",
     "coding-agent",
-    "claude",
-    "anthropic",
     "terminal",
     "tui",
-    "rust"
+    "rust",
+    "forge"
   ],
-  "author": "Kuber Mehta",
   "bin": {
-    "claurst": "bin/claurst"
+    "forge": "bin/forge"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node test/install.test.js"
   },
   "files": [
     "bin/",
     "install.js",
+    "native.js",
     "README.md"
   ],
   "engines": {

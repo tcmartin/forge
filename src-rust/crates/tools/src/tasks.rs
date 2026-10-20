@@ -1,10 +1,13 @@
-// Task management tools: TaskCreate, TaskGet, TaskUpdate, TaskList, TaskStop, TaskOutput.
+// Task management tools: TaskCreate, TaskGet, TaskUpdate, TaskList, TaskStop, TaskOutput,
+// TaskAccept.
 //
 // Implements a simple in-process task store backed by a global Arc<Mutex<HashMap>>.
 // Tasks have id, subject, description, status, owner, blocks/blocked-by dependencies,
 // and optional output.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{
+    agent_tasks, background_processes, PermissionLevel, Tool, ToolContext, ToolEffect, ToolResult,
+};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -109,8 +112,7 @@ impl Task {
 
 /// Global task store shared across all tool invocations.
 /// Public so the TUI can access and display tasks.
-pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> = Lazy::new(|| Arc::new(DashMap::new()));
 
 // ---------------------------------------------------------------------------
 // TaskCreate
@@ -128,9 +130,15 @@ struct TaskCreateInput {
 
 #[async_trait]
 impl Tool for TaskCreateTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_CREATE }
-    fn description(&self) -> &str { "Create a new task to track work items. Returns the task ID." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_CREATE
+    }
+    fn description(&self) -> &str {
+        "Create a new task to track work items. Returns the task ID."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -157,10 +165,13 @@ impl Tool for TaskCreateTool {
         debug!(task_id = %task_id, subject = %params.subject, "Creating task");
         TASK_STORE.insert(task_id.clone(), task);
 
-        ToolResult::success(serde_json::to_string_pretty(&json!({
-            "task_id": task_id,
-            "subject": params.subject,
-        })).unwrap_or_default())
+        ToolResult::success(
+            serde_json::to_string_pretty(&json!({
+                "task_id": task_id,
+                "subject": params.subject,
+            }))
+            .unwrap_or_default(),
+        )
     }
 }
 
@@ -178,9 +189,15 @@ struct TaskGetInput {
 
 #[async_trait]
 impl Tool for TaskGetTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_GET }
-    fn description(&self) -> &str { "Get full details of a task by ID." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_GET
+    }
+    fn description(&self) -> &str {
+        "Get full details of a task by ID."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -200,11 +217,11 @@ impl Tool for TaskGetTool {
 
         match TASK_STORE.get(&params.task_id) {
             Some(task) => ToolResult::success(
-                serde_json::to_string_pretty(&task.to_full_value()).unwrap_or_default()
+                serde_json::to_string_pretty(&task.to_full_value()).unwrap_or_default(),
             ),
-            None => ToolResult::success(
-                serde_json::to_string_pretty(&json!(null)).unwrap_or_default()
-            ),
+            None => {
+                ToolResult::success(serde_json::to_string_pretty(&json!(null)).unwrap_or_default())
+            }
         }
     }
 }
@@ -239,9 +256,15 @@ struct TaskUpdateInput {
 
 #[async_trait]
 impl Tool for TaskUpdateTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_UPDATE }
-    fn description(&self) -> &str { "Update a task's properties (status, subject, description, etc.)." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_UPDATE
+    }
+    fn description(&self) -> &str {
+        "Update a task's properties (status, subject, description, etc.)."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -337,11 +360,14 @@ impl Tool for TaskUpdateTool {
             TASK_STORE.remove(&task_id);
         }
 
-        ToolResult::success(serde_json::to_string_pretty(&json!({
-            "success": true,
-            "task_id": task_id,
-            "updated_fields": updated_fields,
-        })).unwrap_or_default())
+        ToolResult::success(
+            serde_json::to_string_pretty(&json!({
+                "success": true,
+                "task_id": task_id,
+                "updated_fields": updated_fields,
+            }))
+            .unwrap_or_default(),
+        )
     }
 }
 
@@ -353,9 +379,15 @@ pub struct TaskListTool;
 
 #[async_trait]
 impl Tool for TaskListTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_LIST }
-    fn description(&self) -> &str { "List all active tasks (excluding deleted/completed)." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_LIST
+    }
+    fn description(&self) -> &str {
+        "List all active tasks (excluding deleted/completed)."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -406,9 +438,15 @@ struct TaskStopInput {
 
 #[async_trait]
 impl Tool for TaskStopTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_STOP }
-    fn description(&self) -> &str { "Stop a running background task." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Execute }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_STOP
+    }
+    fn description(&self) -> &str {
+        "Stop a running background task."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -420,11 +458,37 @@ impl Tool for TaskStopTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: TaskStopInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if agent_tasks::contains(&params.task_id) {
+            return match agent_tasks::stop(&params.task_id, ctx).await {
+                Ok(()) => ToolResult::success(
+                    serde_json::to_string_pretty(&json!({
+                        "message": "Cancellation requested",
+                        "task_id": params.task_id,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                Err(error) => ToolResult::error(error),
+            };
+        }
+
+        if background_processes::contains(&params.task_id) {
+            return match background_processes::stop(&params.task_id, ctx) {
+                Ok(()) => ToolResult::success(
+                    serde_json::to_string_pretty(&json!({
+                        "message": "Cancellation requested",
+                        "task_id": params.task_id,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                Err(error) => ToolResult::error(error),
+            };
+        }
 
         match TASK_STORE.get_mut(&params.task_id) {
             Some(mut task) => {
@@ -436,10 +500,13 @@ impl Tool for TaskStopTool {
                 }
                 task.status = TaskStatus::Completed;
                 task.updated_at = chrono::Utc::now();
-                ToolResult::success(serde_json::to_string_pretty(&json!({
-                    "message": "Task stopped",
-                    "task_id": params.task_id,
-                })).unwrap_or_default())
+                ToolResult::success(
+                    serde_json::to_string_pretty(&json!({
+                        "message": "Task stopped",
+                        "task_id": params.task_id,
+                    }))
+                    .unwrap_or_default(),
+                )
             }
             None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
         }
@@ -459,13 +526,21 @@ struct TaskOutputInput {
     block: bool,
 }
 
-fn default_block() -> bool { true }
+fn default_block() -> bool {
+    true
+}
 
 #[async_trait]
 impl Tool for TaskOutputTool {
-    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_OUTPUT }
-    fn description(&self) -> &str { "Get the output of a task." }
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_OUTPUT
+    }
+    fn description(&self) -> &str {
+        "Get the output of a task."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -478,27 +553,116 @@ impl Tool for TaskOutputTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: TaskOutputInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if agent_tasks::contains(&params.task_id) {
+            return match agent_tasks::output(&params.task_id, ctx, params.block).await {
+                Ok(output) => {
+                    ToolResult::success(agent_tasks::serialize_task_output(&params.task_id, output))
+                }
+                Err(error) => ToolResult::error(error),
+            };
+        }
+
+        if background_processes::contains(&params.task_id) {
+            return match background_processes::output(&params.task_id, ctx, params.block).await {
+                Ok(output) => {
+                    ToolResult::success(serde_json::to_string_pretty(&output).unwrap_or_default())
+                }
+                Err(error) => ToolResult::error(error),
+            };
+        }
 
         match TASK_STORE.get(&params.task_id) {
             Some(task) => {
                 let retrieval_status = match &task.status {
                     TaskStatus::Completed | TaskStatus::Failed => "success",
                     TaskStatus::Running | TaskStatus::InProgress => {
-                        if params.block { "success" } else { "not_ready" }
+                        if params.block {
+                            "success"
+                        } else {
+                            "not_ready"
+                        }
                     }
                     _ => "success",
                 };
-                ToolResult::success(serde_json::to_string_pretty(&json!({
-                    "retrieval_status": retrieval_status,
-                    "task": task.to_full_value(),
-                })).unwrap_or_default())
+                ToolResult::success(
+                    serde_json::to_string_pretty(&json!({
+                        "retrieval_status": retrieval_status,
+                        "task": task.to_full_value(),
+                    }))
+                    .unwrap_or_default(),
+                )
             }
             None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskAccept
+// ---------------------------------------------------------------------------
+
+/// Verify that an isolated mutating child's artifacts are present in the
+/// parent workspace and pass an immutable host-registered checker before the
+/// child's completion is accepted.
+pub struct TaskAcceptTool;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskAcceptInput {
+    task_id: String,
+    verification_command: String,
+}
+
+#[async_trait]
+impl Tool for TaskAcceptTool {
+    fn name(&self) -> &str {
+        claurst_core::constants::TOOL_NAME_TASK_ACCEPT
+    }
+
+    fn description(&self) -> &str {
+        "Accept an isolated mutating child only after its artifacts match the parent workspace and a host-registered verification command passes."
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutation
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Completed isolated child task ID awaiting parent acceptance"
+                },
+                "verification_command": {
+                    "type": "string",
+                    "description": "Exact foreground command from the parent's immutable trusted-checker catalog"
+                }
+            },
+            "required": ["task_id", "verification_command"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let params: TaskAcceptInput = match serde_json::from_value(input) {
+            Ok(params) => params,
+            Err(error) => return ToolResult::error(format!("Invalid input: {error}")),
+        };
+        match agent_tasks::accept(&params.task_id, &params.verification_command, ctx).await {
+            Ok(result) => result,
+            Err(error) => ToolResult::error(error),
         }
     }
 }

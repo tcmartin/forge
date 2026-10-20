@@ -67,24 +67,24 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: claurst-windows-x86_64
+            artifact: forge-windows-x86_64
             ext: .exe
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: claurst-linux-x86_64
+            artifact: forge-linux-x86_64
             ext: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: claurst-linux-aarch64
+            artifact: forge-linux-aarch64
             ext: ""
             cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: claurst-macos-x86_64
+            artifact: forge-macos-x86_64
             ext: ""
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: claurst-macos-aarch64
+            artifact: forge-macos-aarch64
             ext: ""
 
     runs-on: ${{ matrix.os }}
@@ -124,7 +124,7 @@ jobs:
       - name: Build release binary (native)
         if: ${{ !matrix.cross }}
         working-directory: src-rust
-        run: cargo build --release --locked --package claurst --target ${{ matrix.target }}
+        run: cargo build --release --locked --package claurst --bin forge --target ${{ matrix.target }}
 
       - name: Create Cross.toml for cross-compilation
         if: matrix.cross
@@ -142,12 +142,12 @@ jobs:
       - name: Build release binary (cross)
         if: matrix.cross
         working-directory: src-rust
-        run: cross build --release --locked --package claurst --target ${{ matrix.target }}
+        run: cross build --release --locked --package claurst --bin forge --target ${{ matrix.target }}
 
       - name: Verify binary exists
         shell: bash
         run: |
-          BINARY="src-rust/target/${{ matrix.target }}/release/claurst${{ matrix.ext }}"
+          BINARY="src-rust/target/${{ matrix.target }}/release/forge${{ matrix.ext }}"
           if [[ ! -f "$BINARY" ]]; then
             echo "::error::Binary not found at $BINARY"
             exit 1
@@ -155,21 +155,21 @@ jobs:
           ls -lh "$BINARY"
 
       # Stage the binary into a per-archive directory using the canonical
-      # name "claurst" (or "claurst.exe").  The install scripts assume this
+      # name "forge" (or "forge.exe").  The install scripts assume this
       # name inside the archive — do not change without updating install.sh
       # and install.ps1.
       - name: Stage binary for packaging
         shell: bash
         run: |
           mkdir -p "stage/${{ matrix.artifact }}"
-          cp "src-rust/target/${{ matrix.target }}/release/claurst${{ matrix.ext }}" \
-             "stage/${{ matrix.artifact }}/claurst${{ matrix.ext }}"
+          cp "src-rust/target/${{ matrix.target }}/release/forge${{ matrix.ext }}" \
+             "stage/${{ matrix.artifact }}/forge${{ matrix.ext }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: stage/${{ matrix.artifact }}/claurst${{ matrix.ext }}
+          path: stage/${{ matrix.artifact }}/forge${{ matrix.ext }}
 
   # ── Create GitHub release ───────────────────────────────────────────
   release:
@@ -190,11 +190,11 @@ jobs:
       - name: Verify all expected assets exist
         run: |
           EXPECTED=(
-            claurst-windows-x86_64
-            claurst-linux-x86_64
-            claurst-linux-aarch64
-            claurst-macos-x86_64
-            claurst-macos-aarch64
+            forge-windows-x86_64
+            forge-linux-x86_64
+            forge-linux-aarch64
+            forge-macos-x86_64
+            forge-macos-aarch64
           )
           MISSING=()
           for name in "${EXPECTED[@]}"; do

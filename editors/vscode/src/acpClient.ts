@@ -2,7 +2,7 @@ import * as cp from 'child_process';
 import * as readline from 'readline';
 import { extractText, parseLine } from './acpProtocol';
 
-/** Speaks ACP to a `claurst acp` child process over stdio. Wire parsing
+/** Speaks ACP to a `forge acp` child process over stdio. Wire parsing
  * itself lives in acpProtocol.ts; this class owns the process, the
  * pending-request map, and dispatch to caller-supplied event callbacks. */
 
@@ -51,7 +51,7 @@ export class AcpClient {
     });
     this.child.on('exit', (code) => {
       for (const { reject } of this.pending.values()) {
-        reject(new Error('claurst acp process exited'));
+        reject(new Error('forge acp process exited'));
       }
       this.pending.clear();
       this.events.onExit?.(code);
@@ -62,7 +62,7 @@ export class AcpClient {
     const parsed = parseLine(line);
     if (!parsed) {
       if (line.trim().length > 0) {
-        this.events.onStderr?.(`[claurst-vscode] malformed line from agent: ${line.trim()}`);
+        this.events.onStderr?.(`[forge-vscode] malformed line from agent: ${line.trim()}`);
       }
       return;
     }
@@ -84,7 +84,7 @@ export class AcpClient {
       case 'request':
         // Agent → client request. Only session/request_permission is expected in v1.
         this.handleIncomingRequest(parsed.id, parsed.method, parsed.params).catch((e) => {
-          this.events.onStderr?.(`[claurst-vscode] failed to handle ${parsed.method}: ${e}`);
+          this.events.onStderr?.(`[forge-vscode] failed to handle ${parsed.method}: ${e}`);
         });
         return;
       case 'notification':
@@ -181,7 +181,7 @@ export class AcpClient {
     await this.request('initialize', {
       protocolVersion: 1,
       clientCapabilities: {},
-      clientInfo: { name: 'claurst-vscode', version: '0.1.0' },
+      clientInfo: { name: 'forge-vscode', version: '0.1.0' },
     });
   }
 

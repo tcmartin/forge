@@ -14,26 +14,51 @@
 // - Connection manager with exponential-backoff reconnection
 
 use async_trait::async_trait;
-use claurst_core::config::McpServerConfig;
+use claurst_core::config::{McpServerConfig, McpServerOrigin};
+use claurst_core::crypto_utils::sha256_hex;
 use claurst_core::mcp_templates::TemplateRenderer;
 use claurst_core::types::ToolDefinition;
 use dashmap::DashMap;
 use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+pub use catalog_state::{
+    CatalogAvailability, CatalogRevisionHeader, CatalogSnapshot, CombinedCatalogSnapshot,
+    McpCatalogError, McpToolDescriptor,
+};
 pub use client::McpClient;
-pub use types::*;
 pub use connection_manager::{McpConnectionManager, McpServerStatus};
+pub use mcp_operation_receipt::{
+    with_mcp_query_operation_identity, with_mcp_query_operation_observer, McpOperationBackend,
+    McpOperationContext, McpOperationObserver, McpQueryOperationIdentity, McpSessionCompleteness,
+};
+pub use types::*;
 
 pub mod backend;
+pub(crate) mod bounded_transport;
+pub mod catalog_state;
 pub mod connection_manager;
-pub mod registry;
+pub(crate) mod mcp_operation_receipt;
 pub mod oauth;
+pub(crate) mod raw_mcp_observer;
+pub mod registry;
 pub mod rmcp_backend;
+mod session_manager;
+
+const RAW_MCP_RECEIPT_SINK_ENV: &str = "FORGE_P07_RAW_MCP_RECEIPT_SINK";
+
+/// Resolve the controller-owned raw receipt destination only when the
+/// controller explicitly supplies it.  No default or workspace-relative path
+/// is guessed; the backend repeats absolute/no-symlink/private-file checks
+/// before spawning the stdio child and writing the receipt.
+fn configured_raw_mcp_receipt_sink() -> anyhow::Result<Option<PathBuf>> {
+    Ok(std::env::var_os(RAW_MCP_RECEIPT_SINK_ENV).map(PathBuf::from))
+}
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion
@@ -77,7 +102,8 @@ pub fn expand_env_vars(input: &str) -> String {
                             },
                         };
 
-                        result = format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
+                        result =
+                            format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
                         // Continue scanning from where the replacement ends
                         search_from = start + replacement.len();
                     }
@@ -106,6 +132,96 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
         // a trusted one.
         origin: config.origin,
     }
+}
+
+const MCP_LAUNCH_SOURCE_DOMAIN: &[u8] = b"forge.mcp-launch-source.v1";
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+
+fn frame_string(out: &mut Vec<u8>, value: &str) -> bool {
+    let Ok(length) = u32::try_from(value.len()) else {
+        return false;
+    };
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out.len() <= MAX_SOURCE_BYTES
+}
+
+fn frame_option(out: &mut Vec<u8>, value: Option<&str>) -> bool {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            if !frame_string(out, value) {
+                return false;
+            }
+        }
+    }
+    out.len() <= MAX_SOURCE_BYTES
+}
+
+/// Hash the exact immutable launch snapshot handed to a live MCP transport.
+/// Unsupported or over-bounded snapshots intentionally have no identity and
+/// therefore can never satisfy a host observation grant.
+pub fn mcp_launch_source_key(config: &McpServerConfig) -> Option<String> {
+    let server = canonical_mcp_server_name(&config.name);
+    if server.is_empty() || server.len() > 256 {
+        return None;
+    }
+    if !matches!(config.server_type.as_str(), "stdio" | "sse" | "http") {
+        return None;
+    }
+    if config.args.len() > 1024 || config.env.len() > 1024 {
+        return None;
+    }
+    if config
+        .command
+        .as_ref()
+        .is_some_and(|value| value.len() > 16 * 1024)
+        || config
+            .url
+            .as_ref()
+            .is_some_and(|value| value.len() > 16 * 1024)
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(MCP_LAUNCH_SOURCE_DOMAIN);
+    bytes.push(0);
+    if !frame_string(&mut bytes, &server) || !frame_string(&mut bytes, &config.server_type) {
+        return None;
+    }
+    if !frame_option(&mut bytes, config.command.as_deref()) {
+        return None;
+    }
+    let mut args = config.args.iter();
+    let count = u32::try_from(config.args.len()).ok()?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for arg in args.by_ref() {
+        if arg.len() > 64 * 1024 || !frame_string(&mut bytes, arg) {
+            return None;
+        }
+    }
+    if !frame_option(&mut bytes, config.url.as_deref()) {
+        return None;
+    }
+    let mut env: Vec<_> = config.env.iter().collect();
+    env.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    let count = u32::try_from(env.len()).ok()?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for (key, value) in env {
+        if key.len() > 4 * 1024
+            || value.len() > 64 * 1024
+            || !frame_string(&mut bytes, key)
+            || !frame_string(&mut bytes, value)
+        {
+            return None;
+        }
+    }
+    bytes.push(match config.origin {
+        McpServerOrigin::User => 0,
+        McpServerOrigin::Project => 1,
+    });
+    (bytes.len() <= MAX_SOURCE_BYTES).then(|| sha256_hex(&bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +261,6 @@ pub mod types {
             }
         }
     }
-
 
     /// A JSON-RPC 2.0 response.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,13 +373,31 @@ pub mod types {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "lowercase")]
     pub enum McpContent {
-        Text { text: String },
+        Text {
+            text: String,
+        },
         Image {
             data: String,
             #[serde(rename = "mimeType")]
             mime_type: String,
         },
-        Resource { resource: ResourceContents },
+        Audio {
+            data: String,
+            #[serde(rename = "mimeType")]
+            mime_type: String,
+        },
+        Resource {
+            resource: ResourceContents,
+        },
+        #[serde(rename = "resource_link")]
+        ResourceLink {
+            uri: String,
+            name: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<String>,
+            #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+            mime_type: Option<String>,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,7 +490,7 @@ pub mod types {
 
 pub mod transport {
     use super::*;
-    use reqwest::header::{CONTENT_TYPE, HeaderValue};
+    use reqwest::header::{HeaderValue, CONTENT_TYPE};
     #[cfg(test)]
     use tokio::sync::mpsc;
 
@@ -371,6 +504,9 @@ pub mod transport {
     ];
 
     /// A transport can send requests and receive responses.
+    // async-trait emits a bare `#[must_use]` on its boxed futures;
+    // Rust 1.99 Clippy sees the boxed future's own marker and reports a duplicate.
+    #[allow(clippy::double_must_use)]
     #[async_trait]
     pub trait McpTransport: Send + Sync {
         async fn send(&self, message: &JsonRpcRequest) -> anyhow::Result<()>;
@@ -411,7 +547,10 @@ pub mod transport {
             .unwrap_or(false)
     }
 
-    pub(crate) fn resolve_legacy_endpoint(base_url: &str, endpoint: &str) -> anyhow::Result<String> {
+    pub(crate) fn resolve_legacy_endpoint(
+        base_url: &str,
+        endpoint: &str,
+    ) -> anyhow::Result<String> {
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
             anyhow::bail!("legacy SSE endpoint event did not include a POST endpoint");
@@ -421,9 +560,13 @@ pub mod transport {
         }
         let base = url::Url::parse(base_url)
             .map_err(|e| anyhow::anyhow!("invalid legacy SSE base URL '{}': {}", base_url, e))?;
-        base.join(endpoint)
-            .map(|url| url.to_string())
-            .map_err(|e| anyhow::anyhow!("failed to resolve legacy SSE endpoint '{}': {}", endpoint, e))
+        base.join(endpoint).map(|url| url.to_string()).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve legacy SSE endpoint '{}': {}",
+                endpoint,
+                e
+            )
+        })
     }
 
     #[cfg(test)]
@@ -456,24 +599,7 @@ pub mod transport {
         Ok(())
     }
 
-    fn dispatch_sse_event<F>(
-        event_name: &mut Option<String>,
-        data_lines: &mut Vec<String>,
-        on_event: &mut F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(Option<&str>, &str) -> anyhow::Result<()>,
-    {
-        if event_name.is_none() && data_lines.is_empty() {
-            return Ok(());
-        }
-        let data = data_lines.join("\n");
-        on_event(event_name.as_deref(), &data)?;
-        *event_name = None;
-        data_lines.clear();
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(super) fn process_sse_line(
         line: &str,
         event_name: &mut Option<String>,
@@ -501,45 +627,13 @@ pub mod transport {
         F: FnMut(Option<&str>, &str) -> anyhow::Result<()>,
     {
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut event_name: Option<String> = None;
-        let mut data_lines: Vec<String> = Vec::new();
-
+        let mut parser = crate::bounded_transport::BoundedSseParser::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow::anyhow!("failed reading SSE stream: {}", e))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(pos) = buffer.find('\n') {
-                let mut line: String = buffer.drain(..=pos).collect();
-                if line.ends_with('\n') {
-                    line.pop();
-                }
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-                if line.is_empty() {
-                    dispatch_sse_event(&mut event_name, &mut data_lines, &mut on_event)?;
-                } else {
-                    process_sse_line(&line, &mut event_name, &mut data_lines);
-                }
-            }
+            parser.push(&chunk, &mut |event, _, data| on_event(event, data))?;
         }
-
-        if !buffer.is_empty() {
-            if buffer.ends_with('\r') {
-                buffer.pop();
-            }
-            if buffer.is_empty() {
-                dispatch_sse_event(&mut event_name, &mut data_lines, &mut on_event)?;
-            } else {
-                process_sse_line(&buffer, &mut event_name, &mut data_lines);
-            }
-        }
-
-        dispatch_sse_event(&mut event_name, &mut data_lines, &mut on_event)?;
-        Ok(())
+        parser.finish(&mut |event, _, data| on_event(event, data))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -559,10 +653,15 @@ pub mod client {
         pub prompts: Vec<McpPrompt>,
         pub instructions: Option<String>,
         backend: Option<Arc<dyn backend::McpClientBackend>>,
+        catalog: Arc<catalog_state::ServerCatalogState>,
+        connection_generation: u64,
     }
 
     impl McpClient {
         fn from_snapshot(snapshot: backend::McpClientSnapshot) -> Self {
+            let catalog = Arc::new(catalog_state::ServerCatalogState::new(
+                &snapshot.server_name,
+            ));
             Self {
                 server_name: snapshot.server_name,
                 server_info: snapshot.server_info,
@@ -572,12 +671,18 @@ pub mod client {
                 prompts: snapshot.prompts,
                 instructions: snapshot.instructions,
                 backend: None,
+                catalog,
+                connection_generation: 0,
             }
         }
 
         fn from_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
             let snapshot = backend.snapshot();
+            let catalog = backend.catalog_state();
+            let connection_generation = catalog.connection_generation();
             let mut client = Self::from_snapshot(snapshot);
+            client.catalog = catalog;
+            client.connection_generation = connection_generation;
             client.backend = Some(backend);
             client
         }
@@ -588,13 +693,38 @@ pub mod client {
                 .ok_or_else(|| anyhow::anyhow!("MCP client backend missing"))
         }
 
-        pub async fn connect(config: &McpServerConfig, auth_token: Option<String>) -> anyhow::Result<Self> {
+        pub async fn connect(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+        ) -> anyhow::Result<Self> {
+            Self::connect_with_catalog(
+                config,
+                auth_token,
+                Arc::new(catalog_state::CatalogState::new()),
+            )
+            .await
+        }
+
+        pub async fn connect_with_catalog(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+            catalog: Arc<catalog_state::CatalogState>,
+        ) -> anyhow::Result<Self> {
+            let receipt_sink = super::configured_raw_mcp_receipt_sink()?;
             match config.server_type.as_str() {
-                "stdio" => Self::connect_stdio(config).await,
+                "stdio" => {
+                    Self::connect_stdio_with_catalog_and_receipt_sink(
+                        config,
+                        Arc::clone(&catalog),
+                        receipt_sink,
+                    )
+                    .await
+                }
                 "sse" => {
                     let backend = crate::rmcp_backend::RmcpClientBackend::connect_legacy_sse(
                         config,
                         auth_token,
+                        Arc::clone(&catalog),
                     )
                     .await?;
                     Ok(Self::from_backend(Arc::new(backend)))
@@ -618,6 +748,7 @@ pub mod client {
                             config,
                             auth_token.clone(),
                             protocol_version,
+                            Arc::clone(&catalog),
                         )
                         .await
                         {
@@ -667,8 +798,57 @@ pub mod client {
         /// Connect to an MCP server using stdio transport. The `config` should
         /// already have env vars expanded via `expand_server_config`.
         pub async fn connect_stdio(config: &McpServerConfig) -> anyhow::Result<Self> {
-            let backend = crate::rmcp_backend::RmcpClientBackend::connect_stdio(config).await?;
+            Self::connect_stdio_with_catalog(config, Arc::new(catalog_state::CatalogState::new()))
+                .await
+        }
+
+        pub async fn connect_stdio_with_catalog(
+            config: &McpServerConfig,
+            catalog: Arc<catalog_state::CatalogState>,
+        ) -> anyhow::Result<Self> {
+            let receipt_sink = super::configured_raw_mcp_receipt_sink()?;
+            Self::connect_stdio_with_catalog_and_receipt_sink(config, catalog, receipt_sink).await
+        }
+
+        pub(crate) async fn connect_stdio_with_catalog_and_receipt_sink(
+            config: &McpServerConfig,
+            catalog: Arc<catalog_state::CatalogState>,
+            receipt_sink: Option<PathBuf>,
+        ) -> anyhow::Result<Self> {
+            let backend =
+                crate::rmcp_backend::RmcpClientBackend::connect_stdio_scoped_with_receipt_sink(
+                    config,
+                    catalog,
+                    None,
+                    None,
+                    receipt_sink,
+                )
+                .await?;
             Ok(Self::from_backend(Arc::new(backend)))
+        }
+
+        pub(crate) async fn connect_stdio_scoped(
+            config: &McpServerConfig,
+            catalog: Arc<catalog_state::CatalogState>,
+            working_dir: &std::path::Path,
+            admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+        ) -> anyhow::Result<Self> {
+            let receipt_sink = super::configured_raw_mcp_receipt_sink()?;
+            let backend =
+                crate::rmcp_backend::RmcpClientBackend::connect_stdio_scoped_with_receipt_sink(
+                    config,
+                    catalog,
+                    Some(working_dir),
+                    Some(admission),
+                    receipt_sink,
+                )
+                .await?;
+            Ok(Self::from_backend(Arc::new(backend)))
+        }
+
+        pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+            self.mark_catalog_unavailable();
+            self.backend()?.shutdown().await
         }
 
         // ---- High-level API -----------------------------------------------
@@ -682,14 +862,59 @@ pub mod client {
             name: &str,
             arguments: Option<Value>,
         ) -> anyhow::Result<CallToolResult> {
-            self.backend()?.call_tool(name, arguments).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "MCP server '{}': tool '{}' call failed: {}",
-                    self.server_name,
-                    name,
-                    e
-                )
-            })
+            self.backend()?
+                .call_tool(name, arguments)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': tool '{}' call failed: {}",
+                        self.server_name,
+                        name,
+                        e
+                    )
+                })
+        }
+
+        /// Return exact stdio operation contexts exposed by the backend.
+        /// Empty means capture was disabled or the backend has no raw
+        /// observer; it never represents inferred query authority.
+        pub fn operation_contexts(&self) -> anyhow::Result<Vec<McpOperationContext>> {
+            self.backend()?.operation_contexts()
+        }
+
+        pub fn catalog_state(&self) -> Arc<catalog_state::ServerCatalogState> {
+            Arc::clone(&self.catalog)
+        }
+
+        pub fn catalog_snapshot(&self) -> catalog_state::CatalogSnapshot {
+            self.catalog.snapshot()
+        }
+
+        pub fn catalog_revision_header(&self) -> catalog_state::CatalogRevisionHeader {
+            self.catalog.revision_header()
+        }
+
+        pub fn mark_catalog_unavailable(&self) {
+            self.catalog
+                .mark_unavailable_if_connection(self.connection_generation);
+        }
+
+        pub async fn call_tool_descriptor(
+            &self,
+            descriptor: &catalog_state::McpToolDescriptor,
+            arguments: Option<Value>,
+        ) -> anyhow::Result<CallToolResult> {
+            if descriptor.server_name() != self.server_name {
+                return Err(anyhow::anyhow!(
+                    catalog_state::McpCatalogError::StaleDescriptor
+                ));
+            }
+            self.catalog
+                .validate(descriptor)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            self.backend()?
+                .call_tool(descriptor.raw_name(), arguments)
+                .await
         }
 
         pub async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
@@ -698,7 +923,7 @@ pub mod client {
             Ok(resources)
         }
 
-        pub async fn read_resource(&self, uri: &str) -> anyhow::Result<ResourceContents> {
+        pub async fn read_resource(&self, uri: &str) -> anyhow::Result<Vec<ResourceContents>> {
             self.backend()?.read_resource(uri).await
         }
 
@@ -732,7 +957,9 @@ pub mod client {
         }
 
         /// Subscribe to raw JSON notifications from the active backend.
-        pub fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
+        pub fn subscribe_to_notifications(
+            &self,
+        ) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
             self.backend()
                 .expect("MCP client backend missing")
                 .subscribe_to_notifications()
@@ -766,7 +993,10 @@ pub mod client {
             match method {
                 "notifications/resources/updated" => {
                     let uri = raw["params"]["uri"].as_str().unwrap_or("").to_string();
-                    let key = (self.server_name.clone(), uri.clone());
+                    let key = (
+                        crate::canonical_mcp_server_name(&self.server_name),
+                        uri.clone(),
+                    );
                     if let Some(tx) = resource_subscriptions.get(&key) {
                         let event = ResourceChangedEvent {
                             server_name: self.server_name.clone(),
@@ -789,6 +1019,34 @@ pub mod client {
                 }
                 "notifications/tools/list_changed" => {
                     info!(server = %self.server_name, "MCP tools list changed");
+                    match self.list_tools().await {
+                        Ok(tools) => {
+                            info!(
+                                server = %self.server_name,
+                                tools = tools.len(),
+                                "MCP tools catalog refreshed"
+                            );
+                        }
+                        Err(error)
+                            if matches!(
+                                error.downcast_ref::<catalog_state::McpCatalogError>(),
+                                Some(catalog_state::McpCatalogError::StaleRefresh)
+                            ) =>
+                        {
+                            debug!(
+                                server = %self.server_name,
+                                error = %error,
+                                "MCP tools catalog refresh superseded by a newer generation"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                server = %self.server_name,
+                                error = %error,
+                                "MCP tools catalog refresh failed"
+                            );
+                        }
+                    }
                 }
                 other => {
                     debug!(
@@ -802,8 +1060,9 @@ pub mod client {
 
         #[cfg(test)]
         pub fn new_for_test(server_name: impl Into<String>) -> Self {
+            let server_name = server_name.into();
             Self {
-                server_name: server_name.into(),
+                server_name: server_name.clone(),
                 server_info: None,
                 capabilities: ServerCapabilities::default(),
                 tools: vec![],
@@ -811,7 +1070,14 @@ pub mod client {
                 prompts: vec![],
                 instructions: None,
                 backend: None,
+                catalog: Arc::new(catalog_state::ServerCatalogState::new(&server_name)),
+                connection_generation: 0,
             }
+        }
+
+        #[cfg(test)]
+        pub fn new_for_test_with_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
+            Self::from_backend(backend)
         }
     }
 
@@ -847,7 +1113,9 @@ pub enum McpAuthState {
     /// OAuth required; `auth_url` is where the user should go.
     Required { auth_url: String },
     /// Successfully authenticated; token may have an expiry.
-    Authenticated { token_expiry: Option<chrono::DateTime<chrono::Utc>> },
+    Authenticated {
+        token_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// An error occurred reading / initiating auth.
     Error(String),
 }
@@ -858,13 +1126,19 @@ pub enum McpAuthState {
 
 /// Manages a pool of MCP server connections.
 pub struct McpManager {
+    inherited: Option<Arc<McpManager>>,
     clients: HashMap<String, Arc<McpClient>>,
+    /// Retain failed-to-shutdown transports for Drop cleanup while blocking
+    /// replacement connections.
+    retired_clients: Vec<Arc<McpClient>>,
+    catalog: Arc<catalog_state::CatalogState>,
     /// Servers that failed to connect during `connect_all`.
     failed_servers: Vec<(String, String)>, // (name, error)
     /// Original (unexpanded) server configs — needed for OAuth initiation.
     server_configs: HashMap<String, McpServerConfig>,
     /// Active resource subscriptions: (server_name, uri) → change event sender.
-    pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+    pub resource_subscriptions:
+        DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -876,14 +1150,88 @@ pub struct McpServerCatalog {
     pub prompts: Vec<String>,
 }
 
+fn same_server_definition(left: &McpServerConfig, right: &McpServerConfig) -> bool {
+    canonical_mcp_server_name(&left.name) == canonical_mcp_server_name(&right.name)
+        && left.command == right.command
+        && left.args == right.args
+        && left.env == right.env
+        && left.url == right.url
+        && left.server_type == right.server_type
+        && left.origin == right.origin
+}
+
+/// MCP server names share a case-insensitive namespace across config,
+/// session, and catalog layers.
+pub fn canonical_mcp_server_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn canonical_mcp_configs(configs: &[McpServerConfig]) -> Vec<McpServerConfig> {
+    let mut selected: Vec<McpServerConfig> = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    for config in configs {
+        let key = canonical_mcp_server_name(&config.name);
+        if let Some(index) = indexes.get(&key).copied() {
+            if selected[index].origin == McpServerOrigin::Project
+                && config.origin == McpServerOrigin::User
+            {
+                selected[index] = config.clone();
+            }
+        } else {
+            indexes.insert(key, selected.len());
+            selected.push(config.clone());
+        }
+    }
+    selected
+}
+
+/// Result of reconciling a live MCP roster without restarting unchanged
+/// clients. Failed additions/replacements remain fail-closed in this manager.
+pub struct McpReconcileOutcome {
+    pub manager: Arc<McpManager>,
+    pub failures: Vec<(String, String)>,
+    pub reused: Vec<String>,
+    pub replaced: Vec<String>,
+    pub removed: Vec<String>,
+}
+
 impl McpManager {
     pub fn new() -> Self {
         Self {
+            inherited: None,
             clients: HashMap::new(),
+            retired_clients: Vec::new(),
+            catalog: Arc::new(catalog_state::CatalogState::new()),
             failed_servers: Vec::new(),
             server_configs: HashMap::new(),
             resource_subscriptions: DashMap::new(),
         }
+    }
+
+    pub fn catalog_state(&self) -> Arc<catalog_state::CatalogState> {
+        Arc::clone(&self.catalog)
+    }
+
+    /// Resolve a client by canonical MCP namespace while retaining its
+    /// original spelling for display and transport diagnostics.
+    pub(crate) fn client_for_name(&self, name: &str) -> Option<&Arc<McpClient>> {
+        self.clients.get(name).or_else(|| {
+            let canonical = canonical_mcp_server_name(name);
+            self.clients
+                .iter()
+                .find(|(display_name, _)| canonical_mcp_server_name(display_name) == canonical)
+                .map(|(_, client)| client)
+        })
+    }
+
+    fn config_for_name(&self, name: &str) -> Option<&McpServerConfig> {
+        self.server_configs.get(name).or_else(|| {
+            let canonical = canonical_mcp_server_name(name);
+            self.server_configs
+                .iter()
+                .find(|(display_name, _)| canonical_mcp_server_name(display_name) == canonical)
+                .map(|(_, config)| config)
+        })
     }
 
     /// Connect to all configured MCP servers.
@@ -893,10 +1241,13 @@ impl McpManager {
     /// - Continues on failure (does not bail out on first error).
     /// - Tracks failed servers in `failed_servers()`.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
+        let configs = canonical_mcp_configs(configs);
         let mut manager = Self::new();
-        for config in configs {
+        for config in &configs {
             // Store original config for later OAuth use
-            manager.server_configs.insert(config.name.clone(), config.clone());
+            manager
+                .server_configs
+                .insert(config.name.clone(), config.clone());
             // Expand env vars before using the config
             let expanded = expand_server_config(config);
 
@@ -907,7 +1258,13 @@ impl McpManager {
                     } else {
                         None
                     };
-                    match client::McpClient::connect(&expanded, auth_token).await {
+                    match client::McpClient::connect_with_catalog(
+                        &expanded,
+                        auth_token,
+                        Arc::clone(&manager.catalog),
+                    )
+                    .await
+                    {
                         Ok(client) => {
                             info!(
                                 server = %expanded.name,
@@ -916,7 +1273,9 @@ impl McpManager {
                                 resources = client.resources.len(),
                                 "MCP server connected"
                             );
-                            manager.clients.insert(expanded.name.clone(), Arc::new(client));
+                            manager
+                                .clients
+                                .insert(expanded.name.clone(), Arc::new(client));
                         }
                         Err(e) => {
                             error!(
@@ -947,6 +1306,198 @@ impl McpManager {
         manager
     }
 
+    /// Reconcile a new effective roster while reusing unchanged client and
+    /// catalog leaf identities. Removed or changed clients are shut down
+    /// before any replacement is connected, so stale descriptors fail closed.
+    pub async fn reconcile_with_previous(
+        previous: &Arc<Self>,
+        configs: &[McpServerConfig],
+    ) -> McpReconcileOutcome {
+        Self::reconcile_with_previous_invalidated(previous, configs, &HashSet::new()).await
+    }
+
+    /// Reconcile while forcing selected canonical names through a fresh
+    /// generation even when their transport definition is unchanged. Plugin
+    /// ownership changes use this to prevent stale source identity reuse.
+    pub async fn reconcile_with_previous_invalidated(
+        previous: &Arc<Self>,
+        configs: &[McpServerConfig],
+        invalidated_names: &HashSet<String>,
+    ) -> McpReconcileOutcome {
+        let configs = canonical_mcp_configs(configs);
+        let desired: HashMap<String, McpServerConfig> = configs
+            .iter()
+            .cloned()
+            .map(|config| (canonical_mcp_server_name(&config.name), config))
+            .collect();
+        let reusable: std::collections::HashSet<String> = desired
+            .iter()
+            .filter_map(|(name, config)| {
+                previous
+                    .server_configs
+                    .iter()
+                    .find(|(old_name, old)| {
+                        canonical_mcp_server_name(old_name) == *name
+                            && same_server_definition(old, config)
+                            && !invalidated_names.contains(name)
+                    })
+                    .and_then(|(old_name, _)| {
+                        previous
+                            .clients
+                            .contains_key(old_name)
+                            .then_some(name.clone())
+                    })
+            })
+            .collect();
+        let removed: Vec<String> = previous
+            .server_configs
+            .keys()
+            .filter(|name| !reusable.contains(&canonical_mcp_server_name(name)))
+            .cloned()
+            .collect();
+
+        let mut failures = previous.shutdown_except(&reusable).await;
+        let shutdown_failed: std::collections::HashSet<String> = failures
+            .iter()
+            .map(|(name, _)| canonical_mcp_server_name(name))
+            .collect();
+        let mut next = Self::new();
+        next.retired_clients = previous
+            .clients
+            .iter()
+            .filter(|(name, _)| shutdown_failed.contains(&canonical_mcp_server_name(name)))
+            .map(|(_, client)| Arc::clone(client))
+            .collect();
+        // Keep a filtered manager as the notification/subscription owner for
+        // reused clients. A changed definition may retain the same name, so
+        // inheriting the complete previous roster would route fresh calls to
+        // its revoked client. The filtered owner preserves only unchanged
+        // client identity and catalog leaves.
+        let inherited = Arc::new(Self {
+            inherited: None,
+            clients: previous
+                .clients
+                .iter()
+                .filter(|(name, _)| reusable.contains(&canonical_mcp_server_name(name)))
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect(),
+            retired_clients: Vec::new(),
+            catalog: Arc::new(catalog_state::CatalogState::inherit_selected(
+                &previous.catalog,
+                reusable.iter().map(String::as_str),
+            )),
+            failed_servers: previous
+                .failed_servers
+                .iter()
+                .filter(|(name, _)| reusable.contains(&canonical_mcp_server_name(name)))
+                .cloned()
+                .collect(),
+            server_configs: previous
+                .server_configs
+                .iter()
+                .filter(|(name, _)| reusable.contains(&canonical_mcp_server_name(name)))
+                .map(|(name, config)| (name.clone(), config.clone()))
+                .collect(),
+            resource_subscriptions: previous
+                .resource_subscriptions
+                .iter()
+                .filter(|entry| reusable.contains(&canonical_mcp_server_name(&entry.key().0)))
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
+        });
+        inherited.clone().spawn_notification_poll_loop();
+        next.inherited = Some(inherited);
+        next.catalog = Arc::new(catalog_state::CatalogState::inherit_selected(
+            &previous.catalog,
+            reusable.iter().map(String::as_str),
+        ));
+
+        let mut reused = Vec::new();
+        let mut replaced = Vec::new();
+        for config in configs {
+            let canonical_name = canonical_mcp_server_name(&config.name);
+            if reusable.contains(&canonical_name) {
+                if let Some((previous_name, client)) = previous
+                    .clients
+                    .iter()
+                    .find(|(name, _)| canonical_mcp_server_name(name) == canonical_name)
+                {
+                    next.clients
+                        .insert(previous_name.clone(), Arc::clone(client));
+                    next.server_configs
+                        .insert(previous_name.clone(), config.clone());
+                    reused.push(config.name.clone());
+                    continue;
+                }
+            }
+
+            next.server_configs
+                .insert(config.name.clone(), config.clone());
+            replaced.push(config.name.clone());
+            if shutdown_failed.contains(&canonical_name) {
+                next.failed_servers.push((
+                    config.name.clone(),
+                    "MCP shutdown failed; replacement blocked and old transport retained for cleanup"
+                        .to_string(),
+                ));
+                continue;
+            }
+            let expanded = expand_server_config(&config);
+            let auth_token = if matches!(expanded.server_type.as_str(), "sse" | "http") {
+                next.load_token(&expanded.name).await
+            } else {
+                None
+            };
+            match client::McpClient::connect_with_catalog(
+                &expanded,
+                auth_token,
+                Arc::clone(&next.catalog),
+            )
+            .await
+            {
+                Ok(client) => {
+                    next.clients.insert(config.name.clone(), Arc::new(client));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    next.catalog.remove_server(&config.name);
+                    next.failed_servers
+                        .push((config.name.clone(), message.clone()));
+                    failures.push((config.name.clone(), message));
+                }
+            }
+        }
+        let manager = Arc::new(next);
+        manager.clone().spawn_notification_poll_loop();
+        McpReconcileOutcome {
+            manager,
+            failures,
+            reused,
+            replaced,
+            removed,
+        }
+    }
+
+    async fn shutdown_except(
+        &self,
+        reusable: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String)> {
+        let clients: Vec<(String, Arc<McpClient>)> = self
+            .clients
+            .iter()
+            .filter(|(name, _)| !reusable.contains(&canonical_mcp_server_name(name)))
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect();
+        let mut failures = Vec::new();
+        for (name, client) in clients {
+            client.mark_catalog_unavailable();
+            if let Err(error) = client.shutdown().await {
+                failures.push((name, format!("MCP shutdown failed: {error}")));
+            }
+        }
+        failures
+    }
+
     // -----------------------------------------------------------------------
     // Status / query API (used by /mcp command and McpConnectionManager)
     // -----------------------------------------------------------------------
@@ -958,9 +1509,17 @@ impl McpManager {
 
     /// Return status for a single server.
     pub fn server_status(&self, name: &str) -> McpServerStatus {
-        if let Some(client) = self.clients.get(name) {
-            McpServerStatus::Connected {
-                tool_count: client.tools.len(),
+        if let Some(client) = self.client_for_name(name) {
+            let header = client.catalog_revision_header();
+            match header.availability {
+                CatalogAvailability::Available => McpServerStatus::Connected {
+                    tool_count: header.tool_count,
+                },
+                CatalogAvailability::Dirty | CatalogAvailability::Unavailable => {
+                    McpServerStatus::Disconnected {
+                        last_error: Some("MCP tool catalog unavailable".into()),
+                    }
+                }
             }
         } else if let Some((_, err)) = self.failed_servers.iter().find(|(n, _)| n == name) {
             McpServerStatus::Disconnected {
@@ -975,12 +1534,18 @@ impl McpManager {
     pub fn all_statuses(&self) -> HashMap<String, McpServerStatus> {
         let mut map = HashMap::new();
         for (name, client) in &self.clients {
-            map.insert(
-                name.clone(),
-                McpServerStatus::Connected {
-                    tool_count: client.tools.len(),
+            let header = client.catalog_revision_header();
+            let status = match header.availability {
+                CatalogAvailability::Available => McpServerStatus::Connected {
+                    tool_count: header.tool_count,
                 },
-            );
+                CatalogAvailability::Dirty | CatalogAvailability::Unavailable => {
+                    McpServerStatus::Disconnected {
+                        last_error: Some("MCP tool catalog unavailable".into()),
+                    }
+                }
+            };
+            map.insert(name.clone(), status);
         }
         for (name, err) in &self.failed_servers {
             map.insert(
@@ -1001,9 +1566,10 @@ impl McpManager {
 
     /// Return counts and names for tools/resources/prompts on connected servers.
     pub fn server_catalog(&self, name: &str) -> Option<McpServerCatalog> {
-        let client = self.clients.get(name)?;
+        let client = self.client_for_name(name)?;
+        let tool_count = client.catalog_revision_header().tool_count;
         Some(McpServerCatalog {
-            tool_count: client.tools.len(),
+            tool_count,
             resource_count: client.resources.len(),
             prompt_count: client.prompts.len(),
             resources: client.resources.iter().map(|r| r.name.clone()).collect(),
@@ -1017,19 +1583,78 @@ impl McpManager {
 
     /// Get all tool definitions from all connected servers.
     pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
-        let mut defs = vec![];
-        for (server_name, client) in &self.clients {
-            for td in client.tool_definitions() {
-                // Prefix tool name with server name to avoid conflicts
-                let prefixed = ToolDefinition {
-                    name: format!("{}_{}", server_name, td.name),
-                    description: format!("[{}] {}", server_name, td.description),
-                    input_schema: td.input_schema.clone(),
-                };
-                defs.push((server_name.clone(), prefixed));
-            }
-        }
+        let mut defs: Vec<(String, ToolDefinition)> = self
+            .catalog
+            .checked_snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .descriptors
+                    .into_iter()
+                    .map(|descriptor| {
+                        (
+                            descriptor.server_name().to_string(),
+                            (*descriptor.definition()).clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        defs.sort_by(|left, right| left.1.name.cmp(&right.1.name));
         defs
+    }
+
+    /// Get all current tool definitions, rejecting an ambiguous combined
+    /// callable namespace.  The older infallible helper remains for callers
+    /// that only need compatibility metadata.
+    pub fn try_all_tool_definitions(
+        &self,
+    ) -> Result<Vec<(String, ToolDefinition)>, McpCatalogError> {
+        let mut defs = self
+            .catalog
+            .checked_snapshot()?
+            .descriptors
+            .into_iter()
+            .map(|descriptor| {
+                (
+                    descriptor.server_name().to_string(),
+                    (*descriptor.definition()).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        defs.sort_by(|left, right| left.1.name.cmp(&right.1.name));
+        Ok(defs)
+    }
+
+    /// Return the checked authority-preserving descriptor snapshot. This keeps
+    /// source identity and generations while compatibility helpers clone only
+    /// schema definitions.
+    pub fn checked_catalog_snapshot(
+        &self,
+    ) -> Result<catalog_state::CombinedCatalogSnapshot, McpCatalogError> {
+        self.catalog.checked_snapshot()
+    }
+
+    /// Return a live manager-issued launch identity only after all descriptor
+    /// generations and schema fields are revalidated against the owning client.
+    pub fn source_key_for_descriptor(
+        &self,
+        descriptor: &catalog_state::McpToolDescriptor,
+    ) -> Option<String> {
+        let client = self.client_for_name(descriptor.server_name())?;
+        client
+            .catalog_state()
+            .validated_source_key(descriptor)
+            .ok()?
+    }
+
+    /// Wait for all configured MCP catalogs to become available after a
+    /// notification-triggered refresh.  Dirty sources remain unavailable to
+    /// callers until the complete, generation-checked snapshot is ready.
+    pub async fn wait_catalog_ready(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<catalog_state::CombinedCatalogSnapshot, McpCatalogError> {
+        self.catalog.wait_all_ready(timeout).await
     }
 
     /// Execute a tool call, routing to the correct server.
@@ -1039,18 +1664,52 @@ impl McpManager {
         prefixed_name: &str,
         arguments: Option<Value>,
     ) -> anyhow::Result<CallToolResult> {
-        // Find the server name by matching prefix
-        for (server_name, client) in &self.clients {
-            let prefix = format!("{}_", server_name);
-            if let Some(tool_name) = prefixed_name.strip_prefix(&prefix) {
-                return client.call_tool(tool_name, arguments).await;
+        let mut unavailable = None;
+        let mut matches = Vec::new();
+        for client in self.clients.values() {
+            match client.catalog_state().descriptor(prefixed_name) {
+                Ok(descriptor) => matches.push((Arc::clone(client), descriptor)),
+                Err(error @ McpCatalogError::Dirty { .. })
+                | Err(error @ McpCatalogError::Unavailable { .. }) => {
+                    unavailable = Some(error);
+                }
+                Err(McpCatalogError::UnknownTool { .. }) => {}
+                Err(error) => return Err(anyhow::anyhow!(error)),
             }
+        }
+        if matches.len() > 1 {
+            return Err(anyhow::anyhow!(McpCatalogError::NameCollision {
+                name: prefixed_name.to_string(),
+            }));
+        }
+        if let Some((client, descriptor)) = matches.pop() {
+            return client.call_tool_descriptor(&descriptor, arguments).await;
+        }
+        if let Some(error) = unavailable {
+            return Err(anyhow::anyhow!(error));
         }
         Err(anyhow::anyhow!(
             "No MCP server found for tool '{}'. Connected servers: [{}]",
             prefixed_name,
             self.clients.keys().cloned().collect::<Vec<_>>().join(", ")
         ))
+    }
+
+    /// Execute a captured descriptor after exact source and generation checks.
+    /// The catalog lock is released before the remote call begins.
+    pub async fn call_tool_descriptor(
+        &self,
+        descriptor: &catalog_state::McpToolDescriptor,
+        arguments: Option<Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        let client = self
+            .client_for_name(descriptor.server_name())
+            .ok_or_else(|| {
+                anyhow::anyhow!(McpCatalogError::Unavailable {
+                    server: descriptor.server_name().to_string(),
+                })
+            })?;
+        client.call_tool_descriptor(descriptor, arguments).await
     }
 
     /// Number of connected servers.
@@ -1063,20 +1722,20 @@ impl McpManager {
         self.clients
             .iter()
             .filter_map(|(name, client)| {
-                client.instructions.as_ref().map(|instr| (name.clone(), instr.clone()))
+                client
+                    .instructions
+                    .as_ref()
+                    .map(|instr| (name.clone(), instr.clone()))
             })
             .collect()
     }
 
     /// List all resources from all (or a specific) connected server.
-    pub async fn list_all_resources(
-        &self,
-        server_filter: Option<&str>,
-    ) -> Vec<serde_json::Value> {
+    pub async fn list_all_resources(&self, server_filter: Option<&str>) -> Vec<serde_json::Value> {
         let mut all = vec![];
         for (name, client) in &self.clients {
             if let Some(filter) = server_filter {
-                if name != filter {
+                if canonical_mcp_server_name(name) != canonical_mcp_server_name(filter) {
                     continue;
                 }
             }
@@ -1105,25 +1764,20 @@ impl McpManager {
         &self,
         server_name: &str,
         uri: &str,
-    ) -> anyhow::Result<serde_json::Value> {
-        let client = self
-            .clients
-            .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
+    ) -> anyhow::Result<Vec<ResourceContents>> {
+        let client = self.client_for_name(server_name).ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' not found or not connected", server_name)
+        })?;
 
-        let contents = client.read_resource(uri).await?;
-        Ok(serde_json::to_value(&contents)?)
+        client.read_resource(uri).await
     }
 
     /// List all prompts from all (or a specific) connected server.
-    pub async fn list_all_prompts(
-        &self,
-        server_filter: Option<&str>,
-    ) -> Vec<serde_json::Value> {
+    pub async fn list_all_prompts(&self, server_filter: Option<&str>) -> Vec<serde_json::Value> {
         let mut all = vec![];
         for (name, client) in &self.clients {
             if let Some(filter) = server_filter {
-                if name != filter {
+                if canonical_mcp_server_name(name) != canonical_mcp_server_name(filter) {
                     continue;
                 }
             }
@@ -1156,10 +1810,9 @@ impl McpManager {
         prompt_name: &str,
         arguments: Option<std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<GetPromptResult> {
-        let client = self
-            .clients
-            .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
+        let client = self.client_for_name(server_name).ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' not found or not connected", server_name)
+        })?;
         client.get_prompt(prompt_name, arguments).await
     }
 
@@ -1173,7 +1826,7 @@ impl McpManager {
     /// - Returns `NotRequired` for stdio servers.
     /// - Returns `Required` for remote `http` / `sse` servers that lack a valid token.
     pub fn auth_state(&self, server_name: &str) -> McpAuthState {
-        let config = match self.server_configs.get(server_name) {
+        let config = match self.config_for_name(server_name) {
             Some(c) => c,
             None => return McpAuthState::NotRequired,
         };
@@ -1217,19 +1870,15 @@ impl McpManager {
     /// Build a full OAuth authorization session for an HTTP/SSE MCP server.
     pub async fn begin_auth(&self, server_name: &str) -> anyhow::Result<oauth::McpAuthSession> {
         let config = self
-            .server_configs
-            .get(server_name)
+            .config_for_name(server_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown MCP server: {}", server_name))?;
 
-        let base_url = config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MCP server '{}' has no URL configured (required for OAuth)",
-                    server_name
-                )
-            })?;
+        let base_url = config.url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server '{}' has no URL configured (required for OAuth)",
+                server_name
+            )
+        })?;
 
         oauth::begin_mcp_auth(server_name, base_url).await
     }
@@ -1237,19 +1886,15 @@ impl McpManager {
     /// Run the browser-based OAuth flow and persist the resulting token.
     pub async fn authenticate(&self, server_name: &str) -> anyhow::Result<oauth::McpAuthResult> {
         let config = self
-            .server_configs
-            .get(server_name)
+            .config_for_name(server_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown MCP server: {}", server_name))?;
 
-        let base_url = config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MCP server '{}' has no URL configured (required for OAuth)",
-                    server_name
-                )
-            })?;
+        let base_url = config.url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server '{}' has no URL configured (required for OAuth)",
+                server_name
+            )
+        })?;
 
         oauth::run_mcp_auth_flow(server_name, base_url).await
     }
@@ -1285,7 +1930,7 @@ impl McpManager {
     ///
     /// Returns `None` if no token is stored or the token cannot be refreshed.
     pub async fn load_token(&self, server_name: &str) -> Option<String> {
-        let config = self.server_configs.get(server_name)?;
+        let config = self.config_for_name(server_name)?;
         let server_url = config.url.as_deref()?;
         oauth::get_valid_mcp_access_token(server_name, server_url)
             .await
@@ -1311,13 +1956,25 @@ impl McpManager {
         let clients = self.clients.clone();
 
         // Spawn a task for each client to handle notifications via the stream
-        for client in clients.values() {
-            let client_clone = Arc::clone(client);
+        for (name, client) in &clients {
+            if self
+                .inherited
+                .as_ref()
+                .is_some_and(|parent| parent.client_for_name(name).is_some())
+            {
+                continue;
+            }
+            let client_weak = Arc::downgrade(client);
             let manager_weak = Arc::downgrade(&self);
 
             tokio::spawn(async move {
                 // Subscribe to the transport's notification stream
-                let mut notification_stream = client_clone.subscribe_to_notifications();
+                let client = match client_weak.upgrade() {
+                    Some(client) => client,
+                    None => return,
+                };
+                let mut notification_stream = client.subscribe_to_notifications();
+                drop(client);
 
                 // Process notifications from the stream
                 while let Some(result) = notification_stream.next().await {
@@ -1326,16 +1983,20 @@ impl McpManager {
                         Some(m) => m,
                         None => break, // Manager dropped — shut down
                     };
+                    let client = match client_weak.upgrade() {
+                        Some(client) => client,
+                        None => break,
+                    };
 
                     match result {
                         Ok(raw) => {
-                            client_clone
+                            client
                                 .process_notification(raw, &manager.resource_subscriptions)
                                 .await;
                         }
                         Err(e) => {
                             debug!(
-                                server = %client_clone.server_name,
+                                server = %client.server_name,
                                 error = %e,
                                 "notification stream error"
                             );
@@ -1361,33 +2022,30 @@ impl Default for McpManager {
 /// Convert an MCP tool call result to a string for the model.
 ///
 /// Content type handling:
-/// - `text`     → the text itself
-/// - `image`    → `[Image: <mime_type>]` with a short base64 preview
-/// - `resource` → `[Resource: <uri>]` plus text content if present
+/// - `text`         → bounded text
+/// - `image`        → truthful MIME metadata without payload bytes
+/// - `resource`     → bounded URI metadata plus text content when present
+/// - `audio`        → truthful unsupported-content metadata
+/// - `resource_link` → bounded link metadata without fetching
 ///
 /// Mixed content is joined with newlines.
 /// If all content is empty, returns an empty string.
 pub fn mcp_result_to_string(result: &CallToolResult) -> String {
+    const MAX_DISPLAY_BYTES: usize = 32 * 1024;
+    const MAX_PART_BYTES: usize = 16 * 1024;
     let parts: Vec<String> = result
         .content
         .iter()
         .map(|c| match c {
-            McpContent::Text { text } => text.clone(),
-            McpContent::Image { data, mime_type } => {
-                // Show a short preview (first 32 chars of base64) so the model
-                // knows an image was returned without embedding the full blob.
-                let preview_len = data.len().min(32);
-                let preview = &data[..preview_len];
-                let ellipsis = if data.len() > 32 { "…" } else { "" };
-                format!(
-                    "[Image: {} | base64 preview: {}{}]",
-                    mime_type, preview, ellipsis
-                )
+            McpContent::Text { text } => truncate_utf8(text, MAX_PART_BYTES),
+            McpContent::Image { mime_type, .. } => format!("[Image: {}]", mime_type),
+            McpContent::Audio { mime_type, .. } => {
+                format!("[Audio content unsupported: {}]", mime_type)
             }
             McpContent::Resource { resource } => {
                 let mut parts = vec![format!("[Resource: {}]", resource.uri)];
                 if let Some(ref text) = resource.text {
-                    parts.push(text.clone());
+                    parts.push(truncate_utf8(text, MAX_PART_BYTES));
                 } else if resource.blob.is_some() {
                     let mime = resource
                         .mime_type
@@ -1397,15 +2055,241 @@ pub fn mcp_result_to_string(result: &CallToolResult) -> String {
                 }
                 parts.join("\n")
             }
+            McpContent::ResourceLink {
+                uri,
+                name,
+                description,
+                mime_type,
+            } => {
+                let mut link = format!("[Resource link: {} ({})]", name, uri);
+                if let Some(mime_type) = mime_type {
+                    link.push_str(&format!(" [{}]", mime_type));
+                }
+                if let Some(description) = description {
+                    link.push(' ');
+                    link.push_str(&truncate_utf8(description, MAX_PART_BYTES));
+                }
+                link
+            }
         })
         .collect();
 
-    parts.join("\n")
+    truncate_utf8(&parts.join("\n"), MAX_DISPLAY_BYTES)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.saturating_sub("…".len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_source_key_matches_canonical_golden_vector() {
+        let config = McpServerConfig {
+            name: "Demo".into(),
+            command: Some("node".into()),
+            args: vec!["server.js".into()],
+            env: HashMap::from([
+                ("API_TOKEN".into(), "TOKEN_A".into()),
+                ("Z".into(), "9".into()),
+                ("a".into(), "1".into()),
+            ]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        assert_eq!(
+            mcp_launch_source_key(&config).as_deref(),
+            Some("cee7e0847e31fc92b64917a48726f121512556f0d680ddadb80d1fc9ae78d145")
+        );
+    }
+
+    #[test]
+    fn launch_source_key_changes_with_origin_and_effective_environment() {
+        let mut config = McpServerConfig {
+            name: "demo".into(),
+            command: Some("node".into()),
+            args: vec![],
+            env: HashMap::from([("API_TOKEN".into(), "${_CC_SOURCE_IDENTITY}".into())]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        std::env::set_var("_CC_SOURCE_IDENTITY", "TOKEN_A");
+        let expanded_a = expand_server_config(&config);
+        let user = mcp_launch_source_key(&expanded_a).unwrap();
+        std::env::set_var("_CC_SOURCE_IDENTITY", "TOKEN_B");
+        let expanded_b = expand_server_config(&config);
+        assert_ne!(Some(user.clone()), mcp_launch_source_key(&expanded_b));
+        assert_ne!(Some(user), mcp_launch_source_key(&config));
+        config.origin = McpServerOrigin::Project;
+        assert_ne!(
+            mcp_launch_source_key(&expanded_b),
+            mcp_launch_source_key(&config)
+        );
+        std::env::remove_var("_CC_SOURCE_IDENTITY");
+    }
+
+    #[test]
+    fn scoped_source_key_uses_explicit_config_without_inherited_expansion() {
+        let config = McpServerConfig {
+            name: "scoped".into(),
+            command: Some("node".into()),
+            args: vec![],
+            env: HashMap::from([("API_TOKEN".into(), "${_CC_SCOPED_SOURCE}".into())]),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        std::env::set_var("_CC_SCOPED_SOURCE", "INHERITED");
+        let explicit = mcp_launch_source_key(&config).unwrap();
+        let expanded = mcp_launch_source_key(&expand_server_config(&config)).unwrap();
+        assert_ne!(explicit, expanded);
+        std::env::remove_var("_CC_SCOPED_SOURCE");
+    }
+
+    #[tokio::test]
+    async fn constructor_failed_spawn_preserves_live_source_identity_for_refresh() {
+        let fixture = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "source-transaction-fixture", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "echo",
+            "description": "source transaction fixture",
+            "inputSchema": {"type": "object"},
+        }]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+        let config_a = McpServerConfig {
+            name: "source-transaction-fixture".into(),
+            command: Some("python3".into()),
+            args: vec!["-u".into(), "-c".into(), fixture.into()],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".into(),
+            origin: McpServerOrigin::User,
+        };
+        let catalog = Arc::new(catalog_state::CatalogState::new());
+        let client = Arc::new(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client::McpClient::connect_stdio_with_catalog(&config_a, Arc::clone(&catalog)),
+            )
+            .await
+            .expect("live source A fixture connection timed out")
+            .expect("live source A fixture connection"),
+        );
+        let outcome: anyhow::Result<()> = async {
+            let descriptor_a = catalog
+                .checked_snapshot()?
+                .descriptors
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("source A descriptor missing"))?;
+            let source_key_a = mcp_launch_source_key(&config_a)
+                .ok_or_else(|| anyhow::anyhow!("source A key missing"))?;
+            if descriptor_a.source_key() != Some(source_key_a.as_str()) {
+                anyhow::bail!("source A descriptor identity mismatch");
+            }
+
+            let mut config_b = config_a.clone();
+            config_b.command =
+                Some("/definitely/missing/forge-mcp-source-transaction-fixture".into());
+            let source_key_b = mcp_launch_source_key(&config_b)
+                .ok_or_else(|| anyhow::anyhow!("source B key missing"))?;
+            let b_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client::McpClient::connect_stdio_with_catalog(&config_b, Arc::clone(&catalog)),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("source B fixture connection timed out"))?;
+            let error = match b_result {
+                Ok(b_client) => {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        b_client.shutdown(),
+                    )
+                    .await;
+                    anyhow::bail!("missing source B executable unexpectedly connected");
+                }
+                Err(error) => error,
+            };
+            if !error
+                .to_string()
+                .contains("failed to spawn rmcp stdio child")
+            {
+                anyhow::bail!("source B failed for an unexpected reason: {error}");
+            }
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.list_tools())
+                .await
+                .map_err(|_| anyhow::anyhow!("source A refresh timed out"))??;
+            let descriptor_after_refresh = catalog
+                .checked_snapshot()?
+                .descriptors
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("refreshed source A descriptor missing"))?;
+            if descriptor_after_refresh.source_key() != Some(source_key_a.as_str()) {
+                anyhow::bail!("source A refresh changed descriptor identity");
+            }
+            let catalog_source_key = catalog
+                .lookup_server(&config_a.name)
+                .ok_or_else(|| anyhow::anyhow!("source A catalog entry missing"))?
+                .source_key();
+            if catalog_source_key != Some(source_key_a.clone()) {
+                anyhow::bail!("source A refresh changed catalog identity");
+            }
+
+            let mut manager = McpManager::new();
+            manager
+                .clients
+                .insert(config_a.name.clone(), Arc::clone(&client));
+            if manager.source_key_for_descriptor(&descriptor_after_refresh)
+                != Some(source_key_a.clone())
+            {
+                anyhow::bail!("manager did not preserve source A identity");
+            }
+            if manager.source_key_for_descriptor(&descriptor_after_refresh) == Some(source_key_b) {
+                anyhow::bail!("manager accepted failed source B identity");
+            }
+            Ok(())
+        }
+        .await;
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+            .await
+            .map_err(|_| anyhow::anyhow!("source A shutdown timed out"))
+            .and_then(|result| result);
+        match (outcome, shutdown) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) => panic!("source transaction regression: {error}"),
+            (Ok(()), Err(error)) => panic!("source A shutdown failed: {error}"),
+            (Err(outcome_error), Err(shutdown_error)) => panic!(
+                "source transaction regression: {outcome_error}; source A shutdown failed: {shutdown_error}"
+            ),
+        }
+    }
 
     // ---- env expansion -----------------------------------------------------
 
@@ -1466,8 +2350,200 @@ mod tests {
         let expanded = expand_server_config(&cfg);
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
         assert_eq!(expanded.args[1], "/home/user");
-        assert_eq!(expanded.env.get("PATH").map(|s| s.as_str()), Some("/home/user/bin"));
+        assert_eq!(
+            expanded.env.get("PATH").map(|s| s.as_str()),
+            Some("/home/user/bin")
+        );
         std::env::remove_var("_CC_TEST_HOME");
+    }
+
+    #[tokio::test]
+    async fn reconcile_reuses_unchanged_client_arc_and_catalog_leaf() {
+        let config = McpServerConfig {
+            name: "user-server".to_string(),
+            command: Some("fixture".to_string()),
+            args: vec!["--one".to_string()],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: Default::default(),
+        };
+        let mut previous = McpManager::new();
+        previous
+            .catalog
+            .server("user-server")
+            .unwrap()
+            .install_tools(
+                1,
+                &[McpTool {
+                    name: "echo".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+            )
+            .unwrap();
+        previous
+            .server_configs
+            .insert(config.name.clone(), config.clone());
+        let client = Arc::new(client::McpClient::new_for_test("user-server"));
+        previous
+            .clients
+            .insert(config.name.clone(), Arc::clone(&client));
+        let previous = Arc::new(previous);
+
+        let outcome = McpManager::reconcile_with_previous(&previous, &[config]).await;
+        let reused = outcome.manager.clients.get("user-server").unwrap();
+        assert!(Arc::ptr_eq(&client, reused));
+        assert_eq!(outcome.reused, vec!["user-server"]);
+        assert!(outcome.failures.is_empty());
+        assert!(outcome.manager.checked_catalog_snapshot().is_ok());
+    }
+
+    #[tokio::test]
+    async fn case_only_rename_reuses_display_client_and_delivers_subscription() {
+        let old = McpServerConfig {
+            name: "Foo".to_string(),
+            command: Some("fixture".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: McpServerOrigin::User,
+        };
+        let mut renamed = old.clone();
+        renamed.name = "foo".to_string();
+        let mut previous = McpManager::new();
+        previous.server_configs.insert(old.name.clone(), old);
+        let client = Arc::new(client::McpClient::new_for_test("Foo"));
+        previous
+            .clients
+            .insert("Foo".to_string(), Arc::clone(&client));
+        let previous = Arc::new(previous);
+
+        let outcome = McpManager::reconcile_with_previous(&previous, &[renamed]).await;
+        assert!(Arc::ptr_eq(
+            &client,
+            outcome.manager.client_for_name("foo").unwrap()
+        ));
+
+        let owner = outcome.manager.resource_owner("foo");
+        assert!(owner.client_for_name("foo").is_some());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        owner
+            .resource_subscriptions
+            .insert(("foo".to_string(), "memory://case".to_string()), sender);
+        client::McpClient::process_notification(
+            outcome.manager.client_for_name("foo").unwrap(),
+            serde_json::json!({
+                "method": "notifications/resources/updated",
+                "params": {"uri": "memory://case"}
+            }),
+            &owner.resource_subscriptions,
+        )
+        .await;
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.server_name, "Foo");
+        assert_eq!(event.uri, "memory://case");
+    }
+
+    #[tokio::test]
+    async fn invalidated_owner_forces_same_definition_replacement_path() {
+        let config = McpServerConfig {
+            name: "owner-server".to_string(),
+            command: Some("fixture".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: McpServerOrigin::User,
+        };
+        let mut previous = McpManager::new();
+        previous
+            .server_configs
+            .insert(config.name.clone(), config.clone());
+        let client = Arc::new(client::McpClient::new_for_test("owner-server"));
+        previous
+            .clients
+            .insert(config.name.clone(), Arc::clone(&client));
+        let previous = Arc::new(previous);
+        let invalidated = HashSet::from(["owner-server".to_string()]);
+
+        let outcome =
+            McpManager::reconcile_with_previous_invalidated(&previous, &[config], &invalidated)
+                .await;
+        assert!(outcome.reused.is_empty());
+        assert!(outcome.manager.clients.is_empty());
+        assert_eq!(outcome.manager.retired_clients.len(), 1);
+        assert!(!outcome.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_changed_definition_drops_old_source_fail_closed() {
+        let old = McpServerConfig {
+            name: "plugin-server".to_string(),
+            command: Some("old-fixture".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: claurst_core::config::McpServerOrigin::Project,
+        };
+        let mut changed = old.clone();
+        changed.command = Some("new-fixture".to_string());
+        let mut previous = McpManager::new();
+        previous.server_configs.insert(old.name.clone(), old);
+        let client = Arc::new(client::McpClient::new_for_test("plugin-server"));
+        previous
+            .clients
+            .insert("plugin-server".to_string(), Arc::clone(&client));
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        previous.resource_subscriptions.insert(
+            ("plugin-server".to_string(), "stale://resource".to_string()),
+            sender,
+        );
+        let previous = Arc::new(previous);
+
+        let outcome = McpManager::reconcile_with_previous(&previous, &[changed]).await;
+        assert!(outcome.manager.clients.is_empty());
+        assert!(!outcome.failures.is_empty());
+        assert!(!outcome
+            .manager
+            .server_names()
+            .iter()
+            .any(|name| name == "plugin-server"));
+        assert_eq!(
+            client.catalog_state().availability(),
+            CatalogAvailability::Unavailable
+        );
+        assert_eq!(outcome.manager.retired_clients.len(), 1);
+        assert!(outcome
+            .manager
+            .inherited
+            .as_ref()
+            .unwrap()
+            .resource_subscriptions
+            .is_empty());
+    }
+
+    #[test]
+    fn canonical_mcp_configs_prefers_user_and_deduplicates_case_insensitively() {
+        let project = McpServerConfig {
+            name: "Foo".to_string(),
+            command: Some("project".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: McpServerOrigin::Project,
+        };
+        let mut user = project.clone();
+        user.name = "foo".to_string();
+        user.command = Some("user".to_string());
+        user.origin = McpServerOrigin::User;
+        let selected = canonical_mcp_configs(&[project, user]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "foo");
+        assert_eq!(selected[0].command.as_deref(), Some("user"));
     }
 
     // ---- JSON-RPC -----------------------------------------------------------
@@ -1532,7 +2608,34 @@ mod tests {
         let s = mcp_result_to_string(&result);
         assert!(s.contains("Image:"));
         assert!(s.contains("image/png"));
-        assert!(s.contains("abc123"));
+        assert!(!s.contains("abc123"));
+        assert!(!s.contains("base64"));
+    }
+
+    #[test]
+    fn resource_link_uses_protocol_tag_and_round_trips() {
+        let content = McpContent::ResourceLink {
+            uri: "file:///report.txt".to_string(),
+            name: "report".to_string(),
+            description: Some("text report".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let encoded = serde_json::to_value(&content).unwrap();
+        assert_eq!(encoded["type"], "resource_link");
+        match serde_json::from_value::<McpContent>(encoded).unwrap() {
+            McpContent::ResourceLink {
+                uri,
+                name,
+                description,
+                mime_type,
+            } => {
+                assert_eq!(uri, "file:///report.txt");
+                assert_eq!(name, "report");
+                assert_eq!(description.as_deref(), Some("text report"));
+                assert_eq!(mime_type.as_deref(), Some("text/plain"));
+            }
+            other => panic!("expected resource link after round trip, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1694,12 +2797,13 @@ pub async fn subscribe_resource(
     server_name: &str,
     uri: &str,
 ) -> tokio_mpsc::Receiver<ResourceChangedEvent> {
+    let manager = manager.resource_owner(server_name);
     let make_dead = || {
         let (_tx, rx) = tokio_mpsc::channel::<ResourceChangedEvent>(1);
         rx
     };
 
-    let client = match manager.clients.get(server_name) {
+    let client = match manager.client_for_name(server_name) {
         Some(c) => c,
         None => {
             tracing::warn!(server_name, uri, "subscribe_resource: server not connected");
@@ -1713,9 +2817,10 @@ pub async fn subscribe_resource(
     }
 
     let (tx, rx) = tokio_mpsc::channel(32);
-    manager
-        .resource_subscriptions
-        .insert((server_name.to_string(), uri.to_string()), tx);
+    manager.resource_subscriptions.insert(
+        (canonical_mcp_server_name(server_name), uri.to_string()),
+        tx,
+    );
     tracing::info!(server_name, uri, "MCP resource subscription registered");
     rx
 }
@@ -1730,10 +2835,13 @@ pub async fn unsubscribe_resource(
     server_name: &str,
     uri: &str,
 ) -> Result<(), String> {
-    let client = manager
-        .clients
-        .get(server_name)
-        .ok_or_else(|| format!("unsubscribe_resource: server '{}' not connected", server_name))?;
+    let manager = manager.resource_owner(server_name);
+    let client = manager.client_for_name(server_name).ok_or_else(|| {
+        format!(
+            "unsubscribe_resource: server '{}' not connected",
+            server_name
+        )
+    })?;
 
     client
         .unsubscribe_resource(uri)
@@ -1809,9 +2917,10 @@ mod transport_tests {
         assert!(crate::McpClient::is_unsupported_protocol_error(
             "Bad Request: Unsupported MCP-Protocol-Version: 2025-11-25"
         ));
-        assert!(!crate::McpClient::is_unsupported_protocol_error("connection reset by peer"));
+        assert!(!crate::McpClient::is_unsupported_protocol_error(
+            "connection reset by peer"
+        ));
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1821,6 +2930,112 @@ mod transport_tests {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    struct TestNotificationBackend {
+        snapshot: backend::McpClientSnapshot,
+        catalog: Arc<catalog_state::ServerCatalogState>,
+        connection_generation: u64,
+        refreshed_tools: Vec<McpTool>,
+        list_calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+        notification_rx: StdMutex<Option<tokio::sync::mpsc::Receiver<Value>>>,
+        call_entered: Arc<tokio::sync::Notify>,
+        call_release: Arc<tokio::sync::Notify>,
+        backend_dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for TestNotificationBackend {
+        fn drop(&mut self) {
+            self.backend_dropped.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl backend::McpClientBackend for TestNotificationBackend {
+        fn kind(&self) -> backend::McpBackendKind {
+            backend::McpBackendKind::Rmcp
+        }
+
+        fn snapshot(&self) -> backend::McpClientSnapshot {
+            self.snapshot.clone()
+        }
+
+        fn catalog_state(&self) -> Arc<catalog_state::ServerCatalogState> {
+            Arc::clone(&self.catalog)
+        }
+
+        async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let starting_generation = self
+                .catalog
+                .begin_refresh_if_connection(self.connection_generation)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            self.catalog
+                .commit_refresh(
+                    starting_generation,
+                    self.connection_generation,
+                    &self.refreshed_tools,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(self.refreshed_tools.clone())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<Value>,
+        ) -> anyhow::Result<CallToolResult> {
+            self.tool_calls.fetch_add(1, Ordering::SeqCst);
+            self.call_entered.notify_one();
+            self.call_release.notified().await;
+            Ok(CallToolResult {
+                content: vec![McpContent::Text {
+                    text: "held call completed".to_string(),
+                }],
+                is_error: false,
+            })
+        }
+
+        async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
+            Ok(Vec::new())
+        }
+
+        async fn read_resource(&self, _uri: &str) -> anyhow::Result<Vec<ResourceContents>> {
+            Err(anyhow::anyhow!("test backend has no resources"))
+        }
+
+        async fn list_prompts(&self) -> anyhow::Result<Vec<McpPrompt>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_prompt(
+            &self,
+            _name: &str,
+            _arguments: Option<HashMap<String, String>>,
+        ) -> anyhow::Result<GetPromptResult> {
+            Err(anyhow::anyhow!("test backend has no prompts"))
+        }
+
+        async fn subscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unsubscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<Value>> {
+            match self.notification_rx.lock().unwrap().take() {
+                Some(receiver) => Box::pin(ReceiverStream::new(receiver).map(Ok)),
+                None => Box::pin(stream::empty()),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_process_notification_routes_resource_updated() {
@@ -1839,12 +3054,17 @@ mod notification_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ResourceChangedEvent>(4);
         subscriptions.insert(("myserver".to_string(), "file:///foo.txt".to_string()), tx);
 
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
 
         let event = rx.try_recv().expect("expected a ResourceChangedEvent");
         assert_eq!(event.server_name, "myserver");
         assert_eq!(event.uri, "file:///foo.txt");
-        assert!(rx.try_recv().is_err(), "channel should be empty after one event");
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be empty after one event"
+        );
     }
 
     #[tokio::test]
@@ -1860,7 +3080,9 @@ mod notification_tests {
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
     }
 
     #[tokio::test]
@@ -1876,7 +3098,208 @@ mod notification_tests {
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_process_notification_refreshes_catalog_while_tool_call_is_held() {
+        let server_name = "myserver";
+        let catalog = Arc::new(catalog_state::ServerCatalogState::new(server_name));
+        let initial_tool = McpTool {
+            name: "old_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        catalog
+            .install_tools(1, std::slice::from_ref(&initial_tool))
+            .unwrap();
+        let stale_descriptor = catalog.descriptor("myserver_old_tool").unwrap();
+        let refreshed_tools = vec![McpTool {
+            name: "new_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let call_entered = Arc::new(tokio::sync::Notify::new());
+        let call_release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(TestNotificationBackend {
+            snapshot: backend::McpClientSnapshot {
+                server_name: server_name.to_string(),
+                server_info: None,
+                capabilities: ServerCapabilities::default(),
+                tools: vec![initial_tool],
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                instructions: None,
+            },
+            catalog: Arc::clone(&catalog),
+            connection_generation: 1,
+            refreshed_tools,
+            list_calls: Arc::clone(&list_calls),
+            tool_calls: Arc::clone(&tool_calls),
+            notification_rx: StdMutex::new(None),
+            call_entered: Arc::clone(&call_entered),
+            call_release: Arc::clone(&call_release),
+            backend_dropped: Arc::new(tokio::sync::Notify::new()),
+        });
+        let client = Arc::new(client::McpClient::new_for_test_with_backend(backend));
+        let subscriptions = DashMap::new();
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {}
+        });
+
+        let call_client = Arc::clone(&client);
+        let admitted_descriptor = stale_descriptor.clone();
+        let call_handle = tokio::spawn(async move {
+            call_client
+                .call_tool_descriptor(&admitted_descriptor, None)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), call_entered.notified())
+            .await
+            .expect("tool call did not enter backend");
+        assert!(
+            !call_handle.is_finished(),
+            "tool call must remain pending before release"
+        );
+
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
+
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            catalog.revision_header().availability,
+            CatalogAvailability::Available
+        );
+        assert!(catalog.descriptor("myserver_new_tool").is_ok());
+        assert!(matches!(
+            client.call_tool_descriptor(&stale_descriptor, None).await,
+            Err(error) if error.downcast_ref::<McpCatalogError>() == Some(&McpCatalogError::StaleDescriptor)
+        ));
+        assert!(
+            !call_handle.is_finished(),
+            "refresh must not release the held tool call"
+        );
+        call_release.notify_one();
+        let call_result = call_handle.await.expect("held tool call task panicked");
+        assert!(
+            call_result.is_ok(),
+            "held tool call should complete after one release"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_manager_notification_loop_refreshes_catalog() {
+        let server_name = "loop-server";
+        let catalog = Arc::new(catalog_state::ServerCatalogState::new(server_name));
+        catalog
+            .install_tools(
+                1,
+                &[McpTool {
+                    name: "before".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+            )
+            .unwrap();
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(2);
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(TestNotificationBackend {
+            snapshot: backend::McpClientSnapshot {
+                server_name: server_name.to_string(),
+                server_info: None,
+                capabilities: ServerCapabilities::default(),
+                tools: vec![],
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                instructions: None,
+            },
+            catalog: Arc::clone(&catalog),
+            connection_generation: 1,
+            refreshed_tools: vec![McpTool {
+                name: "after".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            list_calls: Arc::clone(&list_calls),
+            tool_calls: Arc::new(AtomicUsize::new(0)),
+            notification_rx: StdMutex::new(Some(notification_rx)),
+            call_entered: Arc::new(tokio::sync::Notify::new()),
+            call_release: Arc::new(tokio::sync::Notify::new()),
+            backend_dropped: Arc::new(tokio::sync::Notify::new()),
+        });
+        let client = Arc::new(client::McpClient::new_for_test_with_backend(backend));
+        let mut manager = McpManager::new();
+        manager
+            .clients
+            .insert(server_name.to_string(), Arc::clone(&client));
+        let manager = Arc::new(manager);
+        manager.clone().spawn_notification_poll_loop();
+        notification_tx
+            .send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {}
+            }))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while list_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manager notification loop refresh timeout");
+        assert_eq!(
+            catalog.descriptor("loop-server_after").unwrap().raw_name(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_notification_loop_drops_idle_client_with_manager() {
+        let server_name = "idle-server";
+        let catalog = Arc::new(catalog_state::ServerCatalogState::new(server_name));
+        let (_notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
+        let backend_dropped = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(TestNotificationBackend {
+            snapshot: backend::McpClientSnapshot::empty(server_name),
+            catalog,
+            connection_generation: 1,
+            refreshed_tools: Vec::new(),
+            list_calls: Arc::new(AtomicUsize::new(0)),
+            tool_calls: Arc::new(AtomicUsize::new(0)),
+            notification_rx: StdMutex::new(Some(notification_rx)),
+            call_entered: Arc::new(tokio::sync::Notify::new()),
+            call_release: Arc::new(tokio::sync::Notify::new()),
+            backend_dropped: Arc::clone(&backend_dropped),
+        });
+        let client = Arc::new(client::McpClient::new_for_test_with_backend(backend));
+        let mut manager = McpManager::new();
+        manager
+            .clients
+            .insert(server_name.to_string(), Arc::clone(&client));
+        let manager = Arc::new(manager);
+        manager.clone().spawn_notification_poll_loop();
+
+        drop(manager);
+        drop(client);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend_dropped.notified(),
+        )
+        .await
+        .expect("idle notification loop retained the client/backend");
     }
 
     #[tokio::test]

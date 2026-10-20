@@ -14,10 +14,39 @@ use std::sync::Arc;
 use agent_client_protocol_schema as acp;
 use claurst_core::permissions::{PermissionDecision, PermissionRequest};
 use claurst_core::PermissionHandler;
-use claurst_tools::{PendingPermissionStore, PendingPermissionRequest};
+use claurst_tools::{PendingPermissionRequest, PendingPermissionStore};
 use tracing::{debug, warn};
 
 use crate::connection::Connection;
+
+const MAX_PERMISSION_FORWARDS: usize = 16;
+pub(crate) const MAX_QUEUED_PERMISSIONS: usize = 64;
+
+struct DecisionOwner(Option<tokio::sync::oneshot::Sender<PermissionDecision>>);
+
+impl DecisionOwner {
+    fn resolve(mut self, decision: PermissionDecision) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(decision);
+        }
+    }
+}
+
+impl Drop for DecisionOwner {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(PermissionDecision::Deny);
+        }
+    }
+}
+
+struct StoreOwner(Arc<parking_lot::Mutex<PendingPermissionStore>>);
+
+impl Drop for StoreOwner {
+    fn drop(&mut self) {
+        self.0.lock().close();
+    }
+}
 
 /// Permission handler that defers every decision to the ACP client.
 pub struct AcpPermissionHandler;
@@ -43,85 +72,89 @@ impl PermissionHandler for AcpPermissionHandler {
 /// Drain a single pending permission request, route it through the
 /// connection as `session/request_permission`, and fire the oneshot with
 /// the resulting decision.
-pub async fn forward_pending(
+pub fn forward_pending(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
     pending: PendingPermissionRequest,
-) {
+) -> impl std::future::Future<Output = ()> {
     let PendingPermissionRequest {
         tool_use_id,
         request,
         reason,
         decision_tx,
     } = pending;
+    // Ownership starts before first poll; an aborted task must deny its waiter.
+    let decision_owner = DecisionOwner(decision_tx);
+    async move {
+        if decision_owner.0.is_none() {
+            warn!("ACP permission: pending request had no decision channel");
+            return;
+        }
 
-    let Some(decision_tx) = decision_tx else {
-        warn!(tool_use_id, "ACP permission: pending request had no decision_tx");
-        return;
-    };
+        let title = if reason.is_empty() {
+            format!("Approve {}", request.tool_name)
+        } else {
+            reason.clone()
+        };
 
-    let title = if reason.is_empty() {
-        format!("Approve {}", request.tool_name)
-    } else {
-        reason.clone()
-    };
+        let fields = acp::ToolCallUpdateFields::new()
+            .kind(Some(infer_tool_kind(&request)))
+            .status(Some(acp::ToolCallStatus::Pending))
+            .title(Some(title));
+        let tool_call =
+            acp::ToolCallUpdate::new(acp::ToolCallId::new(tool_use_id.as_str()), fields);
 
-    let fields = acp::ToolCallUpdateFields::new()
-        .kind(Some(infer_tool_kind(&request)))
-        .status(Some(acp::ToolCallStatus::Pending))
-        .title(Some(title));
-    let tool_call = acp::ToolCallUpdate::new(acp::ToolCallId::new(tool_use_id.as_str()), fields);
+        let options = vec![
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("allow_once"),
+                "Allow once",
+                acp::PermissionOptionKind::AllowOnce,
+            ),
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("allow_always"),
+                "Allow always",
+                acp::PermissionOptionKind::AllowAlways,
+            ),
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("reject_once"),
+                "Reject",
+                acp::PermissionOptionKind::RejectOnce,
+            ),
+        ];
 
-    let options = vec![
-        acp::PermissionOption::new(
-            acp::PermissionOptionId::new("allow_once"),
-            "Allow once",
-            acp::PermissionOptionKind::AllowOnce,
-        ),
-        acp::PermissionOption::new(
-            acp::PermissionOptionId::new("allow_always"),
-            "Allow always",
-            acp::PermissionOptionKind::AllowAlways,
-        ),
-        acp::PermissionOption::new(
-            acp::PermissionOptionId::new("reject_once"),
-            "Reject",
-            acp::PermissionOptionKind::RejectOnce,
-        ),
-    ];
+        let request_params = acp::RequestPermissionRequest::new(session_id, tool_call, options);
 
-    let request_params = acp::RequestPermissionRequest::new(session_id, tool_call, options);
+        debug!("ACP permission: requesting from client");
+        let result = connection
+            .send_request::<_, acp::RequestPermissionResponse>(
+                "session/request_permission",
+                request_params,
+            )
+            .await;
 
-    debug!(tool = %request.tool_name, "ACP permission: requesting from client");
-    let result = connection
-        .send_request::<_, acp::RequestPermissionResponse>(
-            "session/request_permission",
-            request_params,
-        )
-        .await;
-
-    let decision = match result {
-        Ok(Ok(response)) => match response.outcome {
-            acp::RequestPermissionOutcome::Selected(sel) => match sel.option_id.0.as_ref() {
-                "allow_once" => PermissionDecision::Allow,
-                "allow_always" => PermissionDecision::AllowPermanently,
-                "reject_always" => PermissionDecision::DenyPermanently,
+        let decision = match result {
+            Ok(Ok(response)) => match response.outcome {
+                acp::RequestPermissionOutcome::Selected(sel) => match sel.option_id.0.as_ref() {
+                    "allow_once" => PermissionDecision::Allow,
+                    "allow_always" => PermissionDecision::AllowPermanently,
+                    "reject_always" => PermissionDecision::DenyPermanently,
+                    _ => PermissionDecision::Deny,
+                },
+                acp::RequestPermissionOutcome::Cancelled => PermissionDecision::Deny,
                 _ => PermissionDecision::Deny,
             },
-            acp::RequestPermissionOutcome::Cancelled => PermissionDecision::Deny,
-            _ => PermissionDecision::Deny,
-        },
-        Ok(Err(err)) => {
-            warn!(?err, "ACP permission: client returned error, denying");
-            PermissionDecision::Deny
-        }
-        Err(err) => {
-            warn!(?err, "ACP permission: send_request failed, denying");
-            PermissionDecision::Deny
-        }
-    };
+            Ok(Err(_)) => {
+                warn!("ACP permission: client returned error, denying");
+                PermissionDecision::Deny
+            }
+            Err(_) => {
+                warn!("ACP permission: send_request failed, denying");
+                PermissionDecision::Deny
+            }
+        };
 
-    let _ = decision_tx.send(decision);
+        decision_owner.resolve(decision);
+    }
 }
 
 /// Classify a Claurst tool name into an ACP `ToolKind` for client UI hints.
@@ -130,7 +163,9 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
         return acp::ToolKind::Read;
     }
     match request.tool_name.as_str() {
-        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => acp::ToolKind::Edit,
+        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => {
+            acp::ToolKind::Edit
+        }
         "Bash" | "Shell" | "Execute" => acp::ToolKind::Execute,
         "WebFetch" | "WebSearch" => acp::ToolKind::Fetch,
         "Glob" | "Grep" | "GlobTool" => acp::ToolKind::Search,
@@ -150,32 +185,179 @@ pub fn spawn_drainer(
     store: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    let owner = StoreOwner(store);
     tokio::spawn(async move {
+        let store = &owner.0;
+        let disconnected = connection.disconnected();
+        let mut tasks = tokio::task::JoinSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
+                _ = disconnected.cancelled() => break,
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                    if result.is_err() { warn!("ACP permission forward failed"); }
+                    continue;
+                }
                 _ = ticker.tick() => {}
             }
             let popped: Vec<PendingPermissionRequest> = {
                 let mut guard = store.lock();
-                guard.queue.drain(..).collect()
+                while guard.queue.len() > MAX_QUEUED_PERMISSIONS {
+                    if let Some(pending) = guard.queue.pop_back() {
+                        DecisionOwner(pending.decision_tx).resolve(PermissionDecision::Deny);
+                    }
+                }
+                let count = (MAX_PERMISSION_FORWARDS - tasks.len()).min(guard.queue.len());
+                guard.queue.drain(..count).collect()
             };
             for pending in popped {
                 let conn = connection.clone();
                 let sid = session_id.clone();
-                tokio::spawn(async move {
-                    forward_pending(conn, sid, pending).await;
-                });
+                tasks.spawn(forward_pending(conn, sid, pending));
             }
         }
+        store.lock().close();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{duplex, AsyncBufReadExt, BufReader};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    fn pending(
+        id: usize,
+    ) -> (
+        PendingPermissionRequest,
+        oneshot::Receiver<PermissionDecision>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            PendingPermissionRequest {
+                tool_use_id: format!("call-{id}"),
+                request: request("Write", false),
+                reason: String::new(),
+                decision_tx: Some(tx),
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn drainer_cancellation_denies_and_joins_active_permission() {
+        let (client, writer) = duplex(8192);
+        let connection = Connection::new(writer);
+        let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+        let (permission, decision) = pending(1);
+        store.lock().queue.push_back(permission);
+        let cancel = CancellationToken::new();
+        let drainer = spawn_drainer(
+            connection,
+            acp::SessionId::new("fixture"),
+            store.clone(),
+            cancel.clone(),
+        );
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["method"],
+            "session/request_permission"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), drainer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), decision)
+                .await
+                .expect("drainer returned with a permission still waiting")
+                .unwrap(),
+            PermissionDecision::Deny
+        ));
+        assert!(store.lock().queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpolled_drainer_abort_denies_queued_permission() {
+        let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+        let (permission, decision) = pending(1);
+        store.lock().queue.push_back(permission);
+        let drainer = spawn_drainer(
+            Connection::new(tokio::io::sink()),
+            acp::SessionId::new("fixture"),
+            store.clone(),
+            CancellationToken::new(),
+        );
+        drainer.abort();
+        assert!(drainer.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), decision)
+                .await
+                .expect("unpolled owner left the permission store live")
+                .unwrap(),
+            PermissionDecision::Deny
+        ));
+        assert!(store.lock().queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_forwarding_is_capped_and_all_decisions_finish_on_cancel() {
+        let (client, writer) = duplex(65536);
+        let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+        let mut decisions = Vec::new();
+        for id in 0..32 {
+            let (permission, decision) = pending(id);
+            store.lock().queue.push_back(permission);
+            decisions.push(decision);
+        }
+        let cancel = CancellationToken::new();
+        let drainer = spawn_drainer(
+            Connection::new(writer),
+            acp::SessionId::new("fixture"),
+            store.clone(),
+            cancel.clone(),
+        );
+        let mut reader = BufReader::new(client);
+        for _ in 0..16 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut extra = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), reader.read_line(&mut extra))
+                .await
+                .is_err(),
+            "more than 16 permission requests were forwarded concurrently"
+        );
+        cancel.cancel();
+        drainer.await.unwrap();
+        for decision in decisions {
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), decision)
+                    .await
+                    .expect("permission decision survived turn cancellation")
+                    .unwrap(),
+                PermissionDecision::Deny
+            ));
+        }
+        assert!(store.lock().queue.is_empty());
+    }
 
     fn request(tool_name: &str, is_read_only: bool) -> PermissionRequest {
         PermissionRequest {
@@ -218,7 +400,11 @@ mod tests {
             ("Sequential", acp::ToolKind::Think),
         ];
         for (name, expected) in cases {
-            assert_eq!(infer_tool_kind(&request(name, false)), expected, "tool: {name}");
+            assert_eq!(
+                infer_tool_kind(&request(name, false)),
+                expected,
+                "tool: {name}"
+            );
         }
     }
 

@@ -44,11 +44,10 @@ impl Tool for EnterPlanModeTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        let params: EnterPlanModeInput = serde_json::from_value(input).unwrap_or(EnterPlanModeInput {
-            reason: None,
-        });
+        let params: EnterPlanModeInput =
+            serde_json::from_value(input).unwrap_or(EnterPlanModeInput { reason: None });
 
-        debug!(reason = ?params.reason, "Entering plan mode");
+        debug!(has_reason = params.reason.is_some(), "Entering plan mode");
 
         let msg = if let Some(reason) = &params.reason {
             format!("Entered plan mode: {}", reason)

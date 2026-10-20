@@ -2,34 +2,32 @@
 
 use std::io::Stdout;
 
+use super::turns::format_elapsed_ms;
+use super::types::{recent_session_label, RecentSession, ToolStatus, ToolUseBlock};
+use super::App;
+use crate::notifications::NotificationKind;
+use crate::render;
 use claurst_core::types::Message;
 use claurst_core::{sample_completion_verb, sample_spinner_verb};
 use claurst_query::QueryEvent;
-use crate::notifications::NotificationKind;
-use crate::render;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tracing::debug;
-use super::App;
-use super::turns::format_elapsed_ms;
-use super::types::{RecentSession, ToolStatus, ToolUseBlock, recent_session_label};
 
-pub(super) fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn open_file_externally(
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Try to open with the system's default application
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(path)
-            .spawn()?;
+        std::process::Command::new("open").arg(path).spawn()?;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn()?;
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
         Ok(())
     }
 
@@ -46,16 +44,18 @@ pub(super) fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn
     {
         // Fallback for other systems: try common editors in order
         for editor in &["nano", "vi", "vim", "emacs"] {
-            match std::process::Command::new(editor)
-                .arg(path)
-                .spawn()
-            {
+            match std::process::Command::new(editor).arg(path).spawn() {
                 Ok(_) => return Ok(()),
                 Err(_) => continue,
             }
         }
         Err("No suitable editor found".into())
     }
+}
+
+/// Build the voice status preview without slicing through a UTF-8 code point.
+pub(super) fn voice_status_preview(text: &str) -> String {
+    text.chars().take(60).collect()
 }
 
 impl App {
@@ -114,6 +114,8 @@ impl App {
         }
 
         match event {
+            QueryEvent::ProviderWireWitness(_) => {}
+            QueryEvent::McpDiscovery(_) | QueryEvent::McpInvocation { .. } => {}
             QueryEvent::Stream(stream_evt) => {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
@@ -161,7 +163,11 @@ impl App {
                 }
             }
 
-            QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+            QueryEvent::ToolStart {
+                tool_name,
+                tool_id,
+                input_json,
+            } => {
                 if !self.is_streaming && self.spinner_verb.is_none() {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
@@ -169,9 +175,7 @@ impl App {
                 self.is_streaming = true;
                 self.status_message = Some(format!("Running {}…", tool_name));
                 let turn_index = self.current_user_turn_index();
-                if let Some(existing) =
-                    self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
-                {
+                if let Some(existing) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     existing.turn_index = turn_index;
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
@@ -194,6 +198,8 @@ impl App {
                 tool_id,
                 result,
                 is_error,
+                native_operation_receipt: _,
+                execution_witness: _,
             } => {
                 // Build a multi-line preview: show up to 3 lines, truncate if more.
                 let all_lines: Vec<&str> = result.lines().collect();
@@ -203,9 +209,7 @@ impl App {
                 if remaining > 0 {
                     preview.push_str(&format!("\n\u{2026} {} more lines", remaining));
                 }
-                if let Some(block) =
-                    self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
-                {
+                if let Some(block) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     block.status = if is_error {
                         ToolStatus::Error
                     } else {
@@ -222,28 +226,38 @@ impl App {
                 self.refresh_turn_diff_from_history();
             }
 
-            QueryEvent::TurnComplete { turn, stop_reason, usage, .. } => {
+            QueryEvent::TurnComplete {
+                turn,
+                stop_reason,
+                usage,
+                ..
+            } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 self.spinner_verb = None;
 
                 // Update context window usage from the usage info.
                 if let Some(ref u) = usage {
-                    let turn_tokens = u.input_tokens + u.output_tokens
-                        + u.cache_creation_input_tokens + u.cache_read_input_tokens;
+                    let turn_tokens = u.input_tokens
+                        + u.output_tokens
+                        + u.cache_creation_input_tokens
+                        + u.cache_read_input_tokens;
                     self.context_used_tokens = self.context_used_tokens.saturating_add(turn_tokens);
                 }
                 // Record elapsed time and pick a completion verb
                 let seed = self.frame_count as usize ^ (self.messages.len() * 7);
-                let elapsed = self.turn_start.take()
+                let elapsed = self
+                    .turn_start
+                    .take()
                     .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
-                self.last_turn_elapsed = Some(
-                    elapsed.unwrap_or_else(|| "0s".to_string())
-                );
+                self.last_turn_elapsed = Some(elapsed.unwrap_or_else(|| "0s".to_string()));
                 self.last_turn_verb = Some(sample_completion_verb(seed));
                 self.flush_streamed_assistant_message();
-                self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
-                self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
+                self.tool_use_blocks
+                    .retain(|b| b.status != ToolStatus::Running);
+                self.complete_current_turn_snapshot(
+                    stop_reason.contains("abort") || stop_reason.contains("cancel"),
+                );
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
             }
@@ -252,14 +266,30 @@ impl App {
                 self.status_message = Some(msg);
             }
 
+            QueryEvent::EffortSelection(selection) => {
+                if !selection.is_default_fixed() {
+                    self.status_message = Some(selection.status_line());
+                }
+            }
+
             QueryEvent::Error(msg) => {
+                // QueryEvent::Error is terminal for this event channel.
+                // Recoverable notices use Status and must not close the turn.
                 self.is_streaming = false;
                 self.spinner_verb = None;
+                self.stall_start = None;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
-                self.invalidate_transcript();
+                let elapsed = self
+                    .turn_start
+                    .take()
+                    .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
+                self.last_turn_elapsed = Some(elapsed.unwrap_or_else(|| "0s".to_string()));
+                self.tool_use_blocks.clear();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
+                self.complete_current_turn_snapshot(true);
+                self.refresh_turn_diff_from_history();
                 self.push_notification(NotificationKind::Error, err_msg, None);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
@@ -276,7 +306,10 @@ impl App {
                         self.token_warning_threshold_shown = 80;
                         self.push_notification(
                             NotificationKind::Warning,
-                            format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
+                            format!(
+                                "Context window {:.0}% full. Consider /compact.",
+                                pct_used * 100.0
+                            ),
                             Some(30),
                         );
                     }
@@ -284,7 +317,10 @@ impl App {
                         self.token_warning_threshold_shown = 95;
                         self.push_notification(
                             NotificationKind::Error,
-                            format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
+                            format!(
+                                "Context window {:.0}% full! Run /compact now.",
+                                pct_used * 100.0
+                            ),
                             None,
                         );
                     }
@@ -331,8 +367,7 @@ impl App {
                     let entries: Vec<crate::session_browser::SessionEntry> = sessions
                         .into_iter()
                         .map(|s| {
-                            let age = chrono::Utc::now()
-                                .signed_duration_since(s.updated_at);
+                            let age = chrono::Utc::now().signed_duration_since(s.updated_at);
                             let last_updated = if age.num_minutes() < 1 {
                                 "just now".to_string()
                             } else if age.num_hours() < 1 {
@@ -414,8 +449,7 @@ impl App {
                         }
                         VoiceEvent::RecordingStopped => {
                             self.voice_recording = false;
-                            self.status_message =
-                                Some("Transcribing\u{2026}".to_string());
+                            self.status_message = Some("Transcribing\u{2026}".to_string());
                         }
                         VoiceEvent::TranscriptReady(text) => {
                             if !text.is_empty() {
@@ -428,9 +462,8 @@ impl App {
                                 }
                                 self.prompt_input.paste(&text);
                                 self.refresh_prompt_input();
-                                self.status_message = Some(
-                                    format!("Transcribed: {}", &text[..text.len().min(60)])
-                                );
+                                self.status_message =
+                                    Some(format!("Transcribed: {}", voice_status_preview(&text)));
                             }
                             // Clear the channel once we have the result.
                             self.voice_event_rx = None;
@@ -472,8 +505,7 @@ impl App {
             let pending = self.pending_key.take();
 
             // Poll for events with a short timeout so we can redraw for animation
-            let got_event = pending.is_some()
-                || event::poll(std::time::Duration::from_millis(50))?;
+            let got_event = pending.is_some() || event::poll(std::time::Duration::from_millis(50))?;
 
             if got_event {
                 let event = if let Some(k) = pending {
@@ -538,8 +570,7 @@ impl App {
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
-                                let (cmd, args) =
-                                        crate::input::parse_slash_command(&slash_input);
+                                let (cmd, args) = crate::input::parse_slash_command(&slash_input);
                                 if self.intercept_slash_command_with_args(cmd, args) {
                                     self.clear_prompt();
                                     continue;
@@ -580,9 +611,9 @@ impl App {
             let content = msg.get_all_text().to_lowercase();
 
             // Check if message contains error keywords
-            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
-                content.contains(keyword)
-            });
+            let has_error = ERROR_KEYWORDS
+                .iter()
+                .any(|keyword| content.contains(keyword));
 
             if has_error && i > (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
                 // Found an error message, scroll to it
@@ -608,9 +639,9 @@ impl App {
             let content = msg.get_all_text().to_lowercase();
 
             // Check if message contains error keywords
-            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
-                content.contains(keyword)
-            });
+            let has_error = ERROR_KEYWORDS
+                .iter()
+                .any(|keyword| content.contains(keyword));
 
             if has_error && i < (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
                 // Found an error message, scroll to it
@@ -624,5 +655,4 @@ impl App {
 
         self.status_message = Some("No previous errors found.".to_string());
     }
-
 }

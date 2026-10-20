@@ -1,32 +1,53 @@
-//! End-to-end smoke test: spawn the `claurst` binary in ACP mode, send a
+//! End-to-end smoke test: spawn the `forge` binary in ACP mode, send a
 //! short JSON-RPC conversation over its stdin, and verify the responses on
 //! stdout match what the Agent Client Protocol spec mandates.
 //!
 //! This guards the wire-format and capability surface that registry-listed
 //! ACP clients (Zed, Neovim, JetBrains, …) rely on. Runs against the
 //! debug binary produced by `cargo build` — Cargo provides the path via
-//! `CARGO_BIN_EXE_claurst`.
+//! `CARGO_BIN_EXE_forge`.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn binary_path() -> String {
-    env!("CARGO_BIN_EXE_claurst").to_string()
+    env!("CARGO_BIN_EXE_forge").to_string()
 }
 
 fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
+    let root = test_root("isolated");
+    let output = run_with_input_in_root(stdin, timeout, &root);
+    std::fs::remove_dir_all(root).expect("remove isolated ACP root");
+    output
+}
+
+fn test_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("forge-acp-{label}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("home")).expect("create isolated home");
+    std::fs::create_dir_all(root.join("data")).expect("create isolated data root");
+    root
+}
+
+fn run_with_input_in_root(stdin: &str, timeout: Duration, root: &Path) -> (String, String) {
     let mut child = Command::new(binary_path())
         .arg("acp")
+        .env("HOME", root.join("home"))
+        .env("FORGE_HOME", root.join("data"))
+        .env("CLAURST_HOME", root.join("data"))
+        .env("CLAURST_DISABLE_MODELS_FETCH", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn claurst acp");
+        .expect("spawn forge acp");
 
     {
         let mut stdin_handle = child.stdin.take().expect("stdin");
-        stdin_handle.write_all(stdin.as_bytes()).expect("write stdin");
+        stdin_handle
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
         // Dropping stdin signals EOF — the agent will finish in-flight work
         // and then exit cleanly.
     }
@@ -37,7 +58,7 @@ fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
             Some(_status) => break,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                panic!("claurst acp did not exit within {timeout:?}");
+                panic!("forge acp did not exit within {timeout:?}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -75,7 +96,8 @@ fn initialize_returns_spec_compliant_response() {
     let result = &resp["result"];
     assert_eq!(result["protocolVersion"], 1);
     // Agent identifies itself.
-    assert_eq!(result["agentInfo"]["name"], "claurst");
+    assert_eq!(result["agentInfo"]["name"], "forge");
+    assert_eq!(result["agentInfo"]["title"], "Forge");
     assert!(result["agentInfo"]["version"].is_string());
     // authMethods MUST be an array (even if empty).
     assert!(result["authMethods"].is_array());
@@ -83,7 +105,7 @@ fn initialize_returns_spec_compliant_response() {
     let caps = &result["agentCapabilities"];
     assert!(caps["promptCapabilities"].is_object());
     assert!(caps["mcpCapabilities"].is_object());
-    assert!(caps["loadSession"].is_boolean());
+    assert_eq!(caps["loadSession"], true);
 }
 
 #[test]
@@ -101,19 +123,60 @@ fn session_new_returns_session_id() {
     let session_id = resp["result"]["sessionId"]
         .as_str()
         .expect("sessionId should be a string");
-    assert!(session_id.starts_with("acp-"), "sessionId not prefixed: {session_id}");
+    assert!(
+        session_id.starts_with("acp-"),
+        "sessionId not prefixed: {session_id}"
+    );
 }
 
 #[test]
-fn session_load_returns_method_not_found() {
-    // We do not advertise loadSession, so well-behaved clients should never
-    // call session/load — but the agent must answer correctly if they do.
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}
-{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"x","cwd":"/","mcpServers":[]}}
-"#;
-    let (stdout, _stderr) = run_with_input(request, Duration::from_secs(20));
-    let resp = find_response(&stdout, 2);
-    assert_eq!(resp["error"]["code"], -32601, "should be MethodNotFound");
+fn session_load_survives_restart_and_enforces_workspace_binding() {
+    let root = test_root("restart");
+    let workspace = root.join("workspace");
+    let foreign = root.join("foreign");
+    std::fs::create_dir(&workspace).expect("create workspace");
+    std::fs::create_dir(&foreign).expect("create foreign workspace");
+    let cwd = workspace.to_string_lossy().replace('\\', "/");
+    let foreign_cwd = foreign.to_string_lossy().replace('\\', "/");
+    let new_request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1,"clientCapabilities":{{}},"clientInfo":{{"name":"smoke","version":"0.0.0"}}}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{cwd}","mcpServers":[]}}}}
+"#
+    );
+    let (stdout, stderr) = run_with_input_in_root(&new_request, Duration::from_secs(20), &root);
+    assert!(stderr.is_empty(), "unexpected ACP stderr: {stderr}");
+    let session_id = find_response(&stdout, 2)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let record = root
+        .join("data/acp-sessions")
+        .join(format!("{session_id}.json"));
+    assert!(record.is_file(), "durable ACP record missing: {record:?}");
+
+    let load_request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1,"clientCapabilities":{{}},"clientInfo":{{"name":"smoke","version":"0.0.0"}}}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{cwd}","mcpServers":[]}}}}
+"#
+    );
+    let (stdout, stderr) = run_with_input_in_root(&load_request, Duration::from_secs(20), &root);
+    assert!(stderr.is_empty(), "unexpected ACP stderr: {stderr}");
+    let loaded = find_response(&stdout, 2);
+    assert!(
+        loaded["result"].is_object(),
+        "load did not return an empty result"
+    );
+    assert!(loaded.get("error").is_none());
+
+    let foreign_request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1,"clientCapabilities":{{}},"clientInfo":{{"name":"smoke","version":"0.0.0"}}}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{foreign_cwd}","mcpServers":[]}}}}
+"#
+    );
+    let (stdout, _stderr) =
+        run_with_input_in_root(&foreign_request, Duration::from_secs(20), &root);
+    assert_eq!(find_response(&stdout, 2)["error"]["code"], -32602);
+    std::fs::remove_dir_all(root).expect("remove restart ACP root");
 }
 
 #[test]
@@ -130,5 +193,8 @@ fn cancel_notification_is_silent() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
         .count();
-    assert_eq!(response_count, 1, "unexpected extra responses in:\n{stdout}");
+    assert_eq!(
+        response_count, 1,
+        "unexpected extra responses in:\n{stdout}"
+    );
 }

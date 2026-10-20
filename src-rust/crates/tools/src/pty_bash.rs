@@ -1496,6 +1496,86 @@ mod windows_tests {
         }
     }
 
+    const WINDOWS_TREE_MARKER: &str = "pty-timeout-pids.txt";
+    const WINDOWS_TREE_STARTED_MARKER: &str = "pty-timeout-descendant-started.txt";
+    const WINDOWS_TREE_PARENT_TEST: &str =
+        "pty_bash::windows_tests::windows_process_tree_parent_fixture";
+    const WINDOWS_TREE_DESCENDANT_TEST: &str =
+        "pty_bash::windows_tests::windows_process_tree_descendant_fixture";
+
+    fn windows_tree_fixture_command(test_name: &str) -> String {
+        let executable = std::env::current_exe().expect("test executable");
+        // cmd.exe receives this as raw /S /C text. The outer pair is added by
+        // cmd_shell_command; this pair protects a test binary path containing
+        // spaces without changing the fixture's argv.
+        format!(
+            "\"{}\" {test_name} --exact --ignored --nocapture",
+            executable.display()
+        )
+    }
+
+    fn write_windows_marker(path: &Path, contents: &str) -> std::io::Result<()> {
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, contents)?;
+        std::fs::rename(temporary, path)
+    }
+
+    fn wait_for_windows_fixture_started(marker: &Path, descendant_pid: u32) -> std::io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                if contents.trim().parse::<u32>().ok() == Some(descendant_pid) {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "native descendant fixture did not publish its startup witness",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "launched as a child by the fallback process-tree test"]
+    fn windows_process_tree_parent_fixture() {
+        let started = Path::new(WINDOWS_TREE_STARTED_MARKER);
+        let mut descendant =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    WINDOWS_TREE_DESCENDANT_TEST,
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .spawn()
+                .expect("spawn native descendant fixture");
+        if let Err(error) = wait_for_windows_fixture_started(started, descendant.id()) {
+            let _ = descendant.kill();
+            let _ = descendant.wait();
+            panic!("native descendant startup witness: {error}");
+        }
+        write_windows_marker(
+            Path::new(WINDOWS_TREE_MARKER),
+            &format!("{},{}", std::process::id(), descendant.id()),
+        )
+        .expect("publish native process-tree witness");
+        let _ = descendant.wait();
+    }
+
+    #[test]
+    #[ignore = "launched as a child by the fallback process-tree test"]
+    fn windows_process_tree_descendant_fixture() {
+        write_windows_marker(
+            Path::new(WINDOWS_TREE_STARTED_MARKER),
+            &std::process::id().to_string(),
+        )
+        .expect("publish native descendant startup witness");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
     fn windows_process_exists(pid: u32) -> std::io::Result<bool> {
         let query = format!(
             "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
@@ -1546,24 +1626,25 @@ mod windows_tests {
     #[tokio::test]
     async fn windows_fallback_timeout_kills_owned_descendant() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("pty-timeout-pids.txt");
-        std::fs::write(
-            dir.path().join("pty-timeout.ps1"),
-            r#"$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru
-Set-Content -NoNewline -LiteralPath 'pty-timeout-pids.txt' -Value ($PID.ToString()+','+$p.Id)
-Wait-Process -Id $p.Id
-"#,
-        )
-        .unwrap();
-        let command = "powershell -NoProfile -NonInteractive -File pty-timeout.ps1".to_string();
+        let marker = dir.path().join(WINDOWS_TREE_MARKER);
+        let command = windows_tree_fixture_command(WINDOWS_TREE_PARENT_TEST);
         let cwd = dir.path().to_path_buf();
         let ctx = allow_all_context();
+        let cancel = ctx.cancel_token.clone();
         let task = tokio::spawn(async move {
             run_windows_fallback(&command, &cwd, Duration::from_millis(500), 500, &ctx).await
         });
-        let pids = wait_for_pid_witness(&marker)
-            .await
-            .expect("fallback parent and descendant startup witness");
+        let pids = match wait_for_pid_witness(&marker).await {
+            Ok(pids) => pids,
+            Err(error) => {
+                // A missing witness is a fixture failure. Cancel and join the
+                // owned capture before propagating it; never leave its Job
+                // Object task running after the test has failed.
+                cancel.cancel();
+                let _ = task.await;
+                panic!("fallback parent and descendant startup witness: {error}");
+            }
+        };
         let result = task.await.unwrap();
         assert!(result.is_error, "timeout must return an error result");
         assert_eq!(

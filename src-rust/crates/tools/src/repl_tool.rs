@@ -26,6 +26,21 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+// Test-only diagnostics make every cleanup gate observable without adding
+// production output or changing fail-closed cleanup behavior.
+#[cfg(test)]
+macro_rules! repl_cleanup_diag {
+    ($($arg:tt)*) => {
+        eprintln!("[repl-cleanup] {}", format_args!($($arg)*));
+    };
+}
+#[cfg(not(test))]
+macro_rules! repl_cleanup_diag {
+    ($($arg:tt)*) => {{
+        let _ = ();
+    }};
+}
 use uuid::Uuid;
 
 const MAX_REPL_SESSIONS: usize = 64;
@@ -714,17 +729,63 @@ fn remove_cancel_if_same(key: &ReplKey, session: &Arc<Mutex<ReplSession>>) {
 }
 
 async fn terminate_session(key: &ReplKey, session: &Arc<Mutex<ReplSession>>) -> bool {
+    repl_cleanup_diag!("cleanup_started");
     if let Some(cancel) = cancellation_for_session(key, session) {
         cancel.cancel();
     }
     let mut guard = session.lock().await;
+    repl_cleanup_diag!("lock_acquired");
     guard.retiring = true;
     guard.cancel.cancel();
     guard.group.kill_now();
     let _ = guard.child.start_kill();
     let wait_result = timeout(Duration::from_secs(2), guard.child.wait()).await;
-    let clean = matches!(wait_result, Ok(Ok(_))) && guard.group.confirmed_empty().await;
-    let pending_clean = clean && guard.pending.confirm_terminal().is_ok();
+    let wait_succeeded = matches!(&wait_result, Ok(Ok(_)));
+    #[cfg(test)]
+    {
+        let wait_error = wait_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().err())
+            .map(ToString::to_string);
+        repl_cleanup_diag!(
+            "wait_result succeeded={} timed_out={} error={:?}",
+            wait_succeeded,
+            wait_result.is_err(),
+            wait_error
+        );
+    }
+    #[cfg(not(test))]
+    repl_cleanup_diag!(
+        "wait_result succeeded={} timed_out={}",
+        wait_succeeded,
+        wait_result.is_err()
+    );
+    let group_confirmed = if wait_succeeded {
+        guard.group.confirmed_empty().await
+    } else {
+        false
+    };
+    repl_cleanup_diag!("group_confirmed={group_confirmed}");
+    let clean = wait_succeeded && group_confirmed;
+    let pending_clean = if clean {
+        match guard.pending.confirm_terminal() {
+            Ok(()) => {
+                repl_cleanup_diag!("pending_confirmed=true");
+                true
+            }
+            Err(error) => {
+                #[cfg(test)]
+                repl_cleanup_diag!("pending_confirmed=false error={error}");
+                #[cfg(not(test))]
+                let _ = error;
+                false
+            }
+        }
+    } else {
+        repl_cleanup_diag!("pending_confirmed=false skipped=true");
+        false
+    };
     drop(guard);
     if cancel_entry_matches(key, session) {
         remove_cancel_if_same(key, session);
@@ -740,9 +801,14 @@ fn remove_if_same(key: &ReplKey, session: &Arc<Mutex<ReplSession>>) -> bool {
 
 async fn terminate_and_remove_if_clean(key: &ReplKey, session: &Arc<Mutex<ReplSession>>) -> bool {
     let clean = terminate_session(key, session).await;
+    #[cfg(test)]
+    let registry_removed = clean && remove_if_same(key, session);
+    #[cfg(not(test))]
     if clean {
-        remove_if_same(key, session);
+        let _ = remove_if_same(key, session);
     }
+    #[cfg(test)]
+    repl_cleanup_diag!("cleanup_finished clean={clean} registry_removed={registry_removed}");
     clean
 }
 
@@ -1021,15 +1087,22 @@ impl InvocationGuard {
 
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
+        repl_cleanup_diag!("guard_drop armed={}", self.armed);
         if !self.armed {
             return;
         }
         let key = self.key.clone();
         let session = self.session.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = terminate_and_remove_if_clean(&key, &session).await;
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                repl_cleanup_diag!("cleanup_dispatch runtime_available=true");
+                handle.spawn(async move {
+                    let _ = terminate_and_remove_if_clean(&key, &session).await;
+                });
+            }
+            Err(_error) => {
+                repl_cleanup_diag!("cleanup_dispatch runtime_available=false error={_error:?}");
+            }
         }
     }
 }

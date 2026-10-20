@@ -10,6 +10,19 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+macro_rules! process_group_diag {
+    ($($arg:tt)*) => {
+        eprintln!("[owned-process-group] {}", format_args!($($arg)*));
+    };
+}
+#[cfg(not(test))]
+macro_rules! process_group_diag {
+    ($($arg:tt)*) => {{
+        let _ = ();
+    }};
+}
+
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cleanup guard for the process group owned by one command invocation.
@@ -137,6 +150,7 @@ impl ProcessGroupGuard {
 
     pub(crate) async fn confirmed_empty(&self) -> bool {
         if self.ownership_lost {
+            process_group_diag!("ownership_lost=true");
             return false;
         }
         #[cfg(windows)]
@@ -146,16 +160,48 @@ impl ProcessGroupGuard {
         #[cfg(unix)]
         if let Some(pid) = self.pid.filter(|pid| *pid > 0 && *pid <= i32::MAX as u32) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            #[cfg(test)]
+            let mut probes = 0_u32;
             loop {
+                #[cfg(test)]
+                {
+                    probes += 1;
+                }
                 match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), None) {
-                    Err(nix::errno::Errno::ESRCH) => return true,
+                    Err(nix::errno::Errno::ESRCH) => {
+                        process_group_diag!("pid={} probes={} group_absent=true", pid, probes);
+                        return true;
+                    }
                     Ok(()) if tokio::time::Instant::now() < deadline => {
+                        #[cfg(test)]
+                        if probes == 1 {
+                            process_group_diag!("pid={} probes={} group_absent=false", pid, probes);
+                        }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    _ => return false,
+                    Ok(()) => {
+                        process_group_diag!(
+                            "pid={} probes={} group_absent=false timeout=true",
+                            pid,
+                            probes
+                        );
+                        return false;
+                    }
+                    Err(error) => {
+                        process_group_diag!(
+                            "pid={} probes={} group_absent=false probe_error={:?}",
+                            pid,
+                            probes,
+                            error
+                        );
+                        #[cfg(not(test))]
+                        let _ = &error;
+                        return false;
+                    }
                 }
             }
         }
+        process_group_diag!("identity_missing=true");
         false
     }
 }

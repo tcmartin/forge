@@ -10,8 +10,10 @@
 use async_trait::async_trait;
 use claurst_core::config::PermissionMode;
 use claurst_core::cost::CostTracker;
+use claurst_core::media::{MediaError, MediaLimits, MediaManifest};
 use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
-use claurst_core::types::ToolDefinition;
+use claurst_core::types::{ContentBlock, ToolDefinition};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -19,84 +21,130 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
+pub mod agent_tasks;
+pub mod apply_patch;
 pub mod ask_user;
-pub mod pty_bash;
+mod background_processes;
+pub mod batch_edit;
 pub mod brief;
+pub mod bundled_skills;
+mod command_capture;
+pub mod computer_use;
 pub mod config_tool;
 pub mod cron;
+pub mod deletion_intent;
 pub mod enter_plan_mode;
+pub mod evidence;
+pub mod execution;
 pub mod exit_plan_mode;
-pub mod apply_patch;
-pub mod batch_edit;
 pub mod file_edit;
-pub mod line_endings;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
+pub mod formatter;
 pub mod glob_tool;
+pub mod goal_complete;
 pub mod grep_tool;
+pub mod line_endings;
 pub mod lsp_tool;
+pub mod mcp_auth_tool;
+pub mod mcp_content;
 pub mod mcp_resources;
-pub mod todo_write;
+pub mod monitor_tool;
+pub mod mutation;
 pub mod notebook_edit;
 pub mod powershell;
+pub mod pty_bash;
+pub mod remote_trigger;
+pub mod repl_tool;
 pub mod send_message;
-pub mod bundled_skills;
 pub mod skill_tool;
 pub mod sleep;
+pub mod synthetic_output;
 pub mod tasks;
+pub mod team_tool;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod todo_write;
+pub mod tool_catalog;
+pub mod tool_policy;
 pub mod tool_search;
+pub mod trusted_checker;
+pub(crate) mod trusted_checker_execution;
+#[cfg(all(test, unix))]
+mod trusted_dispatch_tests;
+pub mod verification_receipts;
 pub mod web_fetch;
 pub mod web_search;
 pub mod worktree;
-pub mod computer_use;
-pub mod mcp_auth_tool;
-pub mod repl_tool;
-pub mod synthetic_output;
-pub mod team_tool;
-pub mod remote_trigger;
-pub mod formatter;
-pub mod monitor_tool;
-pub mod goal_complete;
 
 // Re-exports for convenience.
-pub use formatter::try_format_file;
+pub use claurst_mcp::{
+    with_mcp_query_operation_identity, with_mcp_query_operation_observer, McpOperationBackend,
+    McpOperationContext, McpOperationObserver, McpQueryOperationIdentity,
+};
+
+pub use apply_patch::ApplyPatchTool;
 pub use ask_user::AskUserQuestionTool;
-pub use pty_bash::PtyBashTool;
+pub use batch_edit::BatchEditTool;
 pub use brief::BriefTool;
+pub use computer_use::ComputerUseTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
+pub use deletion_intent::{with_deletion_authorization, DeletionAuthorization};
 pub use enter_plan_mode::EnterPlanModeTool;
+pub use evidence::EvidenceReadTool;
+pub use execution::{authorization_preflight, execute_authorized, ExecutionStatus};
+// Inventory hosts use the MCP boundary already owned by this crate.
+pub use claurst_mcp::{
+    mcp_result_to_string, CatalogRevisionHeader, CombinedCatalogSnapshot, McpCatalogError,
+    McpManager, McpToolDescriptor,
+};
 pub use exit_plan_mode::ExitPlanModeTool;
-pub use apply_patch::ApplyPatchTool;
-pub use batch_edit::BatchEditTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub(crate) use formatter::try_format_file;
 pub use glob_tool::GlobTool;
+pub use goal_complete::GoalCompleteTool;
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
+pub use mcp_auth_tool::McpAuthTool;
+pub use mcp_content::mcp_result_to_tool_result;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
-pub use todo_write::TodoWriteTool;
+pub use monitor_tool::MonitorTool;
+pub use mutation::EditCheckTool;
 pub use notebook_edit::NotebookEditTool;
 pub use powershell::PowerShellTool;
-pub use send_message::{SendMessageTool, drain_inbox, peek_inbox};
+pub use pty_bash::PtyBashTool;
+pub use remote_trigger::RemoteTriggerTool;
+pub use repl_tool::ReplTool;
+pub use send_message::{drain_inbox, peek_inbox, SendMessageTool};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
-pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, Task, TaskStatus, TASK_STORE};
+pub use synthetic_output::SyntheticOutputTool;
+pub use tasks::{
+    Task, TaskAcceptTool, TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStatus,
+    TaskStopTool, TaskUpdateTool, TASK_STORE,
+};
+pub use team_tool::{register_agent_runner, AgentRunFn, TeamCreateTool, TeamDeleteTool};
+pub use todo_write::TodoWriteTool;
+pub use tool_catalog::{
+    DiscoveryReceipt, ToolCatalogEntry, ToolCatalogError, ToolCatalogScope, ToolCatalogSource,
+    ToolCatalogView,
+};
 pub use tool_search::ToolSearchTool;
+pub use trusted_checker::{
+    RegistrationSpec, TrustedCheckerCatalog, TrustedCheckerCatalogBuilder, TrustedCheckerError,
+    TrustedCheckerInvocation, TrustedCheckerOperation, TrustedCheckerRegistration,
+    TrustedCheckerShell, TrustedCheckerSource,
+};
+pub use verification_receipts::{
+    finalize_proof, CheckerReceipt, MutationReceipt, ReceiptBundle, ReceiptError,
+    TrustedVerificationProof,
+};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use worktree::{EnterWorktreeTool, ExitWorktreeTool};
-pub use computer_use::ComputerUseTool;
-pub use mcp_auth_tool::McpAuthTool;
-pub use repl_tool::ReplTool;
-pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
-pub use remote_trigger::RemoteTriggerTool;
-pub use monitor_tool::MonitorTool;
-pub use goal_complete::GoalCompleteTool;
 
 // ---------------------------------------------------------------------------
 // AskUser question channel
@@ -126,6 +174,141 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Optional structured metadata (for the TUI to render diffs, etc.).
     pub metadata: Option<Value>,
+    application_receipts: Option<ReceiptBundle>,
+    discovery_receipt: Option<DiscoveryReceipt>,
+    execution_status: Option<ExecutionStatus>,
+    typed_content: Option<Arc<ValidatedToolContent>>,
+    /// Host-owned evidence authority.  Model-visible metadata never mints
+    /// this state; it is populated only by the retention/read paths.
+    evidence_state: Option<EvidenceState>,
+}
+
+/// Native Bash process outcome allowed to cross the query event boundary.
+///
+/// This is deliberately narrower than `ToolResult::metadata`: only the
+/// built-in PTY Bash implementation can construct it through the `Tool` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeBashCommandStatus {
+    Completed,
+    Unknown,
+    NotRun,
+    Cancelled,
+    TimedOut,
+}
+
+/// Content-free, bounded evidence for one built-in PTY Bash result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeBashExecutionWitness {
+    /// Exact `ToolStart`/`ToolEnd` identity; never a command or tool name.
+    pub tool_id: String,
+    /// SHA-256 over the exact UTF-8 bytes emitted in the `ToolEnd.result`.
+    pub displayed_result_sha256: String,
+    pub command_status: NativeBashCommandStatus,
+    pub exit_code: Option<i32>,
+    pub partial: bool,
+}
+
+impl NativeBashExecutionWitness {
+    /// Parse only the allowlisted fields written by `PtyBashTool` and bind the
+    /// digest to the final display string before metadata is discarded.
+    pub(crate) fn from_trusted_result(
+        tool_id: &str,
+        result: &ToolResult,
+        emitted_result: &str,
+    ) -> Option<Self> {
+        if tool_id.is_empty() || tool_id.len() > 256 {
+            return None;
+        }
+        let metadata = result.metadata.as_ref()?.as_object()?;
+        let command_status = match metadata.get("command_status")?.as_str()? {
+            "completed" => NativeBashCommandStatus::Completed,
+            "unknown" => NativeBashCommandStatus::Unknown,
+            "not_run" => NativeBashCommandStatus::NotRun,
+            "cancelled" => NativeBashCommandStatus::Cancelled,
+            "timed_out" => NativeBashCommandStatus::TimedOut,
+            _ => return None,
+        };
+        let exit_code = match metadata.get("exit_code")? {
+            Value::Null => None,
+            Value::Number(number) => {
+                let code = number.as_i64()?.try_into().ok()?;
+                Some(code)
+            }
+            _ => return None,
+        };
+        let partial = metadata.get("partial")?.as_bool()?;
+        Some(Self {
+            tool_id: tool_id.to_string(),
+            displayed_result_sha256: claurst_core::crypto_utils::sha256_hex(
+                emitted_result.as_bytes(),
+            ),
+            command_status,
+            exit_code,
+            partial,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EvidenceSelection {
+    InitialPreview,
+    Page { offset: usize, end: usize },
+    Query,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvidenceState {
+    pub(crate) id: String,
+    pub(crate) bytes: u64,
+    pub(crate) partial: bool,
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) session: Option<String>,
+    pub(crate) selection: EvidenceSelection,
+    pub(crate) fallback: Option<String>,
+    pub(crate) next_offset: Option<usize>,
+    pub(crate) done: Option<bool>,
+}
+
+/// Private role indices for MCP-created resource provenance text blocks.
+/// Indices are retained separately from payload and are never inferred from
+/// rendered text or caller metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct TypedProvenance {
+    #[serde(default)]
+    pub(crate) resource_text_indices: Vec<usize>,
+}
+
+impl TypedProvenance {
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    fn validate(&self, blocks: &[ContentBlock]) -> Result<(), String> {
+        let mut previous = None;
+        for &index in &self.resource_text_indices {
+            if previous.is_some_and(|previous| index <= previous)
+                || !matches!(blocks.get(index), Some(ContentBlock::Text { .. }))
+            {
+                return Err("MCP provenance indices are invalid".to_string());
+            }
+            previous = Some(index);
+        }
+        Ok(())
+    }
+}
+
+/// Validated typed blocks retained alongside the bounded display string.
+///
+/// This remains private so callers can only create it through
+/// `ToolResult::with_typed_content`, which validates every image occurrence
+/// against the shared media policy before the payload becomes sendable.
+#[derive(Debug, Clone)]
+struct ValidatedToolContent {
+    blocks: Vec<ContentBlock>,
+    manifest: MediaManifest,
+    limits: MediaLimits,
+    provenance: TypedProvenance,
 }
 
 impl ToolResult {
@@ -134,6 +317,11 @@ impl ToolResult {
             content: content.into(),
             is_error: false,
             metadata: None,
+            application_receipts: None,
+            discovery_receipt: None,
+            execution_status: None,
+            typed_content: None,
+            evidence_state: None,
         }
     }
 
@@ -142,11 +330,260 @@ impl ToolResult {
             content: content.into(),
             is_error: true,
             metadata: None,
+            application_receipts: None,
+            discovery_receipt: None,
+            execution_status: None,
+            typed_content: None,
+            evidence_state: None,
         }
     }
 
     pub fn with_metadata(mut self, meta: Value) -> Self {
         self.metadata = Some(meta);
+        self
+    }
+
+    /// Attach a validated typed content payload without copying it into the
+    /// display summary. Image and nested tool-result blocks are checked by the
+    /// shared core media validator before they become sendable.
+    pub fn with_typed_content(
+        mut self,
+        blocks: Vec<ContentBlock>,
+        limits: &MediaLimits,
+    ) -> Result<Self, MediaError> {
+        // An uncertain execution outcome is a terminal revocation.  Keep this
+        // constructor order-safe: callers cannot reattach sendable media by
+        // adding typed blocks after recording NotRun/Cancelled/Unknown.
+        if self.execution_status.is_some_and(|status| {
+            matches!(
+                status,
+                ExecutionStatus::NotRun | ExecutionStatus::Cancelled | ExecutionStatus::Unknown
+            )
+        }) {
+            return Ok(self);
+        }
+        let manifest = MediaManifest::from_blocks(&blocks, limits)?;
+        self.typed_content = Some(Arc::new(ValidatedToolContent {
+            blocks,
+            manifest,
+            limits: *limits,
+            provenance: TypedProvenance::empty(),
+        }));
+        Ok(self)
+    }
+
+    pub(crate) fn with_mcp_typed_content(
+        mut self,
+        blocks: Vec<ContentBlock>,
+        provenance: TypedProvenance,
+        limits: &MediaLimits,
+    ) -> Result<Self, String> {
+        if self.execution_status.is_some_and(|status| {
+            matches!(
+                status,
+                ExecutionStatus::NotRun | ExecutionStatus::Cancelled | ExecutionStatus::Unknown
+            )
+        }) {
+            return Ok(self);
+        }
+        provenance.validate(&blocks)?;
+        let manifest =
+            MediaManifest::from_blocks(&blocks, limits).map_err(|error| error.to_string())?;
+        self.typed_content = Some(Arc::new(ValidatedToolContent {
+            blocks,
+            manifest,
+            limits: *limits,
+            provenance,
+        }));
+        Ok(self)
+    }
+
+    /// Return the validated typed blocks without exposing the private payload
+    /// container or its mutable backing storage.
+    pub fn typed_blocks(&self) -> Option<&[ContentBlock]> {
+        self.typed_content
+            .as_ref()
+            .map(|content| content.blocks.as_slice())
+    }
+
+    /// Return the validated media metadata associated with the typed blocks.
+    pub fn typed_manifest(&self) -> Option<&MediaManifest> {
+        self.typed_content.as_ref().map(|content| &content.manifest)
+    }
+
+    /// Remove and return the validated typed blocks, if present.
+    pub fn take_typed_content(&mut self) -> Option<Vec<ContentBlock>> {
+        self.take_validated_typed_content()
+            .map(|(blocks, _, _, _)| blocks)
+    }
+
+    pub(crate) fn take_validated_typed_content(
+        &mut self,
+    ) -> Option<(
+        Vec<ContentBlock>,
+        MediaManifest,
+        MediaLimits,
+        TypedProvenance,
+    )> {
+        let content = self.typed_content.take()?;
+        match Arc::try_unwrap(content) {
+            Ok(content) => Some((
+                content.blocks,
+                content.manifest,
+                content.limits,
+                content.provenance,
+            )),
+            Err(content) => Some((
+                content.blocks.clone(),
+                content.manifest.clone(),
+                content.limits,
+                content.provenance.clone(),
+            )),
+        }
+    }
+
+    pub(crate) fn evidence_state(&self) -> Option<&EvidenceState> {
+        self.evidence_state.as_ref()
+    }
+
+    pub(crate) fn take_evidence_state(&mut self) -> Option<EvidenceState> {
+        self.evidence_state.take()
+    }
+
+    pub(crate) fn with_evidence_state(mut self, state: EvidenceState) -> Self {
+        self.evidence_state = Some(state);
+        self
+    }
+
+    pub(crate) fn evidence_scope_matches(&self, ctx: &ToolContext) -> bool {
+        let Some(state) = self.evidence_state.as_ref() else {
+            return false;
+        };
+        let Ok(workspace) = crate::worktree::workspace_root(ctx).canonicalize() else {
+            return false;
+        };
+        state.workspace.as_ref() == Some(&workspace)
+            && state.session.as_deref() == Some(ctx.session_id.as_str())
+    }
+
+    /// Return the host-owned exceptional completion state, when one was
+    /// recorded.  This is deliberately separate from model-visible metadata:
+    /// callers cannot clear it by replacing or editing that metadata.
+    pub fn execution_status(&self) -> Option<ExecutionStatus> {
+        self.execution_status
+    }
+
+    /// Return bounded, source-bound operation metadata for diagnostic
+    /// forwarding. Unknown keys are ignored; malformed recognized keys make
+    /// the whole optional receipt unavailable. Private typed receipts and
+    /// model-visible content never cross this accessor.
+    pub fn native_operation_receipt(&self) -> Option<Value> {
+        const MAX_LONG_TEXT: usize = 16 * 1024;
+        const MAX_RECEIPT_BYTES: usize = 64 * 1024;
+
+        let metadata = self.metadata.as_ref().and_then(Value::as_object);
+        let mut receipt = serde_json::Map::new();
+        for (key, max) in [
+            ("operation_id", 256),
+            ("file_path", MAX_LONG_TEXT),
+            ("mutation", 128),
+            ("verification", 128),
+            ("before_hash", 128),
+            ("after_hash", 128),
+            ("command_status", 64),
+        ] {
+            if let Some(value) = metadata.and_then(|object| object.get(key)) {
+                if value.is_null() && matches!(key, "before_hash" | "after_hash") {
+                    receipt.insert(key.to_string(), Value::Null);
+                    continue;
+                }
+                let text = value.as_str()?;
+                if text.len() > max {
+                    return None;
+                }
+                receipt.insert(key.to_string(), Value::String(text.to_string()));
+            }
+        }
+
+        if let Some(value) = metadata.and_then(|object| object.get("bytes")) {
+            receipt.insert("bytes".to_string(), Value::from(value.as_u64()?));
+        }
+        if let Some(value) = metadata.and_then(|object| object.get("exit_code")) {
+            if let Some(code) = value.as_i64() {
+                i32::try_from(code).ok()?;
+            } else if !value.is_null() {
+                return None;
+            }
+            receipt.insert("exit_code".to_string(), value.clone());
+        }
+        if let Some(value) = metadata.and_then(|object| object.get("partial")) {
+            receipt.insert("partial".to_string(), Value::Bool(value.as_bool()?));
+        }
+
+        // This field is host-owned and cannot be forged through metadata.
+        if let Some(status) = self.execution_status {
+            receipt.insert(
+                "execution_status".to_string(),
+                Value::String(status.as_str().to_string()),
+            );
+        }
+
+        if receipt.is_empty() {
+            return None;
+        }
+        let receipt = Value::Object(receipt);
+        (serde_json::to_vec(&receipt).ok()?.len() <= MAX_RECEIPT_BYTES).then_some(receipt)
+    }
+
+    /// Take the private host-only receipt bundle attached by an authorized
+    /// mutator. Model-visible metadata never contains this value.
+    pub fn take_application_receipts(&mut self) -> Option<ReceiptBundle> {
+        self.application_receipts.take()
+    }
+
+    /// Take the private host-only discovery receipt attached by ToolSearch.
+    /// The receipt is never serialized into model-visible metadata.
+    pub fn take_discovery_receipt(&mut self) -> Option<DiscoveryReceipt> {
+        self.discovery_receipt.take()
+    }
+
+    pub(crate) fn with_discovery_receipt(mut self, receipt: DiscoveryReceipt) -> Self {
+        self.discovery_receipt = Some(receipt);
+        self
+    }
+
+    pub(crate) fn with_application_receipts(mut self, receipts: ReceiptBundle) -> Self {
+        self.application_receipts = Some(receipts);
+        self
+    }
+
+    pub(crate) fn with_mutation_receipt(self, receipt: MutationReceipt) -> Self {
+        self.with_application_receipts(ReceiptBundle::new(receipt))
+    }
+
+    /// Add an execution outcome without discarding evidence or tool metadata.
+    /// Uncertain outcomes also revoke any private application receipt.
+    pub fn with_execution_status(mut self, status: ExecutionStatus) -> Self {
+        self.execution_status = Some(status);
+        if matches!(
+            status,
+            ExecutionStatus::NotRun | ExecutionStatus::Cancelled | ExecutionStatus::Unknown
+        ) {
+            self.application_receipts = None;
+            self.discovery_receipt = None;
+            self.typed_content = None;
+            self.evidence_state = None;
+        }
+        let mut metadata = match self.metadata.take() {
+            Some(Value::Object(metadata)) => metadata,
+            Some(other) => serde_json::Map::from_iter([("tool_metadata".into(), other)]),
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "execution_status".into(),
+            Value::String(status.as_str().into()),
+        );
+        self.metadata = Some(Value::Object(metadata));
         self
     }
 }
@@ -171,6 +608,33 @@ pub enum PermissionLevel {
     Forbidden,
 }
 
+/// Trusted execution-effect metadata used by the query scheduler.
+///
+/// Tools must opt into `Observation` explicitly. The default is `Unknown`,
+/// because permission level and tool names do not prove that a call is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// The invocation only observes state and may overlap another observation.
+    Observation,
+    /// The invocation may change state or perform an external side effect.
+    Mutation,
+    /// The effect cannot be established; schedule it as a barrier.
+    Unknown,
+}
+
+/// Host-authored capability for mutation tools exposed to an isolated child.
+///
+/// Names and [`ToolEffect`] values are insufficient: a dynamic tool can reuse
+/// a built-in name or claim mutation metadata while still spawning arbitrary
+/// processes. The default is therefore unavailable. Only native file mutators
+/// that accept the query layer's worktree path wrapper opt in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChildWriterCapability {
+    #[default]
+    Unavailable,
+    ScopedFilesystem,
+}
+
 #[derive(Debug)]
 pub struct PendingPermissionRequest {
     pub tool_use_id: String,
@@ -183,6 +647,30 @@ pub struct PendingPermissionRequest {
 pub struct PendingPermissionStore {
     pub queue: VecDeque<PendingPermissionRequest>,
     pub waiting: HashMap<String, PendingPermissionRequest>,
+    closed: bool,
+    max_queued: Option<usize>,
+}
+
+impl PendingPermissionStore {
+    /// Reopen only after the previous serialized turn has joined its drainer.
+    pub fn reopen(&mut self, max_queued: Option<usize>) {
+        self.closed = false;
+        self.max_queued = max_queued;
+    }
+
+    /// Atomically reject late producers and resolve retained requests as denied.
+    pub fn close(&mut self) {
+        self.closed = true;
+        for pending in self
+            .queue
+            .drain(..)
+            .chain(self.waiting.drain().map(|(_, request)| request))
+        {
+            if let Some(sender) = pending.decision_tx {
+                let _ = sender.send(PermissionDecision::Deny);
+            }
+        }
+    }
 }
 
 /// Persistent shell state shared across Bash tool invocations within one session.
@@ -209,25 +697,65 @@ impl ShellState {
 /// Process-global registry of shell states keyed by session_id.
 /// This lets us persist cwd/env across Bash invocations without changing
 /// the `ToolContext` struct (which is constructed in places we cannot modify).
-static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<ShellState>>>> =
-    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ShellScope {
+    Legacy(String),
+    Context {
+        workspace: PathBuf,
+        session: String,
+        execution_root: PathBuf,
+    },
+}
+
+static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<
+    dashmap::DashMap<ShellScope, Arc<parking_lot::Mutex<ShellState>>>,
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 /// Return the persistent `ShellState` for the given session, creating one if needed.
 pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellState>> {
     SHELL_STATE_REGISTRY
-        .entry(session_id.to_string())
+        .entry(ShellScope::Legacy(session_id.to_string()))
         .or_insert_with(|| Arc::new(parking_lot::Mutex::new(ShellState::new())))
         .clone()
 }
 
-/// Remove the shell state for a session (e.g. when the session ends).
+/// Shell state is owned by a workspace/session and the active execution root.
+/// Switching worktrees cannot carry a previous `cd` back into the main tree.
+fn shell_scope(ctx: &ToolContext) -> ShellScope {
+    ShellScope::Context {
+        workspace: crate::worktree::workspace_root(ctx),
+        session: ctx.session_id.clone(),
+        execution_root: ctx
+            .working_dir
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.working_dir.clone()),
+    }
+}
+
+pub fn context_shell_state(ctx: &ToolContext) -> Arc<parking_lot::Mutex<ShellState>> {
+    SHELL_STATE_REGISTRY
+        .entry(shell_scope(ctx))
+        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(ShellState::new())))
+        .clone()
+}
+
+/// Exit resets only the abandoned execution root; the parent shell remains intact.
+pub fn clear_context_shell_state(ctx: &ToolContext) {
+    SHELL_STATE_REGISTRY.remove(&shell_scope(ctx));
+}
+
+/// Remove every execution root belonging to this exact session identifier.
 pub fn clear_session_shell_state(session_id: &str) {
-    SHELL_STATE_REGISTRY.remove(session_id);
+    SHELL_STATE_REGISTRY.retain(|key, _| match key {
+        ShellScope::Legacy(id) | ShellScope::Context { session: id, .. } => id != session_id,
+    });
 }
 
 /// Return the `ShadowSnapshot` for `working_dir`, creating it on first call.
 /// Returns `None` when git is unavailable or the directory is not in a git repo.
-pub fn session_shadow(working_dir: &std::path::Path) -> Option<Arc<claurst_core::snapshot::ShadowSnapshot>> {
+pub fn session_shadow(
+    working_dir: &std::path::Path,
+) -> Option<Arc<claurst_core::snapshot::ShadowSnapshot>> {
     claurst_core::snapshot::get_or_create(working_dir)
 }
 
@@ -239,31 +767,63 @@ pub fn clear_session_shadow(working_dir: &std::path::Path) {
 /// Write `contents` to `path` atomically: write to a temp file in the same
 /// directory, then rename over the destination. A crash or disk-full mid-write
 /// can never leave the destination truncated or half-written.
-pub(crate) async fn write_atomic(
-    path: &std::path::Path,
-    contents: &[u8],
-) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{}.claurst-tmp-{}", file_name, std::process::id()));
-
-    tokio::fs::write(&tmp, contents).await?;
-    // Preserve the original file's permissions (e.g. the executable bit on
-    // Unix), which a fresh temp file would otherwise reset.
-    if let Ok(meta) = tokio::fs::metadata(path).await {
-        let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
-    }
-    match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
+pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    let contents = contents.to_vec();
+    let commit_lease = crate::mutation::owned_current_lease();
+    // Once scheduled, the owned blocking transaction finishes even if the
+    // caller is dropped. Cancellation after admission is therefore uncertain
+    // until destination readback; it never strands a half-written scratch file.
+    tokio::task::spawn_blocking(move || {
+        let _commit_lease = commit_lease;
+        use std::io::Write;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination has no parent",
+            )
+        })?;
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".{file_name}.claurst-tmp-"))
+            .tempfile_in(parent)?;
+        temporary.write_all(&contents)?;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
         }
-    }
+        temporary.as_file().sync_all()?;
+        // Windows cannot replace a destination while another writer still
+        // holds its handle. Retry only that transient rename failure within a
+        // short bound; all other errors remain hard failures and the test's
+        // atomic-write assertion stays intact.
+        #[cfg(windows)]
+        {
+            let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match temporary.persist(&path) {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.error.kind() == std::io::ErrorKind::PermissionDenied
+                            && std::time::Instant::now() < retry_deadline =>
+                    {
+                        temporary = error.file;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.error),
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        temporary.persist(&path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
-
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
 /// Used by background tasks with `notify_on_complete` to signal completion without polling.
@@ -303,7 +863,8 @@ pub struct ToolContext {
     /// Queue used by interactive mode to surface permission dialogs to the TUI.
     pub pending_permissions: Option<Arc<parking_lot::Mutex<PendingPermissionStore>>>,
     /// Shared permission manager so the interactive loop can record session/persistent approvals.
-    pub permission_manager: Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
+    pub permission_manager:
+        Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
@@ -313,6 +874,12 @@ pub struct ToolContext {
     /// to a fresh disconnected token; `run_query_loop` rebinds it to the loop's
     /// actual token so cancellation propagates into tools and sub-agents.
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Immutable host-owned trusted checker registrations. An empty catalog
+    /// preserves the default adaptive behavior until the host opts in.
+    pub trusted_checker_catalog: Arc<trusted_checker::TrustedCheckerCatalog>,
+    /// Host-built immutable metadata view for authorized lazy tool discovery.
+    /// `None` preserves legacy behavior until the query host binds a view.
+    pub catalog_view: Option<Arc<tool_catalog::ToolCatalogView>>,
 }
 
 impl ToolContext {
@@ -360,13 +927,13 @@ impl ToolContext {
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
-            PermissionDecision::Ask { reason } if self.non_interactive => Err(
-                claurst_core::error::ClaudeError::PermissionDenied(format!(
+            PermissionDecision::Ask { reason } if self.non_interactive => {
+                Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
                     "Permission denied for tool '{}': {}",
                     request.tool_name,
                     interactive_reason.unwrap_or(reason)
-                )),
-            ),
+                )))
+            }
             PermissionDecision::Ask { reason } => {
                 let Some(queue) = &self.pending_permissions else {
                     return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
@@ -376,7 +943,18 @@ impl ToolContext {
                 };
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                queue.lock().queue.push_back(PendingPermissionRequest {
+                let mut store = queue.lock();
+                if store.closed
+                    || self.cancel_token.is_cancelled()
+                    || store
+                        .max_queued
+                        .is_some_and(|limit| store.queue.len() >= limit)
+                {
+                    return Err(claurst_core::error::ClaudeError::PermissionDenied(
+                        "Permission request is unavailable".to_string(),
+                    ));
+                }
+                store.queue.push_back(PendingPermissionRequest {
                     tool_use_id: format!(
                         "perm-{}-{}",
                         self.session_id,
@@ -386,6 +964,7 @@ impl ToolContext {
                     reason: interactive_reason.unwrap_or(reason),
                     decision_tx: Some(tx),
                 });
+                drop(store);
 
                 let decision = tokio::task::block_in_place(|| rx.blocking_recv());
                 match decision {
@@ -409,8 +988,53 @@ impl ToolContext {
         description: &str,
         is_read_only: bool,
     ) -> Result<(), claurst_core::error::ClaudeError> {
-        let request = self.build_permission_request(tool_name, description, None, is_read_only, None);
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
         self.request_permission_inner(request)
+    }
+
+    /// Perform the non-interactive allow/deny capability check used by the
+    /// query execution backstop. Self-gating tools still receive `Ask` here so
+    /// their existing path-aware prompt and hook behavior remains authoritative;
+    /// an explicit deny always stops execution before the tool is called.
+    pub fn check_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        is_read_only: bool,
+    ) -> PermissionDecision {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        self.permission_handler.check_permission(&request)
+    }
+
+    /// Catalog-only capability filtering. A parameterized self-gating tool
+    /// may be disclosed when a path/command grant exists; execution still
+    /// supplies the real parameter to `check_permission_for_path`.
+    pub fn check_catalog_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        is_read_only: bool,
+        parameterized_self_gate: bool,
+    ) -> PermissionDecision {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        self.permission_handler
+            .check_catalog_permission(&request, parameterized_self_gate)
+    }
+
+    /// Preflight for a tool that owns its exact path/command permission check.
+    pub fn check_self_gating_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        is_read_only: bool,
+    ) -> PermissionDecision {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        self.permission_handler
+            .check_self_gating_permission(&request)
     }
 
     pub fn check_permission_for_path(
@@ -420,7 +1044,8 @@ impl ToolContext {
         path: PathBuf,
         is_read_only: bool,
     ) -> Result<(), claurst_core::error::ClaudeError> {
-        let request = self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
         self.request_permission_inner(request)
     }
 
@@ -450,9 +1075,9 @@ impl ToolContext {
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut roots = vec![
-            std::fs::canonicalize(&self.working_dir).unwrap_or_else(|_| self.working_dir.clone()),
-        ];
+        let mut roots =
+            vec![std::fs::canonicalize(&self.working_dir)
+                .unwrap_or_else(|_| self.working_dir.clone())];
         roots.extend(
             self.permission_allowed_roots()
                 .into_iter()
@@ -506,8 +1131,10 @@ impl ToolContext {
 }
 
 /// The trait every tool must implement.
+// async-trait injects #[must_use] on boxed futures; Rust 1.99 flags that generated attribute.
+#[allow(clippy::double_must_use)]
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub trait Tool: Send + Sync + std::any::Any {
     /// Human-readable name (matches the constant in claurst_core::constants).
     fn name(&self) -> &str;
 
@@ -516,6 +1143,21 @@ pub trait Tool: Send + Sync {
 
     /// The permission level the tool requires.
     fn permission_level(&self) -> PermissionLevel;
+
+    /// Trusted scheduler metadata. Unknown is conservative and serializes the
+    /// call until a tool explicitly proves observation-only behavior.
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Unknown
+    }
+
+    /// Whether this exact handle may be wrapped as a path-scoped child writer.
+    ///
+    /// Child execution also clears formatters, hooks, extra directories and
+    /// automatic commits. Implementations must not spawn another writer or
+    /// interpret commands from their input.
+    fn child_writer_capability(&self) -> ChildWriterCapability {
+        ChildWriterCapability::Unavailable
+    }
 
     /// Whether this tool performs its own permission gating inside `execute()`.
     ///
@@ -533,18 +1175,33 @@ pub trait Tool: Send + Sync {
     /// Whether this tool is "advanced" / rarely used and a candidate for
     /// deferred (on-demand) disclosure rather than being sent in every request.
     ///
-    /// Defaults to `false` (always disclosed). This is purely a metadata hint
-    /// today — the prompt/tool-definition layer can read it to decide which
-    /// tools to omit from the initial request and surface only via `ToolSearch`.
-    ///
-    // TODO(#233): wire this into the request assembly so `advanced()` tools are
-    // omitted from the initial `tools` array and loaded on demand. That requires
-    // a mutable *active tool set* tracked across turns inside `run_query_loop`,
-    // which is under active refactor on other branches and intentionally left
-    // untouched here. Land the tracking + gated re-injection there, then have
-    // `all_tools()` callers filter on `advanced()` for the first request.
+    /// Defaults to `false` (initially disclosed). When authorized ToolSearch
+    /// is available, advanced schemas are disclosed only after a scoped host
+    /// discovery receipt activates them. Execution policy remains independent.
     fn advanced(&self) -> bool {
         false
+    }
+
+    /// Trusted host metadata for discovery. Source identity never derives
+    /// from a displayed name and does not grant execution authority.
+    fn catalog_source(&self) -> ToolCatalogSource {
+        if self.advanced() {
+            ToolCatalogSource::DeferredNative
+        } else {
+            ToolCatalogSource::Native
+        }
+    }
+
+    /// Return a witness only for a concrete built-in native Bash capability.
+    /// The default is intentionally absent, so same-name MCP/plugin tools
+    /// cannot turn arbitrary metadata into execution authority.
+    fn native_bash_execution_witness(
+        &self,
+        _tool_id: &str,
+        _result: &ToolResult,
+        _emitted_result: &str,
+    ) -> Option<NativeBashExecutionWitness> {
+        None
     }
 
     /// JSON Schema describing the tool's input parameters.
@@ -568,8 +1225,10 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(PtyBashTool),
         Box::new(FileReadTool),
+        Box::new(EvidenceReadTool),
         Box::new(FileEditTool),
         Box::new(FileWriteTool),
+        Box::new(EditCheckTool),
         Box::new(BatchEditTool),
         Box::new(ApplyPatchTool),
         Box::new(GlobTool),
@@ -583,6 +1242,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(TaskListTool),
         Box::new(TaskStopTool),
         Box::new(TaskOutputTool),
+        Box::new(TaskAcceptTool),
         Box::new(TodoWriteTool),
         Box::new(AskUserQuestionTool),
         Box::new(EnterPlanModeTool),
@@ -675,7 +1335,180 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            trusted_checker_catalog: Arc::new(trusted_checker::TrustedCheckerCatalog::empty()),
+            catalog_view: None,
         }
+    }
+
+    #[test]
+    fn closed_or_cancelled_permission_producers_never_block_or_enqueue() {
+        for scenario in ["closed", "cancelled", "full"] {
+            let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+            let mut context = test_tool_context(Arc::new(AskPermissionHandler {
+                reason: "approval".to_string(),
+            }));
+            context.non_interactive = false;
+            context.pending_permissions = Some(store.clone());
+            if scenario == "closed" {
+                store.lock().close();
+            } else if scenario == "cancelled" {
+                context.cancel_token.cancel();
+            } else {
+                let mut store = store.lock();
+                store.reopen(Some(1));
+                store.queue.push_back(PendingPermissionRequest {
+                    tool_use_id: "retained".to_string(),
+                    request: claurst_core::permissions::PermissionRequest {
+                        tool_name: "Write".to_string(),
+                        description: String::new(),
+                        details: None,
+                        is_read_only: false,
+                        path: None,
+                        working_dir: None,
+                        allowed_roots: Vec::new(),
+                        context_description: None,
+                    },
+                    reason: String::new(),
+                    decision_tx: None,
+                });
+            }
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let denied = context.check_permission("Write", "fixture", false).is_err();
+                let _ = sender.send(denied);
+            });
+            assert!(receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("inactive permission producer blocked"));
+            worker.join().unwrap();
+            assert_eq!(store.lock().queue.len(), usize::from(scenario == "full"));
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_store_closure_denies_retained_waiters_and_can_reopen() {
+        let mut store = PendingPermissionStore::default();
+        for _ in 0..2 {
+            store.reopen(None);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            store.queue.push_back(PendingPermissionRequest {
+                tool_use_id: "fixture".to_string(),
+                request: claurst_core::permissions::PermissionRequest {
+                    tool_name: "Write".to_string(),
+                    description: String::new(),
+                    details: None,
+                    is_read_only: false,
+                    path: None,
+                    working_dir: None,
+                    allowed_roots: Vec::new(),
+                    context_description: None,
+                },
+                reason: String::new(),
+                decision_tx: Some(sender),
+            });
+            store.close();
+            assert!(matches!(receiver.await.unwrap(), PermissionDecision::Deny));
+            assert!(store.queue.is_empty() && store.waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_execution_status_survives_metadata_replacement() {
+        let result = ToolResult::error("uncertain")
+            .with_execution_status(ExecutionStatus::Unknown)
+            .with_metadata(serde_json::json!({"execution_status": "completed"}));
+
+        assert_eq!(result.execution_status(), Some(ExecutionStatus::Unknown));
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_status"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn native_operation_receipt_is_absent_without_metadata() {
+        assert!(ToolResult::success("done")
+            .native_operation_receipt()
+            .is_none());
+    }
+
+    #[test]
+    fn native_operation_receipt_allowlists_fields_and_keeps_typed_status() {
+        let result = ToolResult::success("done")
+            .with_execution_status(ExecutionStatus::Unknown)
+            .with_metadata(serde_json::json!({
+                "operation_id": "op-1",
+                "file_path": "src/lib.rs",
+                "mutation": "modified",
+                "verification": "not_run",
+                "before_hash": "a",
+                "after_hash": "b",
+                "bytes": 12,
+                "partial": false,
+                "execution_status": "completed",
+                "secret": "must not cross",
+                "formatter": {"command": "private"},
+            }));
+        let receipt = result.native_operation_receipt().unwrap();
+        assert_eq!(receipt["operation_id"], "op-1");
+        assert_eq!(receipt["bytes"], 12);
+        assert_eq!(receipt["execution_status"], "unknown");
+        assert!(receipt.get("secret").is_none());
+        assert!(receipt.get("formatter").is_none());
+    }
+
+    #[test]
+    fn native_operation_receipt_preserves_uncertain_mutation_and_typed_status() {
+        let result = ToolResult::error("Final bytes are unavailable; mutation unknown")
+            .with_metadata(serde_json::json!({
+                "operation_id": "uncertain-write-1",
+                "file_path": "src/lib.rs",
+                "mutation": "unknown",
+                "verification": "not_run",
+                "before_hash": "a".repeat(64),
+                "after_hash": null,
+            }))
+            .with_execution_status(ExecutionStatus::Unknown);
+        let receipt = result
+            .native_operation_receipt()
+            .expect("valid uncertain receipt");
+        assert!(result.is_error);
+        assert_eq!(receipt["operation_id"], "uncertain-write-1");
+        assert_eq!(receipt["mutation"], "unknown");
+        assert_eq!(receipt["verification"], "not_run");
+        assert_eq!(receipt["after_hash"], Value::Null);
+        assert_eq!(receipt["execution_status"], "unknown");
+    }
+
+    #[test]
+    fn native_operation_receipt_rejects_malformed_nested_and_oversized_fields() {
+        let malformed = ToolResult::success("done").with_metadata(serde_json::json!({
+            "operation_id": {"nested": true},
+        }));
+        assert!(malformed.native_operation_receipt().is_none());
+
+        let nested = ToolResult::success("done").with_metadata(serde_json::json!({
+            "bytes": {"value": 12},
+        }));
+        assert!(nested.native_operation_receipt().is_none());
+
+        let invalid_exit_code = ToolResult::success("done").with_metadata(serde_json::json!({
+            "exit_code": 2_147_483_648_i64,
+        }));
+        assert!(invalid_exit_code.native_operation_receipt().is_none());
+
+        let oversized = ToolResult::success("done").with_metadata(serde_json::json!({
+            "file_path": "x".repeat(16 * 1024 + 1),
+        }));
+        assert!(oversized.native_operation_receipt().is_none());
+    }
+
+    #[test]
+    fn model_metadata_cannot_mint_discovery_authority() {
+        let mut result = ToolResult::success("search").with_metadata(serde_json::json!({
+            "discovery_receipt": {"catalog_id": 1, "selected_names": ["Read"]}
+        }));
+        assert!(result.take_discovery_receipt().is_none());
     }
 
     // ---- Tool registry tests ------------------------------------------------
@@ -683,7 +1516,10 @@ mod tests {
     #[test]
     fn test_all_tools_non_empty() {
         let tools = all_tools();
-        assert!(!tools.is_empty(), "all_tools() must return at least one tool");
+        assert!(
+            !tools.is_empty(),
+            "all_tools() must return at least one tool"
+        );
     }
 
     #[test]
@@ -749,9 +1585,16 @@ mod tests {
     #[test]
     fn test_core_tools_present() {
         let expected = [
-            "Bash", "Read", "Edit", "Write", "Glob", "Grep",
-            "WebFetch", "WebSearch",
-            "TodoWrite", "Skill",
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
+            "Skill",
         ];
         for name in &expected {
             assert!(
@@ -786,6 +1629,96 @@ mod tests {
         assert!(r.metadata.is_some());
         let meta = r.metadata.unwrap();
         assert_eq!(meta["file"], "foo.rs");
+    }
+
+    #[test]
+    fn typed_tool_content_validates_and_preserves_blocks_separately() {
+        let blocks = vec![
+            claurst_core::types::ContentBlock::Text {
+                text: "original text".to_string(),
+            },
+            claurst_core::types::ContentBlock::Image {
+                source: claurst_core::types::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("image/png".to_string()),
+                    data: Some(
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+                            .to_string(),
+                    ),
+                    url: None,
+                },
+            },
+        ];
+        let result = ToolResult::success("bounded display summary")
+            .with_typed_content(blocks.clone(), &claurst_core::media::MediaLimits::default())
+            .expect("valid typed image");
+        assert_eq!(result.content, "bounded display summary");
+        assert_eq!(result.typed_blocks().unwrap().len(), blocks.len());
+        assert_eq!(result.typed_manifest().unwrap().items().len(), 1);
+        assert_eq!(
+            serde_json::to_vec(result.typed_blocks().unwrap()).unwrap(),
+            serde_json::to_vec(&blocks).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_tool_content_rejects_urls_and_uncertain_status_drops_media() {
+        let blocks = vec![claurst_core::types::ContentBlock::Image {
+            source: claurst_core::types::ImageSource {
+                source_type: "url".to_string(),
+                media_type: Some("image/png".to_string()),
+                data: None,
+                url: Some("https://example.invalid/image.png".to_string()),
+            },
+        }];
+        assert!(matches!(
+            ToolResult::success("summary")
+                .with_typed_content(blocks, &claurst_core::media::MediaLimits::default()),
+            Err(claurst_core::media::MediaError::UrlUnsupported)
+        ));
+
+        let image = claurst_core::types::ContentBlock::Image {
+            source: claurst_core::types::ImageSource {
+                source_type: "base64".to_string(),
+                media_type: Some("image/png".to_string()),
+                data: Some(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+                        .to_string(),
+                ),
+                url: None,
+            },
+        };
+        let result = ToolResult::success("summary")
+            .with_typed_content(vec![image], &claurst_core::media::MediaLimits::default())
+            .expect("valid typed image")
+            .with_execution_status(ExecutionStatus::Cancelled);
+        assert!(result.typed_blocks().is_none());
+
+        let image = claurst_core::types::ContentBlock::Image {
+            source: claurst_core::types::ImageSource {
+                source_type: "base64".to_string(),
+                media_type: Some("image/png".to_string()),
+                data: Some(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+                        .to_string(),
+                ),
+                url: None,
+            },
+        };
+        for status in [
+            ExecutionStatus::NotRun,
+            ExecutionStatus::Cancelled,
+            ExecutionStatus::Unknown,
+        ] {
+            let result = ToolResult::success("summary")
+                .with_execution_status(status)
+                .with_typed_content(
+                    vec![image.clone()],
+                    &claurst_core::media::MediaLimits::default(),
+                )
+                .expect("uncertain result's typed attachment is a documented revocation");
+            assert!(result.typed_blocks().is_none());
+        }
     }
 
     // ---- ToolContext::resolve_path tests ------------------------------------
@@ -831,7 +1764,10 @@ mod tests {
             Some(PathBuf::from("Set-ExecutionPolicy RemoteSigned")),
         );
 
-        let error = ctx.request_permission_inner(request).unwrap_err().to_string();
+        let error = ctx
+            .request_permission_inner(request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("[High risk] This may modify system-wide security policy."));
         assert!(!error.contains("generic reason"));
     }
@@ -849,7 +1785,10 @@ mod tests {
             Some(PathBuf::from("ls -la")),
         );
 
-        let error = ctx.request_permission_inner(request).unwrap_err().to_string();
+        let error = ctx
+            .request_permission_inner(request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("generic reason"));
     }
 
@@ -883,6 +1822,15 @@ mod tests {
         assert_eq!(FileWriteTool.permission_level(), PermissionLevel::Write);
     }
 
+    #[test]
+    fn scheduler_effect_metadata_is_conservative() {
+        assert_eq!(FileReadTool.effect(), ToolEffect::Observation);
+        assert_eq!(GlobTool.effect(), ToolEffect::Observation);
+        assert_eq!(GrepTool.effect(), ToolEffect::Observation);
+        assert_eq!(FileWriteTool.effect(), ToolEffect::Mutation);
+        assert_eq!(PtyBashTool.effect(), ToolEffect::Unknown);
+    }
+
     // ---- Tool to_definition tests ------------------------------------------
 
     #[test]
@@ -905,11 +1853,7 @@ mod tests {
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".claurst-tmp-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"))
             .count()
     }
 
@@ -926,7 +1870,122 @@ mod tests {
         // Overwrite an existing file (the crash-truncation scenario #226 fixes).
         write_atomic(&path, b"replaced").await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
-        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after overwrite");
+        assert_eq!(
+            count_atomic_tmp_files(dir.path()),
+            0,
+            "no tmp after overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_atomic_concurrent_writers_use_distinct_scratch_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        let writes = (0..16).map(|index| {
+            let path = path.clone();
+            async move {
+                let content = vec![b'a' + index; 64 * 1024];
+                write_atomic(&path, &content).await
+            }
+        });
+        for result in futures::future::join_all(writes).await {
+            assert!(
+                result.is_ok(),
+                "concurrent atomic commit failed: {result:?}"
+            );
+        }
+        let final_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(final_bytes.len(), 64 * 1024);
+        assert!(final_bytes.iter().all(|byte| *byte == final_bytes[0]));
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn write_atomic_finishes_owned_commit_after_caller_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned.txt");
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.await.unwrap();
+            let destination = path.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let writer = tokio::spawn(async move {
+                entered_tx.send(()).unwrap();
+                write_atomic(&destination, b"whole committed content").await
+            });
+            entered_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            writer.abort();
+            assert!(writer.await.unwrap_err().is_cancelled());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            // FIFO blocking-pool fence: the owned commit has finished even
+            // though its awaiting task was cancelled.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole committed content");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn write_atomic_holds_scope_until_cancelled_callers_commit_finishes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let path = dir.path().join("leased.txt");
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.await.unwrap();
+            let destination = path.clone();
+            let writer_ctx = ctx.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let writer = tokio::spawn(async move {
+                let lease = match crate::mutation::admit(&writer_ctx, &FileWriteTool).unwrap() {
+                    crate::mutation::MutationAdmission::Acquired(lease) => lease,
+                    _ => panic!("expected fresh mutation lease"),
+                };
+                crate::mutation::with_lease(&lease, async move {
+                    entered_tx.send(()).unwrap();
+                    write_atomic(&destination, b"owned lease commit").await
+                })
+                .await
+            });
+            entered_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            writer.abort();
+            assert!(writer.await.unwrap_err().is_cancelled());
+            assert!(
+                crate::mutation::admit(&ctx, &FileWriteTool).is_err(),
+                "in-flight owned commit must retain exclusion"
+            );
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(crate::mutation::admit(&ctx, &FileWriteTool).is_ok());
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned lease commit");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
     }
 
     /// The executable bit (and other permissions) must survive an atomic

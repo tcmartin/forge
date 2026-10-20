@@ -11,6 +11,23 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Host-published prompt paths. Runtime grants are never loaded from settings.
+#[derive(Debug, Clone)]
+pub struct SkillSource {
+    pub name: String,
+    pub path: PathBuf,
+    pub origin: SkillOrigin,
+}
+
+#[derive(Debug, Clone)]
+pub enum SkillOrigin {
+    Local,
+    Plugin {
+        denial: Option<String>,
+        project_root: Option<PathBuf>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -18,7 +35,7 @@ use std::path::{Path, PathBuf};
 /// A discovered skill loaded from a markdown file.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSkill {
-    /// Skill name (from `name:` frontmatter or file stem).
+    /// Skill name (from frontmatter, the file stem, or the entrypoint directory).
     pub name: String,
     /// One-line description (from `description:` frontmatter or default).
     pub description: String,
@@ -69,12 +86,7 @@ pub fn parse_skill_file(content: &str, path: &Path) -> Option<DiscoveredSkill> {
         (None, None, content.to_string())
     };
 
-    let name = name.unwrap_or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unnamed")
-            .to_string()
-    });
+    let name = name.unwrap_or_else(|| skill_name_from_path(path));
     let description = description.unwrap_or_else(|| "Custom skill".to_string());
 
     if template.is_empty() && name.is_empty() {
@@ -93,34 +105,98 @@ pub fn parse_skill_file(content: &str, path: &Path) -> Option<DiscoveredSkill> {
 // Directory scanning
 // ---------------------------------------------------------------------------
 
-/// Scan a single directory for `*.md` skill files.
-fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
-    let mut skills = Vec::new();
+pub fn skill_name_from_path(path: &Path) -> String {
+    let directory_entrypoint = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    let fallback = if directory_entrypoint {
+        path.parent()
+            .and_then(Path::file_name)
+            .or_else(|| path.file_stem())
+    } else {
+        path.file_stem()
+    };
+    fallback
+        .and_then(|name| name.to_str())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+/// Ordered local sources shared by slash commands and model-facing lookup.
+/// Enumerating these paths never fetches configured Git repositories.
+pub fn skill_search_dirs(cwd: &Path, config: &crate::config::SkillsConfig) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for directory in cwd.ancestors() {
+        directories.push(directory.join(".claurst/skills"));
+        directories.push(directory.join(".agents/skills"));
+    }
+    directories.push(crate::config::Settings::config_dir().join("skills"));
+    for path in &config.paths {
+        let path = Path::new(path);
+        directories.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        });
+    }
+    directories
+}
+
+/// Existing Git cache paths only: a model's read-only lookup cannot clone.
+pub fn cached_git_skill_dirs(config: &crate::config::SkillsConfig) -> Vec<PathBuf> {
+    config
+        .urls
+        .iter()
+        .filter_map(|url| git_skill_cache_dir(url))
+        .flat_map(|root| [root.clone(), root.join("skills")])
+        .collect()
+}
+
+/// Select flat Markdown files and direct child-directory SKILL.md entrypoints.
+/// Reference files inside a skill directory are not separate skills.
+pub fn discover_skill_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     if !dir.is_dir() {
-        return skills;
+        return files;
     }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(err) => {
-            tracing::debug!(dir = %dir.display(), error = %err, "skill_discovery: read_dir failed");
-            return skills;
+        Err(_) => {
+            tracing::debug!("skill_discovery: read_dir failed");
+            return files;
         }
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    if let Some(skill) = parse_skill_file(&content, &path) {
-                        skills.push(skill);
-                    }
-                }
-                Err(err) => {
-                    tracing::debug!(path = %path.display(), error = %err, "skill_discovery: read failed");
+        if path.is_dir() {
+            let upper = path.join("SKILL.md");
+            let lower = path.join("skill.md");
+            if upper.is_file() {
+                files.push(upper);
+            } else if lower.is_file() {
+                files.push(lower);
+            }
+        } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
+    let mut skills = Vec::new();
+    for path in discover_skill_files(dir) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                if let Some(skill) = parse_skill_file(&content, &path) {
+                    skills.push(skill);
                 }
             }
+            Err(_) => tracing::debug!("skill_discovery: read failed"),
         }
     }
 
@@ -158,33 +234,8 @@ pub fn discover_skills(
         }
     };
 
-    // ---- 1. Project skills: walk up from cwd --------------------------------
-    {
-        let mut dir: &Path = cwd;
-        loop {
-            add(scan_dir(&dir.join(".claurst").join("skills")));
-            add(scan_dir(&dir.join(".agents").join("skills")));
-            match dir.parent() {
-                Some(parent) if parent != dir => dir = parent,
-                _ => break,
-            }
-        }
-    }
-
-    // ---- 2. Global skills: <claurst home>/skills/ ---------------------------
-    add(scan_dir(
-        &crate::config::Settings::config_dir().join("skills"),
-    ));
-
-    // ---- 3. Configured extra paths ------------------------------------------
-    for path_str in &config_skills.paths {
-        let path = Path::new(path_str);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-        add(scan_dir(&path));
+    for directory in skill_search_dirs(cwd, config_skills) {
+        add(scan_dir(&directory));
     }
 
     // ---- 4. Git URL skills (cached) -----------------------------------------
@@ -195,8 +246,11 @@ pub fn discover_skills(
     }
 
     // Emit warnings for any duplicate skill names encountered.
-    for w in &warn_duplicates {
-        tracing::warn!("{}", w);
+    if !warn_duplicates.is_empty() {
+        tracing::warn!(
+            count = warn_duplicates.len(),
+            "skill_discovery: duplicate skill names ignored"
+        );
     }
 
     all
@@ -211,32 +265,24 @@ pub fn discover_skills(
 /// Cache location: `<system-cache>/claurst/skills/<repo-name>/`
 /// On first access the repo is cloned with `--depth=1`.
 /// Subsequent calls use the already-cloned cache directory as-is.
-fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
-    let cache_dir = dirs::cache_dir()?.join("claurst").join("skills");
-
-    // Use the last path segment of the URL as the local directory name.
-    let repo_name = url
-        .split('/')
-        .next_back()?
-        .trim_end_matches(".git");
-
-    if repo_name.is_empty() {
-        tracing::warn!(url, "skill_discovery: cannot derive repo name from git URL");
+fn git_skill_cache_dir(url: &str) -> Option<PathBuf> {
+    let repo_name = url.rsplit('/').next()?.trim_end_matches(".git");
+    if matches!(repo_name, "" | "." | "..") {
         return None;
     }
+    Some(dirs::cache_dir()?.join("claurst/skills").join(repo_name))
+}
 
-    let repo_dir = cache_dir.join(repo_name);
+fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
+    let repo_dir = git_skill_cache_dir(url)?;
+    let cache_dir = repo_dir.parent()?;
 
     if !repo_dir.exists() {
-        tracing::info!(url, dest = %repo_dir.display(), "skill_discovery: cloning skills repo");
+        tracing::info!("skill_discovery: cloning skills repo");
 
         // Ensure the parent cache directory exists.
-        if let Err(err) = std::fs::create_dir_all(&cache_dir) {
-            tracing::warn!(
-                dir = %cache_dir.display(),
-                error = %err,
-                "skill_discovery: could not create cache dir"
-            );
+        if std::fs::create_dir_all(cache_dir).is_err() {
+            tracing::warn!("skill_discovery: could not create cache dir");
             return None;
         }
 
@@ -247,14 +293,14 @@ fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
 
         match status {
             Ok(s) if s.success() => {
-                tracing::info!(url, "skill_discovery: clone succeeded");
+                tracing::info!("skill_discovery: clone succeeded");
             }
             Ok(s) => {
-                tracing::warn!(url, exit_code = ?s.code(), "skill_discovery: git clone failed");
+                tracing::warn!(exit_code = ?s.code(), "skill_discovery: git clone failed");
                 return None;
             }
-            Err(err) => {
-                tracing::warn!(url, error = %err, "skill_discovery: could not spawn git");
+            Err(_) => {
+                tracing::warn!("skill_discovery: could not spawn git");
                 return None;
             }
         }
@@ -292,7 +338,8 @@ mod tests {
 
     #[test]
     fn test_parse_with_frontmatter() {
-        let content = "---\nname: review\ndescription: Review code changes\n---\n\nPlease review $ARGUMENTS";
+        let content =
+            "---\nname: review\ndescription: Review code changes\n---\n\nPlease review $ARGUMENTS";
         let path = PathBuf::from("review.md");
         let skill = parse_skill_file(content, &path).unwrap();
         assert_eq!(skill.name, "review");
@@ -320,6 +367,15 @@ mod tests {
     }
 
     #[test]
+    fn directory_entrypoint_uses_parent_name_unless_frontmatter_overrides_it() {
+        let path = Path::new("skills/directory-skill/SKILL.md");
+        let skill = parse_skill_file("Use $ARGUMENTS.", path).unwrap();
+        assert_eq!(skill.name, "directory-skill");
+        let named = parse_skill_file("---\nname: explicit-name\n---\nBody.", path).unwrap();
+        assert_eq!(named.name, "explicit-name");
+    }
+
+    #[test]
     fn test_parse_empty_returns_none() {
         let skill = parse_skill_file("   ", &PathBuf::from("empty.md"));
         assert!(skill.is_none());
@@ -338,7 +394,11 @@ mod tests {
     #[test]
     fn test_scan_dir_finds_skills() {
         let tmp = make_temp_dir();
-        write_file(tmp.path(), "review.md", "---\nname: review\n---\nReview $ARGUMENTS");
+        write_file(
+            tmp.path(),
+            "review.md",
+            "---\nname: review\n---\nReview $ARGUMENTS",
+        );
         write_file(tmp.path(), "debug.md", "Debug help.");
         write_file(tmp.path(), "not-md.txt", "ignored");
 
@@ -355,6 +415,30 @@ mod tests {
         assert!(skills.is_empty());
     }
 
+    #[test]
+    fn directory_skills_load_one_entrypoint_without_reference_files() {
+        let tmp = make_temp_dir();
+        write_file(
+            tmp.path(),
+            "upper/SKILL.md",
+            "---\nname: named-upper\n---\nUpper body.",
+        );
+        write_file(tmp.path(), "lower/skill.md", "Lower body.");
+        write_file(tmp.path(), "upper/references/extra.md", "Reference only.");
+        write_file(tmp.path(), "notes/readme.md", "Not a skill entrypoint.");
+        let skills = scan_dir(tmp.path());
+        assert_eq!(skills.len(), 2);
+        let upper = skills
+            .iter()
+            .find(|skill| skill.name == "named-upper")
+            .unwrap();
+        assert_eq!(upper.template, "Upper body.");
+        assert_eq!(upper.source_path, tmp.path().join("upper/SKILL.md"));
+        assert!(skills
+            .iter()
+            .any(|skill| skill.name == "lower" && skill.template == "Lower body."));
+    }
+
     // ---- discover_skills ----------------------------------------------------
 
     #[test]
@@ -362,7 +446,11 @@ mod tests {
         let tmp = make_temp_dir();
         let skills_dir = tmp.path().join(".claurst").join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        write_file(&skills_dir, "myskill.md", "---\nname: myskill\ndescription: Test\n---\nDo it.");
+        write_file(
+            &skills_dir,
+            "myskill.md",
+            "---\nname: myskill\ndescription: Test\n---\nDo it.",
+        );
 
         let config = crate::config::SkillsConfig::default();
         let discovered = discover_skills(tmp.path(), &config);
@@ -374,7 +462,11 @@ mod tests {
     fn test_discover_extra_paths() {
         let tmp = make_temp_dir();
         let extra = make_temp_dir();
-        write_file(extra.path(), "extra.md", "---\nname: extra\n---\nExtra skill.");
+        write_file(
+            extra.path(),
+            "extra.md",
+            "---\nname: extra\n---\nExtra skill.",
+        );
 
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],
@@ -389,10 +481,18 @@ mod tests {
         let tmp = make_temp_dir();
         let proj_skills = tmp.path().join(".claurst").join("skills");
         std::fs::create_dir_all(&proj_skills).unwrap();
-        write_file(&proj_skills, "dup.md", "---\nname: dup\ndescription: project\n---\nProject.");
+        write_file(
+            &proj_skills,
+            "dup.md",
+            "---\nname: dup\ndescription: project\n---\nProject.",
+        );
 
         let extra = make_temp_dir();
-        write_file(extra.path(), "dup.md", "---\nname: dup\ndescription: extra\n---\nExtra.");
+        write_file(
+            extra.path(),
+            "dup.md",
+            "---\nname: dup\ndescription: extra\n---\nExtra.",
+        );
 
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],

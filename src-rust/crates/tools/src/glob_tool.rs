@@ -1,6 +1,6 @@
 // Glob tool: fast file pattern matching.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolEffect, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,7 +19,9 @@ struct GlobInput {
 #[async_trait]
 impl Tool for GlobTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GLOB
@@ -34,6 +36,10 @@ impl Tool for GlobTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::ReadOnly
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Observation
     }
 
     fn input_schema(&self) -> Value {
@@ -77,10 +83,7 @@ impl Tool for GlobTool {
         debug!(pattern = %params.pattern, dir = %base_dir.display(), "Running glob");
 
         if !base_dir.exists() || !base_dir.is_dir() {
-            return ToolResult::error(format!(
-                "Directory not found: {}",
-                base_dir.display()
-            ));
+            return ToolResult::error(format!("Directory not found: {}", base_dir.display()));
         }
 
         // Build the full glob pattern

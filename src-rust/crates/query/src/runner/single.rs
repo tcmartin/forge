@@ -13,9 +13,12 @@ pub async fn run_single_query(
     let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
     let system = build_system_prompt(config);
 
+    let wire_budget = crate::default_wire_budget(u64::from(config.max_tokens))
+        .map_err(|error| ClaudeError::Config(error.to_string()))?;
     let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
         .messages(api_messages)
         .system(system)
+        .wire_budget(wire_budget)
         .build();
 
     let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);

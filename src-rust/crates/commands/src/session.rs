@@ -14,8 +14,12 @@ pub struct ForkCommand;
 
 #[async_trait]
 impl SlashCommand for PlanCommand {
-    fn name(&self) -> &str { "plan" }
-    fn description(&self) -> &str { "Enter plan mode – model outputs a plan for approval before acting" }
+    fn name(&self) -> &str {
+        "plan"
+    }
+    fn description(&self) -> &str {
+        "Enter plan mode – model outputs a plan for approval before acting"
+    }
     fn help(&self) -> &str {
         "Usage: /plan [description]\n\n\
          Switches to plan mode where the model will create a detailed plan before executing.\n\
@@ -26,7 +30,7 @@ impl SlashCommand for PlanCommand {
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if args.trim() == "exit" {
             return CommandResult::UserMessage(
-                "[Exiting plan mode. Resuming normal execution.]".to_string()
+                "[Exiting plan mode. Resuming normal execution.]".to_string(),
             );
         }
         let task_desc = if args.is_empty() {
@@ -47,13 +51,20 @@ impl SlashCommand for PlanCommand {
 
 #[async_trait]
 impl SlashCommand for TasksCommand {
-    fn name(&self) -> &str { "tasks" }
-    fn aliases(&self) -> Vec<&str> { vec!["bashes"] }
-    fn description(&self) -> &str { "List and manage background tasks" }
+    fn name(&self) -> &str {
+        "tasks"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["bashes"]
+    }
+    fn description(&self) -> &str {
+        "List and manage background tasks"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::UserMessage(
-            "Please list all current tasks using the TaskList tool and show their status.".to_string()
+            "Please list all current tasks using the TaskList tool and show their status."
+                .to_string(),
         )
     }
 }
@@ -62,9 +73,15 @@ impl SlashCommand for TasksCommand {
 
 #[async_trait]
 impl SlashCommand for SessionCommand {
-    fn name(&self) -> &str { "session" }
-    fn aliases(&self) -> Vec<&str> { vec!["remote"] }
-    fn description(&self) -> &str { "Show or manage conversation sessions" }
+    fn name(&self) -> &str {
+        "session"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["remote"]
+    }
+    fn description(&self) -> &str {
+        "Show or manage conversation sessions"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         match args.trim() {
@@ -128,7 +145,11 @@ impl SlashCommand for SessionCommand {
                         for sess in sessions.iter().take(5) {
                             let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
                             let id_short = &sess.id[..sess.id.len().min(8)];
-                            let marker = if sess.id == ctx.session_id { " ◀ current" } else { "" };
+                            let marker = if sess.id == ctx.session_id {
+                                " ◀ current"
+                            } else {
+                                ""
+                            };
                             output.push_str(&format!(
                                 "  {} | {} | {} messages | {}{}\n",
                                 id_short,
@@ -138,13 +159,18 @@ impl SlashCommand for SessionCommand {
                                 marker,
                             ));
                         }
-                        output.push_str("\nUse /session list for all sessions, /resume <id> to switch.");
+                        output.push_str(
+                            "\nUse /session list for all sessions, /resume <id> to switch.",
+                        );
                     }
 
                     CommandResult::Message(output)
                 }
             }
-            _ => CommandResult::Error(format!("Unknown subcommand: {}\n\nUsage: /session [list]", args)),
+            _ => CommandResult::Error(format!(
+                "Unknown subcommand: {}\n\nUsage: /session [list]",
+                args
+            )),
         }
     }
 }
@@ -153,8 +179,12 @@ impl SlashCommand for SessionCommand {
 
 #[async_trait]
 impl SlashCommand for ForkCommand {
-    fn name(&self) -> &str { "fork" }
-    fn description(&self) -> &str { "Fork the current session into a new branch" }
+    fn name(&self) -> &str {
+        "fork"
+    }
+    fn description(&self) -> &str {
+        "Fork the current session into a new branch"
+    }
     fn help(&self) -> &str {
         "Usage: /fork [message_index]\n\n\
          Fork the current session at the specified message index (or at the\n\
@@ -166,10 +196,24 @@ impl SlashCommand for ForkCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let fork_index: Option<usize> = args.trim().parse().ok();
         let messages = &ctx.messages;
-        let fork_at = fork_index.unwrap_or(messages.len()).min(messages.len());
-        let forked_messages: Vec<_> = messages[..fork_at].to_vec();
+        let fork_at = if args.trim().is_empty() {
+            messages.len()
+        } else {
+            match args.trim().parse::<usize>() {
+                Ok(index) => index.min(messages.len()),
+                Err(_) => {
+                    return CommandResult::Error(
+                        "Cannot fork: message index must be a non-negative integer.".to_string(),
+                    )
+                }
+            }
+        };
+        let forked_messages = match claurst_core::history::validated_fork_prefix(messages, fork_at)
+        {
+            Ok(prefix) => prefix.to_vec(),
+            Err(error) => return CommandResult::Error(format!("Cannot fork: {error}")),
+        };
 
         let mut new_session = claurst_core::history::ConversationSession::new(
             ctx.config.effective_model().to_string(),
@@ -181,9 +225,7 @@ impl SlashCommand for ForkCommand {
             "Fork of {}",
             ctx.session_title.as_deref().unwrap_or("session")
         ));
-        new_session.working_dir = Some(
-            ctx.working_dir.to_string_lossy().to_string(),
-        );
+        new_session.working_dir = Some(ctx.working_dir.to_string_lossy().to_string());
 
         let new_id = new_session.id.clone();
         match claurst_core::history::save_session(&new_session).await {

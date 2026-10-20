@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::protocol::LineStreamDecoder;
-use crate::providers::openai::OpenAiProvider;
 use crate::provider_types::StreamEvent;
+use crate::providers::openai::OpenAiProvider;
 
 /// Dedicated index for the Thinking content block emitted when a provider
 /// streams a `reasoning_content` field (DeepSeek V4, etc.). Chosen to avoid
@@ -36,6 +36,7 @@ pub struct OpenAiChatDecoder {
     message_id: String,
     model_name: String,
     thinking_open: bool,
+    message_stopped: bool,
     /// Keyed by content-block index → (tool_call_id, name, accumulated_args).
     tool_call_buffers: HashMap<usize, (String, String, String)>,
 }
@@ -48,12 +49,17 @@ impl OpenAiChatDecoder {
             message_id: String::from("unknown"),
             model_name: String::new(),
             thinking_open: false,
+            message_stopped: false,
             tool_call_buffers: HashMap::new(),
         }
     }
 
     /// Feed one SSE line. See [`LineStreamDecoder::feed_line`].
     pub fn feed_line(&mut self, line: &str, out: &mut Vec<StreamEvent>) -> bool {
+        if self.message_stopped {
+            return true;
+        }
+
         let line = line.trim_end_matches('\r').trim();
 
         if line.is_empty() || line.starts_with(':') {
@@ -66,6 +72,7 @@ impl OpenAiChatDecoder {
         };
 
         if data == "[DONE]" {
+            self.message_stopped = true;
             out.push(StreamEvent::MessageStop);
             return true;
         }
@@ -92,14 +99,19 @@ impl OpenAiChatDecoder {
             });
             out.push(StreamEvent::ContentBlockStart {
                 index: 0,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             });
             self.message_started = true;
         }
 
         let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
-            Some(c) => c,
-            None => {
+            Some(c) if !c.is_empty() => c,
+            // OpenAI's final usage chunk carries `choices: []`; providers may
+            // also omit choices entirely. Both forms are non-terminal and
+            // must be consumed before the later [DONE] sentinel.
+            Some(_) | None => {
                 if let Some(usage_val) = chunk_json.get("usage") {
                     let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
                     out.push(StreamEvent::MessageDelta {
@@ -283,7 +295,8 @@ impl OpenAiChatDecoder {
     /// Flush a trailing `MessageStop` if the stream produced any content but
     /// ended without an explicit `[DONE]` sentinel.
     pub fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        if self.message_started {
+        if self.message_started && !self.message_stopped {
+            self.message_stopped = true;
             out.push(StreamEvent::MessageStop);
         }
     }
@@ -341,7 +354,10 @@ mod tests {
         ));
         assert!(matches!(
             &events[1],
-            StreamEvent::ContentBlockStart { index: 0, content_block: ContentBlock::Text { .. } }
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Text { .. }
+            }
         ));
 
         let text: String = events
@@ -357,9 +373,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::MessageDelta { stop_reason: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::MessageDelta {
+                stop_reason: Some(_),
+                ..
+            }
+        )));
 
         // finish() flushes MessageStop since content was produced.
         let mut tail = Vec::new();
@@ -407,11 +427,15 @@ mod tests {
         let args: String = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::InputJsonDelta { index: 1, partial_json } => Some(partial_json.clone()),
+                StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial_json,
+                } => Some(partial_json.clone()),
                 _ => None,
             })
             .collect();
-        let parsed: Value = serde_json::from_str(&args).expect("assembled tool args must be valid JSON");
+        let parsed: Value =
+            serde_json::from_str(&args).expect("assembled tool args must be valid JSON");
         assert_eq!(parsed["city"], "Paris");
 
         // finish closes text block 0 and the tool block 1.
@@ -482,13 +506,94 @@ mod tests {
         );
         out.clear();
         let stop = d.feed_line(
-            r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             &mut out,
         );
         assert!(!stop);
         assert!(matches!(
             out.as_slice(),
-            [StreamEvent::MessageDelta { stop_reason: None, usage: Some(_) }]
+            [StreamEvent::MessageDelta {
+                stop_reason: None,
+                usage: Some(_)
+            }]
         ));
+    }
+
+    #[test]
+    fn trailing_usage_arrives_before_one_terminal_event() {
+        let mut d = OpenAiChatDecoder::new(None);
+        let mut events = Vec::new();
+
+        assert!(!d.feed_line(
+            r#"data: {"id":"c","model":"m","choices":[{"delta":{"content":"answer"}}]}"#,
+            &mut events,
+        ));
+        assert!(!d.feed_line(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut events,
+        ));
+        let stop_reason_pos = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StreamEvent::MessageDelta {
+                        stop_reason: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("finish_reason should produce a stop reason");
+
+        assert!(!d.feed_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            &mut events,
+        ));
+        let usage_pos = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::MessageDelta { stop_reason: None, usage: Some(usage) } if usage.input_tokens == 5 && usage.output_tokens == 2))
+            .expect("empty choices usage chunk should be decoded");
+        assert!(
+            stop_reason_pos < usage_pos,
+            "usage must follow finish reason"
+        );
+
+        assert!(d.feed_line("data: [DONE]", &mut events));
+        d.finish(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::MessageStop))
+                .count(),
+            1,
+            "[DONE] and EOF must produce one terminal event"
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn eof_before_usage_keeps_usage_zero() {
+        let mut d = OpenAiChatDecoder::new(None);
+        let mut events = Vec::new();
+        d.feed_line(
+            r#"data: {"id":"c","model":"m","choices":[{"delta":{"content":"partial"}}]}"#,
+            &mut events,
+        );
+        d.feed_line(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut events,
+        );
+        d.finish(&mut events);
+
+        assert!(events.iter().all(|event| {
+            !matches!(event, StreamEvent::MessageDelta { usage: Some(usage), .. } if usage.total_input() > 0 || usage.output_tokens > 0)
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::MessageStop))
+                .count(),
+            1
+        );
     }
 }

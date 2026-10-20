@@ -90,7 +90,11 @@ impl JwtClaims {
         let exp = self.exp?;
         let now = chrono::Utc::now().timestamp();
         let diff = exp - now;
-        if diff > 0 { Some(diff) } else { None }
+        if diff > 0 {
+            Some(diff)
+        } else {
+            None
+        }
     }
 }
 
@@ -194,8 +198,8 @@ impl BridgeConfig {
         let mut config = Self::default();
 
         // URL override (sets enabled implicitly)
-        if let Ok(url) = std::env::var("CLAURST_BRIDGE_URL")
-            .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        if let Ok(url) =
+            std::env::var("CLAURST_BRIDGE_URL").or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         {
             if !url.is_empty() {
                 config.server_url = url;
@@ -357,9 +361,7 @@ pub enum BridgeEvent {
         code: Option<String>,
     },
     /// Response to a `Ping` message.
-    Pong {
-        server_time: Option<u64>,
-    },
+    Pong { server_time: Option<u64> },
     /// Session lifecycle state change.
     SessionState {
         session_id: String,
@@ -397,16 +399,37 @@ pub struct BridgeSession {
     last_ping: Option<std::time::Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDelivery {
+    Sent,
+    Closed,
+    Cancelled,
+}
+
+async fn send_inbound_or_cancel(
+    tx: &mpsc::Sender<BridgeMessage>,
+    message: BridgeMessage,
+    cancel: &CancellationToken,
+) -> InboundDelivery {
+    tokio::select! {
+        result = tx.send(message) => {
+            if result.is_ok() {
+                InboundDelivery::Sent
+            } else {
+                InboundDelivery::Closed
+            }
+        }
+        _ = cancel.cancelled() => InboundDelivery::Cancelled,
+    }
+}
+
 impl BridgeSession {
     /// Create a new bridge session; generates a fresh UUID for `session_id`.
     pub fn new(config: BridgeConfig) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent(format!(
-                "claude-code-rust/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("Failed to build reqwest client");
 
@@ -447,10 +470,7 @@ impl BridgeSession {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Bridge register: no session token"))?;
 
-        let url = format!(
-            "{}/api/claude_code/sessions",
-            self.config.server_url
-        );
+        let url = format!("{}/api/claude_code/sessions", self.config.server_url);
 
         let body = serde_json::json!({
             "session_id": self.session_id,
@@ -458,7 +478,7 @@ impl BridgeSession {
             "client_version": self.config.runner_version,
         });
 
-        debug!(session_id = %self.session_id, url = %url, "Registering bridge session");
+        debug!("Registering bridge session");
 
         let resp = self
             .http
@@ -475,7 +495,7 @@ impl BridgeSession {
         match status {
             200 | 201 => {
                 self.set_state(BridgeState::Connected);
-                info!(session_id = %self.session_id, "Bridge session registered");
+                info!("Bridge session registered");
                 Ok(())
             }
             401 | 403 => {
@@ -502,31 +522,20 @@ impl BridgeSession {
             self.config.server_url, self.session_id
         );
 
-        debug!(session_id = %self.session_id, "Deregistering bridge session");
+        debug!("Deregistering bridge session");
 
-        match self
-            .http
-            .delete(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-        {
+        match self.http.delete(&url).bearer_auth(token).send().await {
             Ok(r) if r.status().is_success() => {
-                info!(session_id = %self.session_id, "Bridge session deregistered");
+                info!("Bridge session deregistered");
             }
             Ok(r) => {
                 warn!(
-                    session_id = %self.session_id,
                     status = %r.status(),
                     "Bridge deregister returned non-success (ignored)"
                 );
             }
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "Bridge deregister HTTP error (ignored)"
-                );
+            Err(_) => {
+                warn!("Bridge deregister HTTP error (ignored)");
             }
         }
     }
@@ -621,20 +630,11 @@ impl BridgeSession {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            warn!(
-                session_id = %self.session_id,
-                status,
-                count = events.len(),
-                "Bridge event upload failed"
-            );
+            warn!(status, count = events.len(), "Bridge event upload failed");
             anyhow::bail!("Bridge upload: server returned {}", status);
         }
 
-        debug!(
-            session_id = %self.session_id,
-            count = events.len(),
-            "Bridge events uploaded"
-        );
+        debug!(count = events.len(), "Bridge events uploaded");
         Ok(())
     }
 
@@ -657,17 +657,16 @@ impl BridgeSession {
         mut event_rx: mpsc::Receiver<BridgeEvent>,
         cancel: CancellationToken,
     ) {
-        info!(session_id = %self.session_id, "Bridge poll loop started");
+        info!("Bridge poll loop started");
 
-        let base_interval = std::time::Duration::from_millis(
-            self.config.polling_interval_ms.max(500),
-        );
+        let base_interval =
+            std::time::Duration::from_millis(self.config.polling_interval_ms.max(500));
         let max_backoff = std::time::Duration::from_secs(60);
 
-        loop {
+        'poll: loop {
             // Respect cancellation at the top of every iteration.
             if cancel.is_cancelled() {
-                info!(session_id = %self.session_id, "Bridge poll loop cancelled");
+                info!("Bridge poll loop cancelled");
                 break;
             }
 
@@ -677,34 +676,52 @@ impl BridgeSession {
                 events.push(ev);
             }
             if !events.is_empty() {
-                if let Err(e) = self.upload_events(events).await {
-                    warn!(session_id = %self.session_id, error = %e, "Event upload error");
+                let upload_result = tokio::select! {
+                    result = self.upload_events(events) => Some(result),
+                    _ = cancel.cancelled() => None,
+                };
+                match upload_result {
+                    Some(Err(_)) => warn!("Event upload error"),
+                    Some(Ok(())) => {}
+                    None => {
+                        info!("Bridge poll loop cancelled during event upload");
+                        break;
+                    }
                 }
             }
 
             // --- Poll for incoming messages ---
-            match self.poll_messages().await {
+            let poll_result = tokio::select! {
+                result = self.poll_messages() => Some(result),
+                _ = cancel.cancelled() => None,
+            };
+            let Some(poll_result) = poll_result else {
+                info!("Bridge poll loop cancelled during long poll");
+                break;
+            };
+            match poll_result {
                 Ok(messages) => {
                     // Successful poll — reset reconnect counter.
                     self.reconnect_count = 0;
 
                     for msg in messages {
-                        if msg_tx.send(msg).await.is_err() {
-                            debug!(
-                                session_id = %self.session_id,
-                                "Incoming message channel closed; stopping poll loop"
-                            );
-                            return;
+                        match send_inbound_or_cancel(&msg_tx, msg, &cancel).await {
+                            InboundDelivery::Sent => {}
+                            InboundDelivery::Closed => {
+                                debug!("Incoming message channel closed; stopping poll loop");
+                                break 'poll;
+                            }
+                            InboundDelivery::Cancelled => {
+                                info!(
+                                    "Bridge poll loop cancelled while delivering inbound message"
+                                );
+                                break 'poll;
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        session_id = %self.session_id,
-                        error = %e,
-                        reconnect_count = self.reconnect_count,
-                        "Bridge poll error"
-                    );
+                Err(_) => {
+                    warn!(reconnect_count = self.reconnect_count, "Bridge poll error");
 
                     self.reconnect_count += 1;
 
@@ -712,7 +729,6 @@ impl BridgeSession {
                         && self.reconnect_count >= self.config.max_reconnect_attempts
                     {
                         error!(
-                            session_id = %self.session_id,
                             "Max bridge reconnect attempts ({}) reached; stopping",
                             self.config.max_reconnect_attempts
                         );
@@ -728,10 +744,7 @@ impl BridgeSession {
                     tokio::select! {
                         _ = tokio::time::sleep(backoff) => {}
                         _ = cancel.cancelled() => {
-                            info!(
-                                session_id = %self.session_id,
-                                "Bridge cancelled during backoff sleep"
-                            );
+                            info!("Bridge cancelled during backoff sleep");
                             break;
                         }
                     }
@@ -743,18 +756,20 @@ impl BridgeSession {
             tokio::select! {
                 _ = tokio::time::sleep(base_interval) => {}
                 _ = cancel.cancelled() => {
-                    info!(
-                        session_id = %self.session_id,
-                        "Bridge cancelled during idle sleep"
-                    );
+                    info!("Bridge cancelled during idle sleep");
                     break;
                 }
             }
         }
 
         // Best-effort deregister on shutdown.
-        self.deregister().await;
-        info!(session_id = %self.session_id, "Bridge poll loop terminated");
+        if tokio::time::timeout(std::time::Duration::from_secs(5), self.deregister())
+            .await
+            .is_err()
+        {
+            warn!("Bridge deregistration timed out");
+        }
+        info!("Bridge poll loop terminated");
     }
 }
 
@@ -837,7 +852,8 @@ async fn start_bridge_with_client(
     String,
 )> {
     if !config.is_active() {
-        anyhow::bail!("start_bridge: bridge is not active (enabled={}, token={})",
+        anyhow::bail!(
+            "start_bridge: bridge is not active (enabled={}, token={})",
             config.enabled,
             config.session_token.is_some()
         );
@@ -860,7 +876,7 @@ async fn start_bridge_with_client(
         session.run_poll_loop(msg_tx, event_rx, cancel).await;
     });
 
-    info!(session_id = %session_id, "Bridge started");
+    info!("Bridge started");
     Ok((msg_rx, event_tx, session_id))
 }
 
@@ -882,7 +898,11 @@ pub struct BridgeSessionInfo {
 
 impl std::fmt::Display for BridgeSessionInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BridgeSessionInfo {{ session_id: {}, session_url: {} }}", self.session_id, self.session_url)
+        write!(
+            f,
+            "BridgeSessionInfo {{ session_id: {}, session_url: {} }}",
+            self.session_id, self.session_url
+        )
     }
 }
 
@@ -964,11 +984,7 @@ pub async fn start_bridge_session(
 
     let register_url = format!("{}/api/bridge/sessions", server_url);
 
-    debug!(
-        session_id = %session_id,
-        url = %register_url,
-        "Registering new bridge session"
-    );
+    debug!("Registering new bridge session");
 
     let body = serde_json::json!({
         "session_id": session_id,
@@ -991,7 +1007,7 @@ pub async fn start_bridge_session(
 
     match status {
         200 | 201 => {
-            info!(session_id = %session_id, "Bridge session registered successfully");
+            info!("Bridge session registered successfully");
         }
         401 | 403 => {
             anyhow::bail!(
@@ -1005,17 +1021,14 @@ pub async fn start_bridge_session(
             // The /api/bridge/sessions endpoint may not exist in all deployments.
             // Fall through to synthetic session URL (best-effort mode).
             warn!(
-                session_id = %session_id,
                 "Bridge registration endpoint not found (HTTP 404) — \
                  using local session ID without server validation"
             );
         }
         _ => {
-            let body_text = resp.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Bridge session registration failed: server returned HTTP {}. {}",
-                status,
-                if body_text.is_empty() { String::new() } else { format!("Response: {}", &body_text[..body_text.len().min(200)]) }
+                "Bridge session registration failed: server returned HTTP {}",
+                status
             );
         }
     }
@@ -1082,7 +1095,10 @@ pub async fn poll_bridge_messages(
         let status = resp.status().as_u16();
         match status {
             200 => {
-                let text = resp.text().await.context("poll_bridge_messages: reading body")?;
+                let text = resp
+                    .text()
+                    .await
+                    .context("poll_bridge_messages: reading body")?;
                 if text.trim().is_empty() || text.trim() == "[]" {
                     return Ok(vec![]);
                 }
@@ -1094,10 +1110,16 @@ pub async fn poll_bridge_messages(
             429 => {
                 attempt += 1;
                 if attempt > max_retries {
-                    anyhow::bail!("poll_bridge_messages: rate-limited (HTTP 429) after {} retries", max_retries);
+                    anyhow::bail!(
+                        "poll_bridge_messages: rate-limited (HTTP 429) after {} retries",
+                        max_retries
+                    );
                 }
                 let backoff = std::time::Duration::from_millis(1_000 * 2u64.pow(attempt - 1));
-                warn!(attempt, "Bridge poll rate-limited; backing off {:?}", backoff);
+                warn!(
+                    attempt,
+                    "Bridge poll rate-limited; backing off {:?}", backoff
+                );
                 tokio::time::sleep(backoff).await;
                 continue;
             }
@@ -1145,12 +1167,7 @@ pub async fn post_bridge_response(
         "done": done,
     });
 
-    debug!(
-        session_id = %info.session_id,
-        msg_id = %msg_id,
-        done = done,
-        "Posting bridge response"
-    );
+    debug!(done, "Posting bridge response");
 
     let resp = http
         .put(&url)
@@ -1163,14 +1180,10 @@ pub async fn post_bridge_response(
 
     let status = resp.status().as_u16();
     if resp.status().is_success() {
-        debug!(session_id = %info.session_id, msg_id = %msg_id, "Bridge response posted");
+        debug!("Bridge response posted");
         Ok(())
     } else {
-        anyhow::bail!(
-            "post_bridge_response: server returned HTTP {} for msg {}",
-            status,
-            msg_id
-        )
+        anyhow::bail!("post_bridge_response: server returned HTTP {}", status)
     }
 }
 
@@ -1182,10 +1195,7 @@ pub async fn post_bridge_response(
 ///
 /// Errors are returned to the caller, who should treat them as transient and
 /// ignore them so the query loop is never blocked.
-pub async fn post_bridge_event(
-    info: &BridgeSessionInfo,
-    payload: String,
-) -> anyhow::Result<()> {
+pub async fn post_bridge_event(info: &BridgeSessionInfo, payload: String) -> anyhow::Result<()> {
     let server_url = std::env::var("CLAURST_BRIDGE_URL")
         .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         .unwrap_or_else(|_| "https://claude.ai".to_string());
@@ -1209,10 +1219,7 @@ pub async fn post_bridge_event(
         "ts": chrono::Utc::now().timestamp_millis(),
     });
 
-    debug!(
-        session_id = %info.session_id,
-        "Posting bridge event"
-    );
+    debug!("Posting bridge event");
 
     let resp = http
         .post(&url)
@@ -1225,13 +1232,10 @@ pub async fn post_bridge_event(
 
     let status = resp.status().as_u16();
     if resp.status().is_success() {
-        debug!(session_id = %info.session_id, "Bridge event posted");
+        debug!("Bridge event posted");
         Ok(())
     } else {
-        anyhow::bail!(
-            "post_bridge_event: server returned HTTP {}",
-            status
-        )
+        anyhow::bail!("post_bridge_event: server returned HTTP {}", status)
     }
 }
 
@@ -1361,34 +1365,30 @@ pub async fn run_bridge_loop(
     loop {
         match session.register().await {
             Ok(()) => break,
-            Err(e) => {
+            Err(_) => {
                 reg_attempts += 1;
-                warn!(
-                    attempt = reg_attempts,
-                    error = %e,
-                    "Bridge registration failed"
-                );
+                warn!(attempt = reg_attempts, "Bridge registration failed");
 
                 // Auth errors are fatal — don't retry.
-                let msg = e.to_string();
-                if msg.contains("auth error") || msg.contains("401") || msg.contains("403") {
+                let msg = session.current_state();
+                if matches!(msg, BridgeState::Error(ref value) if value.starts_with("Auth error:"))
+                {
                     let _ = tui_tx
-                        .send(TuiBridgeEvent::Error(format!(
-                            "Bridge auth failed: {}",
-                            e
-                        )))
+                        .send(TuiBridgeEvent::Error(
+                            "Bridge authentication failed".to_string(),
+                        ))
                         .await;
-                    return Err(e);
+                    anyhow::bail!("Bridge authentication failed");
                 }
 
                 if reg_attempts >= config.max_reconnect_attempts.max(1) {
                     let _ = tui_tx
                         .send(TuiBridgeEvent::Error(format!(
-                            "Bridge registration failed after {} attempts: {}",
-                            reg_attempts, e
+                            "Bridge registration failed after {} attempts",
+                            reg_attempts
                         )))
                         .await;
-                    return Err(e);
+                    anyhow::bail!("Bridge registration failed after {} attempts", reg_attempts);
                 }
 
                 let backoff = (base_backoff * 2u32.pow(reg_attempts.min(5))).min(max_backoff);
@@ -1431,8 +1431,10 @@ pub async fn run_bridge_loop(
 
     // Spawn the low-level poll loop in its own task.
     let poll_cancel = cancel.clone();
-    tokio::spawn(async move {
-        session.run_poll_loop(msg_tx, bridge_ev_rx, poll_cancel).await;
+    let mut poll_handle = tokio::spawn(async move {
+        session
+            .run_poll_loop(msg_tx, bridge_ev_rx, poll_cancel)
+            .await;
     });
 
     // Message ID counter for outbound text deltas.
@@ -1575,6 +1577,16 @@ pub async fn run_bridge_loop(
         }
     }
 
+    cancel.cancel();
+    if tokio::time::timeout(std::time::Duration::from_secs(7), &mut poll_handle)
+        .await
+        .is_err()
+    {
+        warn!("Bridge poll worker shutdown timed out");
+        poll_handle.abort();
+        let _ = poll_handle.await;
+    }
+
     Ok(())
 }
 
@@ -1609,6 +1621,157 @@ pub use reqwest;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc as std_mpsc, Arc};
+    use std::thread;
+
+    fn read_request_line(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn respond_empty(stream: &mut TcpStream, status: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_inbound_channel_stops_delivery_on_cancellation() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(BridgeMessage::Ping).await.unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        assert_eq!(
+            send_inbound_or_cancel(&tx, BridgeMessage::Ping, &cancel).await,
+            InboundDelivery::Cancelled
+        );
+        assert!(matches!(rx.try_recv(), Ok(BridgeMessage::Ping)));
+    }
+
+    #[tokio::test]
+    async fn closed_inbound_channel_returns_for_deregistration() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let cancel = CancellationToken::new();
+
+        assert_eq!(
+            send_inbound_or_cancel(&tx, BridgeMessage::Ping, &cancel).await,
+            InboundDelivery::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_loop_cancellation_interrupts_long_poll_and_deregisters() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (polled_tx, polled_rx) = std_mpsc::channel();
+        let (deregistered_tx, deregistered_rx) = std_mpsc::channel();
+        let release_poll = Arc::new(AtomicBool::new(false));
+        let server_release = Arc::clone(&release_poll);
+        let server = thread::spawn(move || {
+            let mut poll_handlers = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request_line = read_request_line(&mut stream);
+                if request_line.starts_with("POST /api/claude_code/sessions ") {
+                    respond_empty(&mut stream, "201 Created");
+                } else if request_line.contains("/poll ") {
+                    let _ = polled_tx.send(());
+                    let handler_release = Arc::clone(&server_release);
+                    poll_handlers.push(thread::spawn(move || {
+                        while !handler_release.load(Ordering::Acquire) {
+                            thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    }));
+                } else if request_line.starts_with("DELETE /api/claude_code/sessions/") {
+                    respond_empty(&mut stream, "204 No Content");
+                    server_release.store(true, Ordering::Release);
+                    let _ = deregistered_tx.send(());
+                    break;
+                } else {
+                    respond_empty(&mut stream, "404 Not Found");
+                }
+            }
+            server_release.store(true, Ordering::Release);
+            for handler in poll_handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let config = BridgeConfig {
+            enabled: true,
+            server_url: format!("http://{address}"),
+            session_token: Some("privacy-test-token".to_string()),
+            polling_interval_ms: 500,
+            max_reconnect_attempts: 2,
+            ..BridgeConfig::default()
+        };
+        let mut session = BridgeSession::new(config);
+        session.register().await.unwrap();
+        let (message_tx, _message_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let cancel_worker = cancel.clone();
+        let worker = tokio::spawn(async move {
+            session
+                .run_poll_loop(message_tx, event_rx, cancel_worker)
+                .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if polled_rx.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("long poll should start");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+            .await
+            .expect("bridge worker should stop after cancellation")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if deregistered_rx.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge should deregister during shutdown");
+        server.join().unwrap();
+    }
 
     #[test]
     fn test_device_fingerprint_is_non_empty() {
@@ -1647,7 +1810,10 @@ mod tests {
 
     #[test]
     fn test_bridge_config_with_token_still_needs_enabled() {
-        let mut cfg = BridgeConfig { session_token: Some("tok".into()), ..Default::default() };
+        let mut cfg = BridgeConfig {
+            session_token: Some("tok".into()),
+            ..Default::default()
+        };
         assert!(!cfg.is_active(), "needs enabled=true too");
         cfg.enabled = true;
         assert!(cfg.is_active());
@@ -1703,7 +1869,9 @@ mod tests {
 
     #[test]
     fn test_bridge_event_pong_serde() {
-        let ev = BridgeEvent::Pong { server_time: Some(1_700_000_000) };
+        let ev = BridgeEvent::Pong {
+            server_time: Some(1_700_000_000),
+        };
         let j = serde_json::to_string(&ev).unwrap();
         assert!(j.contains(r#""type":"pong""#));
     }

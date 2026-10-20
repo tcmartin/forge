@@ -183,7 +183,6 @@ impl SettingsSyncManager {
                     warn!(
                         attempt,
                         max = DEFAULT_MAX_RETRIES,
-                        error = %e,
                         "Settings sync download failed, will retry"
                     );
                     last_err = e;
@@ -200,24 +199,19 @@ impl SettingsSyncManager {
     ///
     /// Writes settings and memory files to the appropriate local paths,
     /// enforcing the 500 KB per-file size limit.
-    pub async fn apply_to_local(
-        &self,
-        data: &SyncedData,
-        project_id: Option<&str>,
-    ) -> ApplyResult {
+    pub async fn apply_to_local(&self, data: &SyncedData, project_id: Option<&str>) -> ApplyResult {
         let mut result = ApplyResult::default();
 
         // Global user settings
         if let Some(ref settings_json) = data.settings {
             let path = claude_config_dir().join("settings.json");
-            let content = serde_json::to_string_pretty(settings_json)
-                .unwrap_or_default();
+            let content = serde_json::to_string_pretty(settings_json).unwrap_or_default();
             match write_file_for_sync(&path, &content).await {
                 Ok(()) => {
                     result.settings_written = true;
                     result.applied_count += 1;
                 }
-                Err(e) => warn!("Settings sync: failed to write user settings: {}", e),
+                Err(_) => warn!("Settings sync: failed to write user settings"),
             }
         }
 
@@ -229,7 +223,7 @@ impl SettingsSyncManager {
                     result.memory_written = true;
                     result.applied_count += 1;
                 }
-                Err(e) => warn!("Settings sync: failed to write user memory: {}", e),
+                Err(_) => warn!("Settings sync: failed to write user memory"),
             }
         }
 
@@ -246,8 +240,8 @@ impl SettingsSyncManager {
                         result.settings_written = true;
                         result.applied_count += 1;
                     }
-                    Err(e) => {
-                        warn!("Settings sync: failed to write project settings: {}", e)
+                    Err(_) => {
+                        warn!("Settings sync: failed to write project settings")
                     }
                 }
             }
@@ -262,8 +256,8 @@ impl SettingsSyncManager {
                         result.memory_written = true;
                         result.applied_count += 1;
                     }
-                    Err(e) => {
-                        warn!("Settings sync: failed to write project memory: {}", e)
+                    Err(_) => {
+                        warn!("Settings sync: failed to write project memory")
                     }
                 }
             }
@@ -297,7 +291,10 @@ impl SettingsSyncManager {
             return Ok(());
         }
 
-        debug!(count = changed.len(), "Settings sync: uploading changed entries");
+        debug!(
+            count = changed.len(),
+            "Settings sync: uploading changed entries"
+        );
         self.put_entries(changed).await
     }
 
@@ -330,14 +327,8 @@ impl SettingsSyncManager {
     ///   1. Read local settings and AGENTS.md files
     ///   2. Fetch current remote state for diffing
     ///   3. Upload only changed entries
-    pub fn upload_in_background(token: String, base_url: String) {
-        tokio::spawn(async move {
-            let mgr = SettingsSyncManager::new(token, base_url);
-            let entries = collect_local_entries(None).await;
-            if let Err(e) = mgr.upload(entries).await {
-                warn!("Settings sync: background upload failed: {}", e);
-            }
-        });
+    pub fn upload_in_background(_token: String, _base_url: String) {
+        debug!("Settings sync background upload disabled in OSS build");
     }
 }
 
@@ -417,7 +408,7 @@ pub async fn collect_local_entries(project_id: Option<&str>) -> HashMap<String, 
 async fn try_read_for_sync(path: &PathBuf) -> Option<String> {
     let meta = tokio::fs::metadata(path).await.ok()?;
     if meta.len() > MAX_FILE_SIZE_BYTES {
-        debug!(path = %path.display(), "Settings sync: file exceeds 500 KB limit, skipping");
+        debug!("Settings sync: file exceeds 500 KB limit, skipping");
         return None;
     }
     let content = tokio::fs::read_to_string(path).await.ok()?;
@@ -479,10 +470,7 @@ mod tests {
             SYNC_KEY_USER_SETTINGS.to_string(),
             r#"{"model":"claude-3"}"#.to_string(),
         );
-        entries.insert(
-            SYNC_KEY_USER_MEMORY.to_string(),
-            "# My notes".to_string(),
-        );
+        entries.insert(SYNC_KEY_USER_MEMORY.to_string(), "# My notes".to_string());
 
         let data = entries_to_synced_data(entries);
         assert!(data.settings.is_some());
@@ -496,10 +484,7 @@ mod tests {
     #[test]
     fn test_entries_to_synced_data_invalid_json_settings() {
         let mut entries = HashMap::new();
-        entries.insert(
-            SYNC_KEY_USER_SETTINGS.to_string(),
-            "not-json".to_string(),
-        );
+        entries.insert(SYNC_KEY_USER_SETTINGS.to_string(), "not-json".to_string());
         let data = entries_to_synced_data(entries);
         // Malformed settings JSON → field is None (graceful degradation)
         assert!(data.settings.is_none());

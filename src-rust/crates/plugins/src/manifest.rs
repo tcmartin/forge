@@ -303,8 +303,7 @@ pub struct PluginManifest {
     // ---- Capability grants ----
     /// The set of capability categories this plugin is allowed to use.
     ///
-    /// When `None`, the plugin was written before capability enforcement was
-    /// introduced — all categories are allowed for backwards compatibility.
+    /// When `None`, no capability categories are granted.
     ///
     /// When `Some([])`, the plugin explicitly declares no capabilities, so any
     /// tool action that requires a capability will be blocked.
@@ -377,10 +376,7 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
                     entry
                 })
                 .collect();
-            obj.insert(
-                "mcp_servers".to_string(),
-                serde_json::Value::Array(arr),
-            );
+            obj.insert("mcp_servers".to_string(), serde_json::Value::Array(arr));
         } else if mcp.is_array() {
             obj.insert("mcp_servers".to_string(), mcp);
         }
@@ -401,10 +397,7 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
                     entry
                 })
                 .collect();
-            obj.insert(
-                "lsp_servers".to_string(),
-                serde_json::Value::Array(arr),
-            );
+            obj.insert("lsp_servers".to_string(), serde_json::Value::Array(arr));
         } else if lsp.is_array() {
             obj.insert("lsp_servers".to_string(), lsp);
         }

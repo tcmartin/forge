@@ -1,9 +1,9 @@
 //! Transcript operations: add/replace/push, notifications, scroll.
 
-use claurst_core::types::{Message, Role};
-use crate::notifications::NotificationKind;
-use super::App;
 use super::types::{SystemAnnotation, SystemMessageStyle};
+use super::App;
+use crate::notifications::NotificationKind;
+use claurst_core::types::{Message, Role};
 
 impl App {
     /// Add a message directly (e.g. from a non-streaming source).
@@ -40,7 +40,12 @@ impl App {
     /// It will appear after the current last message.
     /// Push a notification and, for Error-kind notifications, reset the error
     /// modal scroll offset so a newly arrived error is always shown from the top.
-    pub fn push_notification(&mut self, kind: NotificationKind, msg: String, duration_secs: Option<u64>) {
+    pub fn push_notification(
+        &mut self,
+        kind: NotificationKind,
+        msg: String,
+        duration_secs: Option<u64>,
+    ) {
         if kind == NotificationKind::Error {
             self.error_modal_scroll_offset = 0;
         }
@@ -63,8 +68,7 @@ impl App {
             // Auto-scroll: keep offset at 0 so render shows the bottom.
             self.scroll_offset = 0;
         } else {
-            self.new_messages_while_scrolled =
-                self.new_messages_while_scrolled.saturating_add(1);
+            self.new_messages_while_scrolled = self.new_messages_while_scrolled.saturating_add(1);
         }
     }
 
@@ -76,8 +80,7 @@ impl App {
     /// Check current token usage and push token warning notifications as
     /// appropriate.  Call this after updating `token_count`.
     pub fn check_token_warnings(&mut self) {
-        let window =
-            claurst_query::context_window_for_model(&self.model_name) as u32;
+        let window = claurst_query::context_window_for_model(&self.model_name) as u32;
         if window == 0 {
             return;
         }
@@ -88,21 +91,22 @@ impl App {
             self.token_warning_threshold_shown = 100;
             self.push_notification(
                 NotificationKind::Error,
-                "Context window full. Running auto-compact\u{2026}".to_string(),
+                "Long conversation. Run /compact to summarize earlier messages.".to_string(),
                 None,
             );
         } else if pct >= 95 && self.token_warning_threshold_shown < 95 {
             self.token_warning_threshold_shown = 95;
             self.push_notification(
                 NotificationKind::Error,
-                "Context window 95% full! Run /compact now.".to_string(),
+                "Conversation is near the estimated context limit. Consider /compact.".to_string(),
                 None, // persistent until dismissed
             );
         } else if pct >= 80 && self.token_warning_threshold_shown < 80 {
             self.token_warning_threshold_shown = 80;
             self.push_notification(
                 NotificationKind::Warning,
-                "Context window 80% full. Consider /compact.".to_string(),
+                "Conversation is approaching the estimated context limit. Consider /compact."
+                    .to_string(),
                 Some(30),
             );
         }
@@ -144,7 +148,8 @@ impl App {
     /// wheel) stay at the base 3-line step.
     pub(super) fn scroll_step(&mut self) -> usize {
         let now = std::time::Instant::now();
-        let elapsed_ms = self.scroll_last_time
+        let elapsed_ms = self
+            .scroll_last_time
             .map(|t| now.duration_since(t).as_millis())
             .unwrap_or(u128::MAX);
         self.scroll_last_time = Some(now);
@@ -157,5 +162,4 @@ impl App {
         }
         self.scroll_accel.round() as usize
     }
-
 }

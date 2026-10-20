@@ -1,10 +1,12 @@
 // FileEdit tool: exact string replacement with old/new strings (like sed but
 // deterministic).  Mirrors the TypeScript Edit tool behaviour.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::file_write::{commit_file_change, mutation_error};
+use crate::mutation::MutationStatus;
+use crate::{ChildWriterCapability, PermissionLevel, Tool, ToolContext, ToolEffect, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tracing::debug;
 
 pub struct FileEditTool;
@@ -21,7 +23,9 @@ struct FileEditInput {
 #[async_trait]
 impl Tool for FileEditTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_FILE_EDIT
@@ -36,6 +40,14 @@ impl Tool for FileEditTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Write
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutation
+    }
+
+    fn child_writer_capability(&self) -> ChildWriterCapability {
+        ChildWriterCapability::ScopedFilesystem
     }
 
     fn input_schema(&self) -> Value {
@@ -66,16 +78,24 @@ impl Tool for FileEditTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: FileEditInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return mutation_error(MutationStatus::Failed, format!("Invalid input: {}", e))
+            }
         };
 
         // Validate old != new
         if params.old_string == params.new_string {
-            return ToolResult::error("old_string and new_string must be different".to_string());
+            return mutation_error(
+                MutationStatus::Failed,
+                "old_string and new_string must be different".to_string(),
+            );
         }
 
         if params.old_string.is_empty() {
-            return ToolResult::error("old_string must not be empty".to_string());
+            return mutation_error(
+                MutationStatus::Failed,
+                "old_string must not be empty".to_string(),
+            );
         }
 
         let path = ctx.resolve_path(&params.file_path);
@@ -88,14 +108,17 @@ impl Tool for FileEditTool {
             path.clone(),
             false,
         ) {
-            return ToolResult::error(e.to_string());
+            return mutation_error(MutationStatus::Failed, e.to_string());
         }
 
         // Read current content
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
+                return mutation_error(
+                    MutationStatus::Failed,
+                    format!("Failed to read file {}: {}", path.display(), e),
+                );
             }
         };
 
@@ -112,21 +135,27 @@ impl Tool for FileEditTool {
         let count = normalized.matches(&old_string).count();
 
         if count == 0 {
-            return ToolResult::error(format!(
-                "old_string not found in {}. Make sure the string matches exactly, \
+            return mutation_error(
+                MutationStatus::Failed,
+                format!(
+                    "old_string not found in {}. Make sure the string matches exactly, \
                  including whitespace and indentation.",
-                path.display()
-            ));
+                    path.display()
+                ),
+            );
         }
 
         if count > 1 && !params.replace_all {
-            return ToolResult::error(format!(
-                "old_string appears {} times in {}. Either provide a larger string \
+            return mutation_error(
+                MutationStatus::Failed,
+                format!(
+                    "old_string appears {} times in {}. Either provide a larger string \
                  with more surrounding context to make it unique, or set replace_all \
                  to true to replace every occurrence.",
-                count,
-                path.display()
-            ));
+                    count,
+                    path.display()
+                ),
+            );
         }
 
         // Perform the replacement on the ORIGINAL bytes, preserving every
@@ -140,34 +169,22 @@ impl Tool for FileEditTool {
             params.replace_all,
         );
 
-        // Write back
-        if let Err(e) = crate::write_atomic(&path, new_content.as_bytes()).await {
-            return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
-        }
-
-        ctx.record_file_change(
-            path.clone(),
+        let mut result = commit_file_change(
+            &path,
             content.as_bytes(),
             new_content.as_bytes(),
+            true,
             self.name(),
-        );
-
-        // Run any configured formatter for this file type.
-        crate::try_format_file(&path.to_string_lossy(), ctx).await;
-
-        // Build a diff snippet for the response
-        let replacements = if params.replace_all { count } else { 1 };
-        let msg = format!(
-            "Successfully edited {} ({} replacement{}).",
-            path.display(),
-            replacements,
-            if replacements != 1 { "s" } else { "" }
-        );
-
-        ToolResult::success(msg).with_metadata(json!({
-            "file_path": path.display().to_string(),
-            "replacements": replacements,
-        }))
+            ctx,
+        )
+        .await;
+        if let Some(Value::Object(metadata)) = &mut result.metadata {
+            metadata.insert(
+                "replacements".into(),
+                json!(if params.replace_all { count } else { 1 }),
+            );
+        }
+        result
     }
 }
 
@@ -175,6 +192,27 @@ impl Tool for FileEditTool {
 mod tests {
     use super::*;
     use crate::test_support::allow_all_context;
+
+    #[tokio::test]
+    async fn pre_commit_cancellation_keeps_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled.txt");
+        std::fs::write(&path, "old text").unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        ctx.cancel_token.cancel();
+        let result = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path, "old_string": "old", "new_string": "new"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old text");
+        assert!(ctx.file_history.lock().is_empty());
+        assert_eq!(result.metadata.as_ref().unwrap()["mutation"], "cancelled");
+    }
 
     /// #225: editing a CRLF file must keep CRLF; only the edited line changes.
     #[tokio::test]

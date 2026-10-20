@@ -1,15 +1,11 @@
 {
-  "name": "claurst-vscode",
-  "displayName": "Claurst",
-  "description": "Chat with Claurst, an AI coding agent, without leaving VS Code.",
+  "name": "forge-vscode-local",
+  "displayName": "Forge",
+  "description": "Use the local Forge coding agent from VS Code.",
   "version": "0.1.0",
-  "publisher": "claurst",
-  "license": "GPL-3.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Kuberwastaken/claurst.git",
-    "directory": "editors/vscode"
-  },
+  "publisher": "forge-local",
+  "private": true,
+  "license": "GPL-3.0-only",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -18,39 +14,39 @@
     "Chat"
   ],
   "activationEvents": [
-    "onCommand:claurst.openChat"
+    "onCommand:forge.openChat"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "claurst.openChat",
-        "title": "Claurst: Open Chat",
+        "command": "forge.openChat",
+        "title": "Forge: Open Chat",
         "icon": "$(comment-discussion)"
       },
       {
-        "command": "claurst.newSession",
-        "title": "Claurst: New Session"
+        "command": "forge.newSession",
+        "title": "Forge: New Session"
       },
       {
-        "command": "claurst.stopSession",
-        "title": "Claurst: Stop Current Turn"
+        "command": "forge.stopSession",
+        "title": "Forge: Stop Current Turn"
       }
     ],
     "menus": {
       "commandPalette": [
-        { "command": "claurst.openChat" },
-        { "command": "claurst.newSession" },
-        { "command": "claurst.stopSession" }
+        { "command": "forge.openChat" },
+        { "command": "forge.newSession" },
+        { "command": "forge.stopSession" }
       ]
     },
     "configuration": {
-      "title": "Claurst",
+      "title": "Forge",
       "properties": {
-        "claurst.executablePath": {
+        "forge.executablePath": {
           "type": "string",
-          "default": "claurst",
-          "description": "Path to the claurst executable. Defaults to resolving 'claurst' from PATH."
+          "default": "forge",
+          "description": "Path to the Forge executable. Defaults to resolving 'forge' from PATH."
         }
       }
     }

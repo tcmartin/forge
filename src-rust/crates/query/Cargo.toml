@@ -3,6 +3,10 @@ name = "claurst-query"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+a016-openai-loopback = ["claurst-api/a016-openai-loopback"]
+
 [dependencies]
 claurst-core = { workspace = true }
 claurst-api = { workspace = true }

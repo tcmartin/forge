@@ -8,6 +8,7 @@
 // Deployment == model name in Azure.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -18,12 +19,14 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
 };
+use crate::provider_wire::prepare_provider_json;
 use crate::providers::openai::OpenAiProvider;
 
 use super::request_options::merge_openai_compatible_options;
@@ -34,14 +37,16 @@ use super::request_options::merge_openai_compatible_options;
 
 pub struct AzureProvider {
     id: ProviderId,
-    resource_name: String,
+    base_url: String,
     api_key: String,
     api_version: String,
     http_client: reqwest::Client,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl AzureProvider {
     pub fn new(resource_name: String, api_key: String) -> Self {
+        let base_url = format!("https://{resource_name}.openai.azure.com");
         let http_client = reqwest::Client::builder()
             .timeout(crate::request_timeout())
             .build()
@@ -49,11 +54,28 @@ impl AzureProvider {
 
         Self {
             id: ProviderId::new(ProviderId::AZURE),
-            resource_name,
+            base_url,
             api_key,
             api_version: "2024-08-01-preview".to_string(),
             http_client,
+            inference_admission: InferenceAdmission::process(),
         }
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     pub fn with_api_version(mut self, version: String) -> Self {
@@ -61,18 +83,24 @@ impl AzureProvider {
         self
     }
 
+    /// Override the Azure OpenAI-compatible API root.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
     pub fn from_env() -> Option<Self> {
         let key = std::env::var("AZURE_API_KEY").ok()?;
         let resource = std::env::var("AZURE_RESOURCE_NAME").ok()?;
-        let version = std::env::var("AZURE_API_VERSION")
-            .unwrap_or_else(|_| "2024-08-01-preview".to_string());
+        let version =
+            std::env::var("AZURE_API_VERSION").unwrap_or_else(|_| "2024-08-01-preview".to_string());
         Some(Self::new(resource, key).with_api_version(version))
     }
 
     fn endpoint_url(&self, deployment: &str) -> String {
         format!(
-            "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
-            self.resource_name, deployment, self.api_version
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            self.base_url, deployment, self.api_version
         )
     }
 
@@ -112,13 +140,16 @@ impl AzureProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = self.endpoint_url(&request.model);
+        let prepared = prepare_provider_json("azure", &url, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let _admission = self.acquire_inference().await?;
         let resp = self
             .http_client
             .post(&url)
             .header("api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -153,7 +184,7 @@ impl AzureProvider {
     async fn do_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, AdmissionLease), ProviderError> {
         let messages = OpenAiProvider::to_openai_messages_pub(
             &request.messages,
             request.system_prompt.as_ref(),
@@ -183,14 +214,17 @@ impl AzureProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = self.endpoint_url(&request.model);
+        let prepared = prepare_provider_json("azure", &url, true, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
 
+        let admission = self.acquire_inference().await?;
         let resp = self
             .http_client
             .post(&url)
             .header("api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(&body)
+            .body(prepared.into_body())
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -206,7 +240,7 @@ impl AzureProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        Ok(resp)
+        Ok((resp, admission))
     }
 }
 
@@ -228,6 +262,7 @@ impl LlmProvider for AzureProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         self.send_non_streaming(&request).await
     }
 
@@ -236,7 +271,8 @@ impl LlmProvider for AzureProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.do_streaming(&request).await?;
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let (resp, admission) = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
         // TODO(#228): Azure OpenAI speaks the OpenAI-Chat wire format but does no
@@ -294,7 +330,7 @@ impl LlmProvider for AzureProvider {
                     let chunk_json: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
-                            debug!("Failed to parse Azure SSE chunk: {}: {}", e, data);
+                            debug!(error_kind = ?e.classify(), "Azure SSE: invalid JSON event");
                             continue;
                         }
                     };
@@ -432,15 +468,15 @@ impl LlmProvider for AzureProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         // Azure doesn't have a simple /v1/models endpoint without a deployment.
         // We do a minimal OPTIONS or HEAD to the base resource URL.
         let url = format!(
-            "https://{}.openai.azure.com/openai/models?api-version={}",
-            self.resource_name, self.api_version
+            "{}/openai/models?api-version={}",
+            self.base_url, self.api_version
         );
         let resp = self
             .http_client
@@ -470,7 +506,7 @@ impl LlmProvider for AzureProvider {
             streaming: true,
             tool_calling: true,
             thinking: false,
-            image_input: true,
+            image_input: false,
             pdf_input: false,
             audio_input: false,
             video_input: false,

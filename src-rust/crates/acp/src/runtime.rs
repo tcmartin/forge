@@ -27,6 +27,7 @@ pub struct AgentRuntime {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub working_dir: PathBuf,
+    session_owned_mcp: bool,
 }
 
 impl AgentRuntime {
@@ -35,7 +36,8 @@ impl AgentRuntime {
     /// defaults (non-interactive, permission decisions routed back to the
     /// connected client).
     pub async fn build(working_dir: PathBuf) -> anyhow::Result<Self> {
-        let settings = Settings::load_sync().unwrap_or_default();
+        let settings = Settings::load_sync()
+            .map_err(|_| anyhow::anyhow!("ACP settings could not be loaded"))?;
         let mut config = settings.effective_config();
         // Plan mode requires interactive UI — fall back to Default so the
         // ACP permission bridge can route decisions to the client.
@@ -73,16 +75,12 @@ impl AgentRuntime {
 
         let cost_tracker = CostTracker::new();
 
-        // MCP servers from settings — connect upfront so their tools are
-        // visible to every session. Per-session MCP servers supplied via
-        // `session/new` params are additive on top of this (v1: ignored,
-        // tracked in plan/migration-todo).
+        // MCP servers from settings connect once for all sessions. Validated
+        // client-supplied stdio rosters are added by each session runtime.
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
-        // Build tools: built-ins + AgentTool. MCP tool wrappers are NOT
-        // attached here — the wrapper type lives in the CLI crate today and
-        // adding it would create a circular dep. Built-in tools (Bash, Read,
-        // Edit, Glob, Grep, WebFetch, …) cover the common ACP-editor flows.
+        // Retain native handles once. The shared source adds current MCP
+        // descriptors and binds each prompt to its session workspace.
         let mut tools: Vec<Box<dyn Tool>> = claurst_tools::all_tools();
         tools.push(Box::new(claurst_query::AgentTool));
         let tools = Arc::new(tools);
@@ -90,6 +88,13 @@ impl AgentRuntime {
         let mut query_config = QueryConfig::from_config(&config);
         query_config.working_directory = Some(working_dir.display().to_string());
         query_config.provider_registry = Some(provider_registry.clone());
+        query_config.inventory_profile = claurst_query::ToolInventoryProfile::Acp;
+        query_config.inventory_source =
+            Some(claurst_query::host_inventory::HostInventorySource::new(
+                Arc::clone(&tools),
+                &config,
+                None,
+            )?);
 
         Ok(Self {
             config,
@@ -102,7 +107,53 @@ impl AgentRuntime {
             mcp_manager,
             permission_manager,
             working_dir,
+            session_owned_mcp: false,
         })
+    }
+
+    /// Reuse API/native handles, but own a session-scoped inventory cache so
+    /// its MCP wrappers cannot be retained by another session's cache.
+    pub async fn for_session(
+        &self,
+        working_dir: PathBuf,
+        servers: &[claurst_core::config::McpServerConfig],
+        admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let mut scoped = self.clone();
+        scoped.session_owned_mcp = false;
+        scoped.config.project_dir = Some(working_dir.clone());
+        scoped.working_dir = working_dir.clone();
+        scoped.query_config.working_directory = Some(working_dir.display().to_string());
+        scoped.query_config.inventory_source =
+            Some(claurst_query::host_inventory::HostInventorySource::new(
+                Arc::clone(&self.tools),
+                &scoped.config,
+                None,
+            )?);
+        if !servers.is_empty() {
+            let admission =
+                admission.ok_or_else(|| anyhow::anyhow!("Missing session MCP admission"))?;
+            scoped.mcp_manager = Some(
+                claurst_mcp::McpManager::connect_session_stdio(
+                    self.mcp_manager.clone(),
+                    servers,
+                    &working_dir,
+                    admission,
+                )
+                .await?,
+            );
+            scoped.session_owned_mcp = true;
+        }
+        Ok(Arc::new(scoped))
+    }
+
+    pub async fn shutdown_session_mcp(&self) -> anyhow::Result<()> {
+        if self.session_owned_mcp {
+            if let Some(manager) = self.mcp_manager.as_ref() {
+                manager.shutdown_owned().await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -129,9 +180,8 @@ async fn build_mcp_manager(
         &store,
     );
     if !decision.pending.is_empty() {
-        let names: Vec<&str> = decision.pending.iter().map(|s| s.name.as_str()).collect();
         tracing::warn!(
-            servers = ?names,
+            count = decision.pending.len(),
             "Skipping untrusted project-defined MCP server(s) in ACP runtime"
         );
     }

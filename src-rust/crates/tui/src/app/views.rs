@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use super::App;
 use crate::agents_view::{AgentInfo, AgentStatus};
 use crate::export_dialog::ExportFormat;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewStatus};
-use super::App;
 
 impl App {
     pub(super) fn close_secondary_views(&mut self) {
@@ -370,10 +370,8 @@ impl App {
                 self.pending_mcp_reconnect = true;
             }
             McpApprovalChoice::Deny => {
-                self.status_message = Some(format!(
-                    "Skipped project MCP server '{}'.",
-                    server.name
-                ));
+                self.status_message =
+                    Some(format!("Skipped project MCP server '{}'.", server.name));
             }
         }
     }
@@ -401,5 +399,4 @@ impl App {
         settings.skip_dangerous_mode_permission_prompt = true;
         settings.save_sync()
     }
-
 }

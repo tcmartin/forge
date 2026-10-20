@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Claurst installer for Linux, macOS, and Windows (Git Bash / MSYS / Cygwin).
+# Forge installer for Linux, macOS, and Windows (Git Bash / MSYS / Cygwin).
 #
-# Usage (one-liner):
-#   curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
-#
-# Or download and run locally:
-#   curl -fsSL -O https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh
-#   chmod +x install.sh
-#   ./install.sh
+# Verified local usage:
+#   ./install.sh --binary /absolute/path/to/forge --no-modify-path
 
 set -euo pipefail
 
-APP=claurst
-REPO=Kuberwastaken/claurst
+APP=forge
+REPO=${FORGE_RELEASE_REPO:-}
 
 # ANSI colours
 MUTED='\033[0;2m'
@@ -23,7 +18,7 @@ NC='\033[0m'
 
 usage() {
     cat <<EOF
-Claurst installer
+Forge installer
 
 Usage: install.sh [options]
 
@@ -31,16 +26,16 @@ Options:
     -h, --help              Display this help message
     -v, --version <version> Install a specific version (e.g., 0.1.0 or v0.1.0)
     -b, --binary <path>     Install from a local binary instead of downloading
+        --repository <repo> Explicit release repository (owner/name)
         --token <token>     GitHub token for API/downloads (or set GITHUB_TOKEN / GH_TOKEN)
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
         --install-dir <dir> Override install location
                             (default: ${XDG_BIN_HOME:-~/.local/bin}; on Windows:
-                            %LOCALAPPDATA%\\Programs\\claurst)
+                            %LOCALAPPDATA%\\Programs\\forge)
 
 Examples:
-    curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
-    ./install.sh --version 0.1.0
-    ./install.sh --binary /path/to/claurst
+    ./install.sh --binary /path/to/forge --no-modify-path
+    FORGE_RELEASE_REPO=owner/repository ./install.sh --version 0.1.0
     GITHUB_TOKEN=ghp_... ./install.sh
 EOF
 }
@@ -65,6 +60,13 @@ binary_path=""
 install_dir_override=""
 # Prefer explicit --token; otherwise GITHUB_TOKEN, then GH_TOKEN (gh CLI convention).
 github_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+
+# Remote-install safety limits. Local --binary installs never invoke these paths.
+CONNECT_TIMEOUT_SECONDS=10
+TOTAL_TIMEOUT_SECONDS=60
+ARCHIVE_MAX_BYTES=$((128 * 1024 * 1024))
+MANIFEST_MAX_BYTES=$((1 * 1024 * 1024))
+API_MAX_BYTES=$((1 * 1024 * 1024))
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -99,6 +101,15 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --repository)
+            if [[ -n "${2:-}" ]]; then
+                REPO="$2"
+                shift 2
+            else
+                print_message error "Error: --repository requires owner/name"
+                exit 1
+            fi
+            ;;
         --no-modify-path)
             no_modify_path=true
             shift
@@ -118,13 +129,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Build curl args for GitHub (API + asset downloads). Auth avoids rate limits
-# and enables private-release installs when a token is available.
-github_curl_args=(-fsSL -H "User-Agent: claurst-installer" -H "Accept: application/vnd.github+json")
-if [[ -n "$github_token" ]]; then
-    github_curl_args+=(-H "Authorization: Bearer ${github_token}")
-fi
 
 # True when running under Git Bash / MSYS / Cygwin on Windows.
 is_windows_shell() {
@@ -146,12 +150,12 @@ to_unix_path() {
 }
 
 # Default install dir matches install.ps1 on Windows:
-#   %LOCALAPPDATA%\Programs\claurst  (fallback: %USERPROFILE%\.local\bin)
+#   %LOCALAPPDATA%\Programs\forge  (fallback: %USERPROFILE%\.local\bin)
 # Unix: ${XDG_BIN_HOME:-~/.local/bin}
 default_install_dir() {
     if is_windows_shell; then
         if [[ -n "${LOCALAPPDATA:-}" ]]; then
-            echo "$(to_unix_path "$LOCALAPPDATA")/Programs/claurst"
+            echo "$(to_unix_path "$LOCALAPPDATA")/Programs/forge"
         elif [[ -n "${USERPROFILE:-}" ]]; then
             echo "$(to_unix_path "$USERPROFILE")/.local/bin"
         else
@@ -163,7 +167,6 @@ default_install_dir() {
 }
 
 INSTALL_DIR="${install_dir_override:-$(default_install_dir)}"
-mkdir -p "$INSTALL_DIR"
 
 # ----- Detect platform & arch -----
 detect_target() {
@@ -218,6 +221,8 @@ check_required_tools() {
     local missing=()
     if [[ -z "$binary_path" ]]; then
         command -v curl >/dev/null 2>&1 || missing+=("curl")
+        command -v head >/dev/null 2>&1 || missing+=("head")
+        command -v wc >/dev/null 2>&1 || missing+=("wc")
         if is_windows_shell; then
             command -v unzip >/dev/null 2>&1 || missing+=("unzip")
         else
@@ -231,24 +236,157 @@ check_required_tools() {
     fi
 }
 
-resolve_version() {
-    if [[ -n "$requested_version" ]]; then
-        # Strip leading 'v' if present
-        requested_version="${requested_version#v}"
-        specific_version="$requested_version"
-    else
-        # Fetch latest version from GitHub API.  Use sed instead of jq for portability.
-        specific_version=$(curl "${github_curl_args[@]}" \
-            "https://api.github.com/repos/${REPO}/releases/latest" \
-            | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' \
-            | head -n 1)
-        if [[ -z "$specific_version" ]]; then
-            print_message error "Failed to fetch latest version from GitHub API"
-            if [[ -z "$github_token" ]]; then
-                print_message info "If you hit rate limits or need a private release, set GITHUB_TOKEN or pass --token."
-            fi
-            exit 1
+# Download through a bounded reader.  The response body is written to a part
+# file and only CAP+1 bytes can be persisted. Redirects are handled one hop at
+# a time instead of using -L: curl's manual warns that custom -H headers are
+# sent on every redirected request, including other hosts. A token is attached
+# only when the current host is a GitHub API/release host.
+download_capped() {
+    local url="$1" output="$2" cap="$3" label="$4"
+    local part="${output}.part" headers="${output}.headers"
+    local current="$url" redirects=0 started=$SECONDS
+    rm -f -- "$part" "$headers"
+    while true; do
+        local elapsed=$((SECONDS - started))
+        local remaining=$((TOTAL_TIMEOUT_SECONDS - elapsed))
+        if (( remaining <= 0 )); then
+            rm -f -- "$part" "$headers"
+            print_message error "${label} download timed out."
+            return 1
         fi
+        local request_timeout="$CONNECT_TIMEOUT_SECONDS"
+        if (( request_timeout > remaining )); then request_timeout="$remaining"; fi
+        local host="${current#https://}"
+        host="${host%%/*}"
+        local -a args=(-fsS --proto '=https' --proto-redir '=https' --max-redirs 0 \
+            --connect-timeout "$request_timeout" --max-time "$remaining" \
+            -D "$headers" -H "User-Agent: forge-installer" \
+            -H "Accept: application/vnd.github+json")
+        if [[ -n "$github_token" && ( "$host" == "api.github.com" || "$host" == "github.com" ) ]]; then
+            args+=(-H "Authorization: Bearer ${github_token}")
+        fi
+
+        # Do not print curl diagnostics: they can include request URLs or proxy data.
+        set +e
+        curl "${args[@]}" "$current" 2>/dev/null | head -c "$((cap + 1))" > "$part" 2>/dev/null
+        local -a statuses=("${PIPESTATUS[@]}")
+        set -e
+        local curl_status="${statuses[0]:-1}" status_code location size
+        # A proxy may leave CONNECT and 100-Continue status lines in the
+        # header dump. Select the final HTTP status line, not the first one.
+        status_code=$(awk '/^HTTP\/[0-9.]+[[:space:]]+[0-9][0-9][0-9]([[:space:]]|$)/ { code=$2 } END { gsub(/\r/, "", code); print code }' "$headers")
+        if [[ "$status_code" =~ ^3[0-9][0-9]$ ]]; then
+            location=$(sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$headers" | tail -n 1 | tr -d '\r')
+            rm -f -- "$part" "$headers"
+            if [[ -z "$location" || ! "$location" =~ ^https:// ]]; then
+                print_message error "${label} redirect was not HTTPS."
+                return 1
+            fi
+            redirects=$((redirects + 1))
+            if (( redirects > 5 )); then
+                print_message error "${label} exceeded its redirect limit."
+                return 1
+            fi
+            current="$location"
+            continue
+        fi
+        size=$(wc -c < "$part" | tr -d '[:space:]')
+        if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size > cap )); then
+            rm -f -- "$part" "$headers"
+            print_message error "${label} exceeded its size limit."
+            return 1
+        fi
+        if (( curl_status != 0 )); then
+            rm -f -- "$part" "$headers"
+            print_message error "${label} download failed."
+            return 1
+        fi
+        rm -f -- "$headers"
+        mv -f -- "$part" "$output"
+        return 0
+    done
+}
+
+validate_version() {
+    local value="$1"
+    if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+.-][0-9A-Za-z+.-]+)?$ ]]; then
+        print_message error "Invalid release version."
+        exit 1
+    fi
+}
+
+validate_remote_inputs() {
+    if [[ ! "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        print_message error "Remote install requires --repository owner/name or FORGE_RELEASE_REPO."
+        print_message info "For the verified local path, use --binary /absolute/path/to/forge."
+        exit 1
+    fi
+    if [[ -n "$requested_version" ]]; then
+        requested_version="${requested_version#v}"
+        validate_version "$requested_version"
+    fi
+}
+
+resolve_version() {
+    # Validate all user-controlled URL components before any remote request.
+    validate_remote_inputs
+    if [[ -n "$requested_version" ]]; then
+        specific_version="$requested_version"
+        return
+    fi
+
+    local latest_file
+    latest_file=$(mktemp "${TMPDIR:-/tmp}/forge-latest.XXXXXX")
+    if ! download_capped \
+        "https://api.github.com/repos/${REPO}/releases/latest" \
+        "$latest_file" "$API_MAX_BYTES" "Latest-version response"; then
+        rm -f "$latest_file"
+        print_message error "Failed to fetch the latest version."
+        if [[ -z "$github_token" ]]; then
+            print_message info "Private releases or rate limits may require GITHUB_TOKEN, GH_TOKEN, or --token."
+        fi
+        exit 1
+    fi
+    # The response is capped before parsing. Extract one tag and validate it as
+    # a release version before constructing the release-asset URL.
+    specific_version=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v\{0,1\}[0-9][^"]*\)".*/\1/p' "$latest_file" | head -n 1)
+    rm -f "$latest_file"
+    specific_version="${specific_version#v}"
+    if [[ -z "$specific_version" ]]; then
+        print_message error "Latest-version response did not contain a release tag."
+        exit 1
+    fi
+    validate_version "$specific_version"
+}
+
+verify_checksum_manifest() {
+    local manifest="$1" archive_name="$2"
+    local expected
+    # Every non-empty line must be a strict sha256sum record. Track every name
+    # to reject duplicate records, then require exactly one exact archive entry.
+    if ! expected=$(awk -v wanted="$archive_name" '
+        BEGIN { bad=0; matches=0 }
+        {
+            if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9A-Fa-f]+$/) { bad=1; next }
+            name=$2; sub(/^\*/, "", name)
+            if (seen[name]++) { bad=1 }
+            if (name == wanted) { matches++; expected=$1 }
+        }
+        END {
+            if (bad || matches != 1) { exit 1 }
+            print expected
+        }
+    ' "$manifest"); then
+        print_message error "Checksum manifest is malformed, duplicated, or missing the archive."
+        return 1
+    fi
+    printf '%s\n' "$expected"
+}
+
+install_tmp_dir=""
+cleanup_install() {
+    if [[ -n "${install_tmp_dir:-}" && -d "$install_tmp_dir" ]]; then
+        rm -rf -- "$install_tmp_dir"
     fi
 }
 
@@ -262,7 +400,7 @@ check_existing_install() {
             print_message info "${MUTED}Use --version to install a different version, or pass a different one to upgrade.${NC}"
             exit 0
         fi
-        print_message info "${MUTED}Found existing claurst at ${NC}$existing_path${MUTED} (v$installed_version) - upgrading to v$specific_version${NC}"
+        print_message info "${MUTED}Found existing forge at ${NC}$existing_path${MUTED} (v$installed_version) - upgrading to v$specific_version${NC}"
     fi
 }
 
@@ -270,86 +408,65 @@ check_existing_install() {
 download_and_install() {
     local archive="${APP}-${target}.${archive_ext}"
     local url="https://github.com/${REPO}/releases/download/v${specific_version}/${archive}"
+    local sums_url="https://github.com/${REPO}/releases/download/v${specific_version}/SHA256SUMS"
     local tmp_dir
     # mktemp -t is GNU-style; fall back for older / BSD layouts (and Git Bash).
-    tmp_dir=$(mktemp -d -t claurst-install-XXXXXX 2>/dev/null \
-        || mktemp -d "${TMPDIR:-/tmp}/claurst-install.XXXXXX")
-    trap "rm -rf '$tmp_dir'" EXIT
+    tmp_dir=$(mktemp -d -t forge-install-XXXXXX 2>/dev/null \
+        || mktemp -d "${TMPDIR:-/tmp}/forge-install.XXXXXX")
+    install_tmp_dir="$tmp_dir"
+    trap cleanup_install EXIT
 
     print_message info "${MUTED}Installing ${NC}${APP} ${MUTED}v${NC}${specific_version} ${MUTED}(${target})${NC}"
-    print_message info "${MUTED}Downloading ${NC}${url}"
-    if [[ -n "$github_token" ]]; then
-        print_message info "${MUTED}Using GitHub authentication.${NC}"
-    fi
-
-    # Progress bar is optional; keep -f so HTTP errors fail the install.
-    local -a dl_args=(-fL --progress-bar -H "User-Agent: claurst-installer")
-    if [[ -n "$github_token" ]]; then
-        dl_args+=(-H "Authorization: Bearer ${github_token}")
-    fi
-    if ! curl "${dl_args[@]}" -o "$tmp_dir/$archive" "$url"; then
-        print_message error "Download failed."
-        print_message info "Check that release v${specific_version} exists for ${target}:"
-        print_message info "  https://github.com/${REPO}/releases/tag/v${specific_version}"
+    print_message info "${MUTED}Downloading release asset (HTTPS, bounded).${NC}"
+    if ! download_capped "$url" "$tmp_dir/$archive" "$ARCHIVE_MAX_BYTES" "Release archive"; then
+        print_message error "Release archive download failed."
         if [[ -z "$github_token" ]]; then
             print_message info "Private releases require GITHUB_TOKEN / GH_TOKEN or --token."
         fi
         exit 1
     fi
 
-    # ----- Verify checksum (supply-chain integrity) -----
-    # Fetch SHA256SUMS from the same release and verify the archive before we
-    # extract and run it.  Older releases may not ship SHA256SUMS — in that
-    # case we warn and continue so existing installs keep working.  But if the
-    # file IS present and the hash does NOT match, we abort hard.
-    local sums_url="https://github.com/${REPO}/releases/download/v${specific_version}/SHA256SUMS"
-    if curl "${github_curl_args[@]}" -o "$tmp_dir/SHA256SUMS" "$sums_url" 2>/dev/null; then
-        # sha256sum emits "<hash>  <filename>" (two spaces); awk collapses the
-        # whitespace so $1=hash, $2=bare filename.  Match on the bare archive
-        # name (not the full temp path).
-        local expected actual
-        expected=$(awk -v f="$archive" '$2 == f {print $1}' "$tmp_dir/SHA256SUMS" | head -n 1)
-        if [[ -z "$expected" ]]; then
-            print_message warning "Warning: no checksum listed for ${archive} in SHA256SUMS - skipping verification."
-        else
-            if command -v sha256sum >/dev/null 2>&1; then
-                actual=$(sha256sum "$tmp_dir/$archive" | awk '{print $1}')
-            elif command -v shasum >/dev/null 2>&1; then
-                actual=$(shasum -a 256 "$tmp_dir/$archive" | awk '{print $1}')
-            else
-                actual=""
-            fi
-            if [[ -z "$actual" ]]; then
-                print_message warning "Warning: no sha256sum/shasum tool available - skipping checksum verification."
-            elif [[ "$actual" != "$expected" ]]; then
-                print_message error "Checksum verification FAILED for ${archive}"
-                print_message info "  expected: $expected"
-                print_message info "  actual:   $actual"
-                print_message info "The download may be corrupted or tampered with. Aborting."
-                exit 1
-            else
-                print_message info "${MUTED}Checksum verified.${NC}"
-            fi
-        fi
-    else
-        print_message warning "Warning: could not fetch SHA256SUMS for v${specific_version} - skipping checksum verification."
+    # The manifest is independently bounded and must contain one unique,
+    # well-formed entry for this exact archive before extraction.
+    if ! download_capped "$sums_url" "$tmp_dir/SHA256SUMS" "$MANIFEST_MAX_BYTES" "Checksum manifest"; then
+        print_message error "Could not fetch the required checksum manifest."
+        exit 1
     fi
+    local expected actual expected_lower actual_lower
+    if ! expected=$(verify_checksum_manifest "$tmp_dir/SHA256SUMS" "$archive"); then
+        exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$tmp_dir/$archive" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$tmp_dir/$archive" | awk '{print $1}')
+    else
+        print_message error "Checksum verification requires sha256sum or shasum."
+        exit 1
+    fi
+    expected_lower=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    actual_lower=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+    if [[ "$actual_lower" != "$expected_lower" ]]; then
+        print_message error "Checksum verification failed for the release archive."
+        exit 1
+    fi
+    print_message info "${MUTED}Checksum verified.${NC}"
 
     print_message info "${MUTED}Extracting...${NC}"
     if [[ "$archive_ext" == "zip" ]]; then
-        # Quiet extract; -o overwrites without prompting (Windows zip layout).
         if ! unzip -o -q "$tmp_dir/$archive" -d "$tmp_dir"; then
             print_message error "Extract failed."
             exit 1
         fi
     else
-        tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+        if ! tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"; then
+            print_message error "Extract failed."
+            exit 1
+        fi
     fi
 
     if [[ ! -f "$tmp_dir/$binary_name" ]]; then
-        print_message error "Archive did not contain expected binary '$binary_name'"
-        print_message info "Contents:"
-        ls -la "$tmp_dir"
+        print_message error "Archive did not contain the expected binary."
         exit 1
     fi
 
@@ -373,18 +490,37 @@ install_binary() {
         dest_name="${dest_name}.exe"
     fi
     local target_path="${INSTALL_DIR}/${dest_name}"
+    local staged
+    mkdir -p -- "$INSTALL_DIR"
+    staged=$(mktemp "${INSTALL_DIR}/.forge-install.XXXXXX")
+    if ! cp "$source" "$staged" || ! chmod 755 "$staged"; then
+        rm -f "$staged"
+        print_message error "Could not stage the installation binary."
+        return 1
+    fi
 
     # Windows holds an exclusive lock on a running .exe — rename the old binary
     # aside first, then remove it after the new binary is in place (same as
     # install.ps1). The lock is on the open handle, not the new path name.
     local stale="${target_path}.old"
     if is_windows_shell && [[ -f "$target_path" ]]; then
-        rm -f "$stale" 2>/dev/null || true
-        mv -f "$target_path" "$stale" 2>/dev/null || true
+        if ! rm -f "$stale" || ! mv -f "$target_path" "$stale"; then
+            rm -f "$staged"
+            print_message error "Could not move the installed binary."
+            return 1
+        fi
     fi
 
-    cp "$source" "$target_path"
-    chmod 755 "$target_path"
+    if ! mv -f "$staged" "$target_path"; then
+        if [[ -f "$stale" && ! -e "$target_path" ]]; then
+            if ! mv -f "$stale" "$target_path"; then
+                print_message error "Restore the previous binary from $stale."
+            fi
+        fi
+        rm -f "$staged"
+        print_message error "Could not install the staged binary."
+        return 1
+    fi
 
     if [[ -f "$stale" ]]; then
         rm -f "$stale" 2>/dev/null || true
@@ -419,7 +555,7 @@ add_to_windows_user_path() {
     local ps_script
     ps_script=$(cat <<'PSEOF'
 $ErrorActionPreference = 'Stop'
-$installDir = $env:CLAURST_INSTALL_DIR_WIN
+$installDir = $env:FORGE_INSTALL_DIR_WIN
 $current = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($null -eq $current) { $current = '' }
 $paths = $current -split ';' | Where-Object { $_ -ne '' }
@@ -440,7 +576,7 @@ PSEOF
 )
 
     local result
-    if ! result=$(CLAURST_INSTALL_DIR_WIN="$win_dir" powershell.exe -NoProfile -NonInteractive -Command "$ps_script" 2>/dev/null); then
+    if ! result=$(FORGE_INSTALL_DIR_WIN="$win_dir" powershell.exe -NoProfile -NonInteractive -Command "$ps_script" 2>/dev/null); then
         print_message warning "Could not update Windows user PATH. Add manually: $win_dir"
         return
     fi
@@ -510,7 +646,7 @@ add_to_unix_path() {
 
     {
         echo ""
-        echo "# claurst"
+        echo "# forge"
         echo "$path_line"
     } >> "$config_file"
     print_message success "Added $INSTALL_DIR to PATH in $config_file"
@@ -557,17 +693,17 @@ main() {
 
     # Goodbye banner
     echo ""
-    print_message success "claurst is installed!"
+    print_message success "forge is installed!"
     echo ""
     echo -e "${MUTED}Quickstart:${NC}"
     echo -e "  ${MUTED}# Set an API key${NC}"
     echo -e "  export ANTHROPIC_API_KEY=sk-ant-..."
     echo -e ""
     echo -e "  ${MUTED}# Open a new terminal, then:${NC}"
-    echo -e "  ${GREEN}claurst${NC}              ${MUTED}# Interactive TUI${NC}"
-    echo -e "  ${GREEN}claurst -p \"...\"${NC}       ${MUTED}# Headless one-shot${NC}"
+    echo -e "  ${GREEN}forge${NC}              ${MUTED}# Interactive TUI${NC}"
+    echo -e "  ${GREEN}forge -p \"...\"${NC}       ${MUTED}# Headless one-shot${NC}"
     echo ""
-    echo -e "${MUTED}Docs: ${NC}https://github.com/${REPO}"
+    echo -e "${MUTED}Release repository: ${NC}${REPO:-not configured}"
 }
 
 main "$@"

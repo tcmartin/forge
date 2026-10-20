@@ -5,16 +5,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use claurst_core::dispatch::DispatchDenied;
 use claurst_core::ProviderId;
 
-use crate::client::ClientConfig;
+use crate::client::{AnthropicClient, ClientConfig};
+use crate::client_factory::AnthropicClientFactory;
+use crate::dispatch_policy::DispatchPolicy;
 use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
-    OpenAiProvider,
+    CopilotProvider, FreeEntry, FreeProvider, GoogleProvider, MinimaxProvider, OpenAiProvider,
+    FREE_CATALOG,
 };
 
 fn normalize_openai_compat_base(override_base: &str) -> String {
@@ -72,9 +76,10 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 
     match provider_id {
-        "anthropic" => Some(Arc::new(AnthropicProvider::from_config(
-            ClientConfig { api_key: key, ..Default::default() },
-        ))),
+        "anthropic" => Some(Arc::new(AnthropicProvider::from_config(ClientConfig {
+            api_key: key,
+            ..Default::default()
+        }))),
         "minimax" => Some(Arc::new(MinimaxProvider::new(key))),
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
@@ -162,9 +167,25 @@ pub fn provider_from_config(
             if let Some(base) = api_base {
                 provider = provider.with_base_url(base);
             }
+            // The loopback transport is available only in the explicit A016
+            // test feature; normal builds cannot select this option.
+            #[cfg(feature = "a016-openai-loopback")]
+            if let Some(loopback_base) = provider_cfg
+                .and_then(|config| config.options.get("a016_test_loopback_base_url"))
+                .and_then(|value| value.as_str())
+                .filter(|base| !base.is_empty())
+            {
+                provider = provider.with_test_loopback_base_url(loopback_base.to_string());
+            }
             Some(Arc::new(provider))
         }
-        "google" => api_key.map(|key| Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
+        "google" => api_key.map(|key| {
+            let mut provider = GoogleProvider::new(key);
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Arc::new(provider) as Arc<dyn LlmProvider>
+        }),
         "minimax" => api_key.map(|key| {
             let mut provider = MinimaxProvider::new(key);
             if let Some(base) = api_base {
@@ -192,9 +213,9 @@ pub fn provider_from_config(
                 });
 
             match (resource_name, api_key) {
-                (Some(resource_name), Some(key)) => Some(
-                    Arc::new(AzureProvider::new(resource_name, key)) as Arc<dyn LlmProvider>
-                ),
+                (Some(resource_name), Some(key)) => {
+                    Some(Arc::new(AzureProvider::new(resource_name, key)) as Arc<dyn LlmProvider>)
+                }
                 _ => None,
             }
         }
@@ -301,6 +322,71 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     provider_from_key(provider_id, key)
 }
 
+/// Build a runtime provider through the host-owned Anthropic factory.
+///
+/// Anthropic credentials are read once from the auth store for this call;
+/// other providers retain the existing runtime construction path.
+pub fn runtime_provider_for_with_factory(
+    provider_id: &str,
+    factory: &AnthropicClientFactory,
+) -> anyhow::Result<Option<Arc<dyn LlmProvider>>> {
+    if provider_id != ProviderId::ANTHROPIC {
+        return Ok(runtime_provider_for(provider_id));
+    }
+
+    let auth_store = claurst_core::AuthStore::load();
+    let Some(api_key) = auth_store
+        .api_key_for(provider_id)
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let client = factory.create(ClientConfig {
+        api_key,
+        ..Default::default()
+    })?;
+    Ok(Some(Arc::new(AnthropicProvider::new(Arc::new(client)))))
+}
+
+/// Build a configured provider through the host-owned Anthropic factory.
+///
+/// Non-Anthropic providers delegate to the established configuration path so
+/// their key, alias, endpoint, and option precedence remain unchanged.
+pub fn provider_from_config_with_factory(
+    config: &claurst_core::config::Config,
+    provider_id: &str,
+    factory: &AnthropicClientFactory,
+) -> anyhow::Result<Option<Arc<dyn LlmProvider>>> {
+    if provider_id != ProviderId::ANTHROPIC {
+        return Ok(provider_from_config(config, provider_id));
+    }
+
+    if config
+        .provider_configs
+        .get(provider_id)
+        .is_some_and(|provider| !provider.enabled)
+    {
+        return Ok(None);
+    }
+
+    let Some(api_key) = config.resolve_provider_api_key(provider_id) else {
+        return Ok(None);
+    };
+    let defaults = ClientConfig::default();
+    let client_config = ClientConfig {
+        api_key,
+        api_base: resolve_provider_api_base(config, provider_id)
+            .filter(|base| !base.is_empty())
+            .unwrap_or(defaults.api_base),
+        request_timeout: Duration::from_secs(config.resolve_request_timeout_secs(provider_id)),
+        ..defaults
+    };
+
+    let client = factory.create(client_config)?;
+    Ok(Some(Arc::new(AnthropicProvider::new(Arc::new(client)))))
+}
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
@@ -339,6 +425,27 @@ impl ProviderRegistry {
             (canonical_id != &**id)
                 .then(|| self.providers.get(&ProviderId::new(canonical_id)))
                 .flatten()
+        })
+    }
+
+    /// Clone the registry while attaching immutable host dispatch policy to
+    /// one retained provider instance. Providers that do not explicitly
+    /// support policy binding remain fixed/base-only.
+    pub fn with_dispatch_policy(
+        &self,
+        provider_id: &str,
+        policy: Arc<DispatchPolicy>,
+    ) -> Result<Self, DispatchDenied> {
+        let requested = ProviderId::new(provider_id);
+        let provider = self
+            .get(&requested)
+            .ok_or(DispatchDenied::UnsupportedRoute)?;
+        let bound = provider.bind_dispatch_policy(policy)?;
+        let mut providers = self.providers.clone();
+        providers.insert(bound.id().clone(), bound);
+        Ok(Self {
+            providers,
+            default_provider_id: self.default_provider_id.clone(),
         })
     }
 
@@ -385,6 +492,39 @@ impl ProviderRegistry {
         registry
     }
 
+    fn register_environment_providers(&mut self) {
+        self.with_openai_if_key_set()
+            .with_google_if_key_set()
+            .with_azure_if_configured()
+            .with_bedrock_if_configured()
+            .with_copilot_if_configured()
+            .with_codex_if_configured()
+            .with_cohere_if_key_set()
+            .with_available_providers();
+    }
+
+    fn register_auth_store_providers(&mut self) {
+        let auth_store = claurst_core::AuthStore::load();
+
+        for provider_id in auth_store.credentials.keys() {
+            let pid = claurst_core::ProviderId::new(provider_id.as_str());
+            // Skip if already registered from env vars or a host-supplied
+            // client.
+            if self.get(&pid).is_some() {
+                continue;
+            }
+            let Some(key) = auth_store
+                .api_key_for(provider_id)
+                .filter(|key| !key.is_empty())
+            else {
+                continue;
+            };
+            if let Some(provider) = provider_from_key(provider_id, key) {
+                self.register(provider);
+            }
+        }
+    }
+
     pub fn from_config(
         config: &claurst_core::config::Config,
         anthropic_config: ClientConfig,
@@ -398,12 +538,12 @@ impl ProviderRegistry {
         let mut registry = Self::from_environment_with_auth_store(anthropic_config);
         let active_provider = config.selected_provider_id();
 
-        let mut configured_provider_ids: Vec<String> = config
-            .provider_configs
-            .keys()
-            .cloned()
-            .collect();
-        if configured_provider_ids.iter().all(|id| id != active_provider) {
+        let mut configured_provider_ids: Vec<String> =
+            config.provider_configs.keys().cloned().collect();
+        if configured_provider_ids
+            .iter()
+            .all(|id| id != active_provider)
+        {
             configured_provider_ids.push(active_provider.to_string());
         }
 
@@ -418,6 +558,45 @@ impl ProviderRegistry {
             registry.set_default(default_provider_id);
         }
 
+        registry
+    }
+
+    /// Build a configured registry while retaining the exact host-created
+    /// Anthropic client and its dispatch identity.
+    pub fn from_config_with_anthropic_client(
+        config: &claurst_core::config::Config,
+        anthropic_client: Arc<AnthropicClient>,
+    ) -> Self {
+        crate::set_request_timeout_secs(
+            config.resolve_request_timeout_secs(config.selected_provider_id()),
+        );
+        let mut registry = Self::new();
+        registry.register(Arc::new(AnthropicProvider::new(anthropic_client)));
+        registry.register_environment_providers();
+        registry.register_auth_store_providers();
+
+        let active_provider = config.selected_provider_id();
+        let mut configured_provider_ids: Vec<String> =
+            config.provider_configs.keys().cloned().collect();
+        if configured_provider_ids
+            .iter()
+            .all(|id| id != active_provider)
+        {
+            configured_provider_ids.push(active_provider.to_string());
+        }
+        for provider_id in configured_provider_ids {
+            if provider_id == ProviderId::ANTHROPIC {
+                continue;
+            }
+            if let Some(provider) = provider_from_config(config, &provider_id) {
+                registry.register(provider);
+            }
+        }
+
+        let default_provider_id = ProviderId::new(active_provider);
+        if registry.get(&default_provider_id).is_some() {
+            registry.set_default(default_provider_id);
+        }
         registry
     }
 
@@ -496,15 +675,7 @@ impl ProviderRegistry {
     /// This is the recommended constructor for production use.
     pub fn from_environment(anthropic_config: ClientConfig) -> Self {
         let mut registry = Self::with_anthropic(anthropic_config);
-        registry
-            .with_openai_if_key_set()
-            .with_google_if_key_set()
-            .with_azure_if_configured()
-            .with_bedrock_if_configured()
-            .with_copilot_if_configured()
-            .with_codex_if_configured()
-            .with_cohere_if_key_set()
-            .with_available_providers();
+        registry.register_environment_providers();
         registry
     }
 
@@ -520,29 +691,7 @@ impl ProviderRegistry {
     pub fn from_environment_with_auth_store(anthropic_config: ClientConfig) -> Self {
         // Start with env-based registration.
         let mut registry = Self::from_environment(anthropic_config);
-
-        // Now check the auth store for providers that weren't registered from
-        // env vars.
-        let auth_store = claurst_core::AuthStore::load();
-
-        for provider_id in auth_store.credentials.keys() {
-            let pid = claurst_core::ProviderId::new(provider_id.as_str());
-            // Skip if already registered from env vars.
-            if registry.get(&pid).is_some() {
-                continue;
-            }
-            // Try to get a usable key from the auth store.
-            if let Some(key) = auth_store.api_key_for(provider_id) {
-                if key.is_empty() {
-                    continue;
-                }
-                let provider = provider_from_key(provider_id, key);
-                if let Some(p) = provider {
-                    registry.register(p);
-                }
-            }
-        }
-
+        registry.register_auth_store_providers();
         registry
     }
 
@@ -565,95 +714,185 @@ impl ProviderRegistry {
         self.register(Arc::new(p::llama_cpp()));
 
         // Remote providers — only register when an API key is present.
-        if std::env::var("DEEPSEEK_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPSEEK_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepseek()));
         }
-        if std::env::var("GROQ_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("GROQ_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::groq()));
         }
-        if std::env::var("XAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("XAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::xai()));
         }
-        if std::env::var("OPENROUTER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OPENROUTER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::openrouter()));
         }
-        if std::env::var("TOGETHER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("TOGETHER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::together_ai()));
         }
-        if std::env::var("PERPLEXITY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("PERPLEXITY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::perplexity()));
         }
-        if std::env::var("CEREBRAS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("CEREBRAS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::cerebras()));
         }
-        if std::env::var("DEEPINFRA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPINFRA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepinfra()));
         }
-        if std::env::var("VENICE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VENICE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::venice()));
         }
-        if std::env::var("DASHSCOPE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DASHSCOPE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::qwen()));
         }
-        if std::env::var("MISTRAL_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MISTRAL_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::mistral()));
         }
-        if std::env::var("SAMBANOVA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SAMBANOVA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::sambanova()));
         }
-        if std::env::var("HF_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("HF_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::huggingface()));
         }
-        if std::env::var("MINIMAX_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MINIMAX_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
             self.register(Arc::new(MinimaxProvider::new(key)));
         }
-        if std::env::var("NVIDIA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NVIDIA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nvidia()));
         }
-        if std::env::var("SILICONFLOW_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SILICONFLOW_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::siliconflow()));
         }
-        if std::env::var("MOONSHOT_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MOONSHOT_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::moonshot()));
         }
-        if std::env::var("ZHIPU_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("ZHIPU_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::zhipu()));
         }
-        if std::env::var("ZAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("ZAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::zai()));
         }
-        if std::env::var("NEBIUS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NEBIUS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nebius()));
         }
-        if std::env::var("NOVITA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NOVITA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::novita()));
         }
-        if std::env::var("OVHCLOUD_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OVHCLOUD_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::ovhcloud()));
         }
-        if std::env::var("SCALEWAY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SCALEWAY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::scaleway()));
         }
-        if std::env::var("VULTR_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VULTR_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::vultr_ai()));
         }
-        if std::env::var("BASETEN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("BASETEN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::baseten()));
         }
-        if std::env::var("FRIENDLI_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FRIENDLI_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::friendli()));
         }
-        if std::env::var("UPSTAGE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("UPSTAGE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::upstage()));
         }
-        if std::env::var("STEPFUN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("STEPFUN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::stepfun()));
         }
-        if std::env::var("FIREWORKS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FIREWORKS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::fireworks()));
         }
-        if std::env::var("OPENCODE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OPENCODE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::opencode_go()));
         }
         self
@@ -669,7 +908,33 @@ impl Default for ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch_policy::{DispatchModelSpec, DispatchPolicy, EffortWireBinding};
     use crate::providers;
+    use claurst_core::config::{Config, ProviderConfig};
+    use claurst_core::effort::EffortLevel;
+
+    const MODEL: &str = "registry-factory-fixture";
+
+    fn factory(revision: u64) -> AnthropicClientFactory {
+        AnthropicClientFactory::with_dispatch_policy(Arc::new(
+            DispatchPolicy::new(
+                revision,
+                vec![DispatchModelSpec {
+                    model_id: MODEL.to_string(),
+                    efforts: vec![EffortWireBinding::anthropic_thinking(EffortLevel::High)],
+                }],
+            )
+            .expect("fixture policy"),
+        ))
+    }
+
+    fn client_config(api_key: &str, api_base: &str) -> ClientConfig {
+        ClientConfig {
+            api_key: api_key.to_string(),
+            api_base: api_base.to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn local_provider_aliases_resolve_to_canonical_registrations() {
@@ -695,5 +960,107 @@ mod tests {
         registry.set_default(ProviderId::new("lmstudio"));
 
         assert_eq!(&**registry.default_provider_id(), ProviderId::LM_STUDIO);
+    }
+
+    #[test]
+    fn configured_registry_reuses_host_anthropic_client_identity_and_policy() {
+        let factory = factory(31);
+        let host_client = Arc::new(
+            factory
+                .create(client_config("host-key", "http://host.example"))
+                .expect("host client"),
+        );
+        let expected = host_client
+            .dispatch_route(MODEL, EffortLevel::High)
+            .expect("host route");
+        let config = Config {
+            provider: Some(ProviderId::ANTHROPIC.to_string()),
+            api_key: Some("different-config-key".to_string()),
+            ..Default::default()
+        };
+
+        let registry =
+            ProviderRegistry::from_config_with_anthropic_client(&config, Arc::clone(&host_client));
+        let provider = registry
+            .get(&ProviderId::new(ProviderId::ANTHROPIC))
+            .expect("registered Anthropic provider");
+        let actual = provider
+            .dispatch_route(MODEL, EffortLevel::High)
+            .expect("registered route");
+
+        assert_eq!(
+            actual.provider_instance_id(),
+            expected.provider_instance_id()
+        );
+        assert_eq!(actual.account_identity(), expected.account_identity());
+        assert_eq!(actual.endpoint_identity(), expected.endpoint_identity());
+        assert_eq!(actual.policy_revision(), 31);
+    }
+
+    #[test]
+    fn configured_factory_path_preserves_key_base_and_rebuilds_identity() {
+        let mut config = Config {
+            provider: Some(ProviderId::ANTHROPIC.to_string()),
+            api_key: Some("configured-key".to_string()),
+            ..Default::default()
+        };
+        config.provider_configs.insert(
+            ProviderId::ANTHROPIC.to_string(),
+            ProviderConfig {
+                api_base: Some("http://configured.example".to_string()),
+                ..Default::default()
+            },
+        );
+        let factory = factory(37);
+        let first = provider_from_config_with_factory(&config, "anthropic", &factory)
+            .expect("first factory provider")
+            .expect("configured provider")
+            .dispatch_route(MODEL, EffortLevel::High)
+            .expect("first route");
+        let second = provider_from_config_with_factory(&config, "anthropic", &factory)
+            .expect("second factory provider")
+            .expect("configured provider")
+            .dispatch_route(MODEL, EffortLevel::High)
+            .expect("second route");
+
+        assert_eq!(first.policy_revision(), 37);
+        assert_eq!(
+            first.endpoint_identity(),
+            "http://configured.example/v1/messages"
+        );
+        assert_ne!(first.provider_instance_id(), second.provider_instance_id());
+        assert_ne!(first.account_identity(), second.account_identity());
+
+        config
+            .provider_configs
+            .get_mut("anthropic")
+            .unwrap()
+            .enabled = false;
+        assert!(
+            provider_from_config_with_factory(&config, "anthropic", &factory)
+                .expect("disabled factory path")
+                .is_none()
+        );
+
+        config
+            .provider_configs
+            .get_mut("anthropic")
+            .unwrap()
+            .enabled = true;
+        config.api_key = None;
+        assert!(
+            provider_from_config_with_factory(&config, "anthropic", &factory)
+                .expect("missing-key factory path")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn factory_path_delegates_non_anthropic_aliases() {
+        let config = Config::default();
+        let provider = provider_from_config_with_factory(&config, "ollama", &factory(41))
+            .expect("local provider factory path")
+            .expect("local provider");
+        assert_eq!(&**provider.id(), ProviderId::OLLAMA);
     }
 }

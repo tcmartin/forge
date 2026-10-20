@@ -91,11 +91,15 @@ pub async fn generate_away_summary(
     let conversation = crate::sanitize::sanitize_history(conversation);
 
     // Convert to API messages.
-    let api_messages: Vec<claurst_api::ApiMessage> =
-        conversation.iter().map(claurst_api::ApiMessage::from).collect();
+    let api_messages: Vec<claurst_api::ApiMessage> = conversation
+        .iter()
+        .map(claurst_api::ApiMessage::from)
+        .collect();
 
+    let wire_budget = crate::default_wire_budget(u64::from(config.max_tokens)).ok()?;
     let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
         .messages(api_messages)
+        .wire_budget(wire_budget)
         .build();
 
     // Run the API call with cancellation support.
@@ -138,7 +142,10 @@ mod tests {
     #[test]
     fn default_config_uses_haiku() {
         let cfg = AwaySummaryConfig::default();
-        assert!(cfg.model.contains("haiku"), "default model should be a Haiku variant");
+        assert!(
+            cfg.model.contains("haiku"),
+            "default model should be a Haiku variant"
+        );
         assert_eq!(cfg.max_tokens, 300);
     }
 

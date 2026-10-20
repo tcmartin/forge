@@ -1,12 +1,12 @@
 //! Slash-command catalog and dispatch.
 
-use claurst_core::config::Theme;
-use claurst_core::types::Role;
-use crate::notifications::NotificationKind;
-use crate::overlays::HelpEntry;
-use super::App;
 use super::run::open_file_externally;
 use super::try_copy_to_clipboard;
+use super::App;
+use crate::notifications::NotificationKind;
+use crate::overlays::HelpEntry;
+use claurst_core::config::Theme;
+use claurst_core::types::Role;
 
 pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
@@ -31,19 +31,34 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
-    ("import-config", "Import CLAUDE.md and settings.json from ~/.claude"),
+    (
+        "import-config",
+        "Import CLAUDE.md and settings.json from ~/.claude",
+    ),
     ("init", "Initialize AGENTS.md for this project"),
-    ("insights", "Generate a session analysis report with conversation statistics"),
+    (
+        "insights",
+        "Generate a session analysis report with conversation statistics",
+    ),
     ("keybindings", "Show keybinding configuration"),
     ("links", "Open URLs from this session in your browser"),
     ("login", "Log in to Claurst"),
     ("logout", "Log out of Claurst"),
-    ("managed-agents", "Configure manager-executor managed agent system"),
+    (
+        "managed-agents",
+        "Configure manager-executor managed agent system",
+    ),
     ("mcp", "Browse configured MCP servers"),
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
-    ("move", "Re-home this session to another worktree of the same project"),
-    ("new", "Start a fresh session (keeps model, provider & directory)"),
+    (
+        "move",
+        "Re-home this session to another worktree of the same project",
+    ),
+    (
+        "new",
+        "Start a fresh session (keeps model, provider & directory)",
+    ),
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("providers", "List available AI providers and their status"),
@@ -58,21 +73,37 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
-    ("share", "Upload the current session as a secret gist and get a shareable URL"),
+    (
+        "share",
+        "Upload the current session as a secret gist and get a shareable URL",
+    ),
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
-    ("ultrareview", "Run an exhaustive multi-dimensional code review"),
-    ("update", "Check for updates and upgrade to the latest version"),
-    ("upgrade", "Check for updates and upgrade to the latest version"),
+    (
+        "ultrareview",
+        "Run an exhaustive multi-dimensional code review",
+    ),
+    (
+        "update",
+        "Check for updates and upgrade to the latest version",
+    ),
+    (
+        "upgrade",
+        "Check for updates and upgrade to the latest version",
+    ),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
 
 pub(super) fn help_command_category(name: &str) -> &'static str {
     match name {
-        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
-        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
+        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => {
+            "Model & Provider"
+        }
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => {
+            "Review & History"
+        }
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
@@ -215,14 +246,22 @@ impl App {
             }
             "vim" => {
                 self.prompt_input.vim_enabled = !self.prompt_input.vim_enabled;
-                let status = if self.prompt_input.vim_enabled { "enabled" } else { "disabled" };
+                let status = if self.prompt_input.vim_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 self.status_message = Some(format!("Vim mode {}.", status));
                 self.refresh_prompt_input();
                 true
             }
             "fast" => {
                 self.fast_mode = !self.fast_mode;
-                let status = if self.fast_mode { "enabled" } else { "disabled" };
+                let status = if self.fast_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 self.status_message = Some(format!("Fast mode {}.", status));
                 true
             }
@@ -248,7 +287,10 @@ impl App {
             }
             "copy" => {
                 // Copy last assistant message to clipboard. Attempt arboard; fall back to notification.
-                let last = self.messages.iter().rev()
+                let last = self
+                    .messages
+                    .iter()
+                    .rev()
                     .find(|m| m.role == Role::Assistant)
                     .map(|m| m.get_all_text());
                 if let Some(text) = last {
@@ -263,7 +305,10 @@ impl App {
                     } else {
                         self.push_notification(
                             NotificationKind::Info,
-                            format!("Last response: {} chars (clipboard unavailable)", text.len()),
+                            format!(
+                                "Last response: {} chars (clipboard unavailable)",
+                                text.len()
+                            ),
                             Some(5),
                         );
                     }
@@ -295,11 +340,8 @@ impl App {
                     .model_name
                     .strip_prefix(&format!("{}/", provider))
                     .unwrap_or(&self.model_name);
-                let levels = claurst_api::supported_efforts(
-                    provider,
-                    model_id,
-                    Some(&self.model_registry),
-                );
+                let levels =
+                    claurst_api::supported_efforts(provider, model_id, Some(&self.model_registry));
                 self.effort_picker.open(self.effort_level, levels);
                 true
             }
@@ -331,9 +373,8 @@ impl App {
                     }
                     self.voice_recorder = Some(recorder);
                     self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message = Some(
-                        "Voice mode enabled. Press Alt+V to start recording.".to_string(),
-                    );
+                    self.status_message =
+                        Some("Voice mode enabled. Press Alt+V to start recording.".to_string());
                 }
                 true
             }
@@ -369,7 +410,8 @@ impl App {
             }
             "keybindings" => {
                 // Open the keybindings.json file in the external editor
-                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
+                let keybindings_path =
+                    claurst_core::config::Settings::config_dir().join("keybindings.json");
 
                 if let Err(e) = open_file_externally(&keybindings_path) {
                     eprintln!("Failed to open keybindings file: {}", e);
@@ -387,5 +429,4 @@ impl App {
             _ => false,
         }
     }
-
 }

@@ -74,7 +74,7 @@ impl FeatureFlagManager {
         }
     }
 
-    /// Get the cache file path (~/.claurst/feature_flags.json)
+    /// Get the cache path under the configured application data root.
     fn get_cache_path() -> PathBuf {
         crate::config::Settings::config_dir().join("feature_flags.json")
     }
@@ -110,16 +110,16 @@ impl FeatureFlagManager {
         match self.fetch_from_api().await {
             Ok(cached) => {
                 // Save to cache
-                if let Err(e) = self.save_cached_flags(&cached).await {
-                    warn!("Failed to save feature flags cache: {}", e);
+                if self.save_cached_flags(&cached).await.is_err() {
+                    warn!("Failed to save feature flags cache");
                     // Don't fail the whole operation if we can't save cache
                 }
                 self.update_flags_from_cached(&cached);
                 Ok(())
             }
-            Err(e) => {
+            Err(_) => {
                 // If API fetch fails, try to use stale cache
-                warn!("Failed to fetch from GrowthBook API: {}", e);
+                warn!("Failed to fetch from GrowthBook API");
                 if let Ok(cached) = self.load_cached_flags().await {
                     debug!("Using stale cached feature flags as fallback");
                     self.update_flags_from_cached(&cached);
@@ -152,9 +152,8 @@ impl FeatureFlagManager {
         let status = response.status();
         if !status.is_success() {
             return Err(anyhow!(
-                "GrowthBook API returned status {}: {}",
-                status.as_u16(),
-                response.text().await.unwrap_or_default()
+                "GrowthBook API returned status {}",
+                status.as_u16()
             ));
         }
 
@@ -234,10 +233,11 @@ mod tests {
     #[test]
     fn test_cache_path() {
         let path = FeatureFlagManager::get_cache_path();
-        // "claurst" (not ".claurst"): the config dir is legacy ~/.claurst on
-        // existing installs but XDG ~/.config/claurst on fresh ones (#207).
-        assert!(path.to_string_lossy().contains("claurst"));
-        assert!(path.to_string_lossy().contains("feature_flags.json"));
+        assert_eq!(
+            path.parent(),
+            Some(crate::config::Settings::config_dir().as_path())
+        );
+        assert_eq!(path.file_name().unwrap(), "feature_flags.json");
     }
 
     #[test]

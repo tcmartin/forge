@@ -14,6 +14,7 @@
 // Only Claude models on Bedrock are officially supported by this adapter.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -21,15 +22,16 @@ use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::Stream;
 use serde_json::{json, Value};
-use tracing::debug;
 
 use crate::error_handling::parse_error_response;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamEvent, SystemPrompt, SystemPromptStyle,
 };
+use crate::provider_wire::{preflight_provider_request, tool_result_text};
 
 use super::message_normalization::remove_empty_messages;
 use super::request_options::merge_bedrock_options;
@@ -40,15 +42,32 @@ use super::request_options::merge_bedrock_options;
 
 pub struct BedrockProvider {
     id: ProviderId,
+    base_url: String,
     region: String,
     http_client: reqwest::Client,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
     bearer_token: Option<String>,
+    inference_admission: Arc<InferenceAdmission>,
 }
 
 impl BedrockProvider {
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        Self {
+            id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            http_client: reqwest::Client::new(),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            bearer_token: None,
+            inference_admission: InferenceAdmission::process(),
+        }
+    }
+
     pub fn from_env() -> Option<Self> {
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -63,12 +82,14 @@ impl BedrockProvider {
         if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
             return Some(Self {
                 id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+                base_url: format!("https://bedrock-runtime.{region}.amazonaws.com"),
                 region,
                 http_client,
                 access_key_id: None,
                 secret_access_key: None,
                 session_token: None,
                 bearer_token: Some(token),
+                inference_admission: InferenceAdmission::process(),
             });
         }
 
@@ -79,13 +100,37 @@ impl BedrockProvider {
 
         Some(Self {
             id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+            base_url: format!("https://bedrock-runtime.{region}.amazonaws.com"),
             region,
             http_client,
             access_key_id: Some(key),
             secret_access_key: Some(secret),
             session_token: session,
             bearer_token: None,
+            inference_admission: InferenceAdmission::process(),
         })
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    /// Override the Bedrock-compatible runtime API root.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     /// Add a regional cross-inference prefix for models that support it.
@@ -107,8 +152,16 @@ impl BedrockProvider {
 
     fn endpoint_url(&self, model_id: &str) -> String {
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse-stream",
-            self.region,
+            "{}/model/{}/converse-stream",
+            self.base_url,
+            urlencoding::encode(model_id)
+        )
+    }
+
+    fn non_streaming_endpoint_url(&self, model_id: &str) -> String {
+        format!(
+            "{}/model/{}/converse",
+            self.base_url,
             urlencoding::encode(model_id)
         )
     }
@@ -157,7 +210,11 @@ impl BedrockProvider {
         });
         let canonical_uri = {
             let p = parsed.path();
-            if p.is_empty() { "/".to_string() } else { p.to_string() }
+            if p.is_empty() {
+                "/".to_string()
+            } else {
+                p.to_string()
+            }
         };
         let canonical_query = parsed.query().unwrap_or("").to_string();
 
@@ -175,8 +232,7 @@ impl BedrockProvider {
             "content-type:{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
             content_type, host, body_hash, datetime_str
         );
-        let mut signed_headers =
-            "content-type;host;x-amz-content-sha256;x-amz-date".to_string();
+        let mut signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date".to_string();
 
         if let Some(ref tok) = self.session_token {
             canonical_headers.push_str(&format!("x-amz-security-token:{}\n", tok));
@@ -186,19 +242,12 @@ impl BedrockProvider {
         // Canonical request.
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
-            method,
-            canonical_uri,
-            canonical_query,
-            canonical_headers,
-            signed_headers,
-            body_hash
+            method, canonical_uri, canonical_query, canonical_headers, signed_headers, body_hash
         );
 
         // String to sign.
-        let credential_scope =
-            format!("{}/{}/{}/aws4_request", date_str, region, service);
-        let canonical_request_hash =
-            hex::encode(Sha256::digest(canonical_request.as_bytes()));
+        let credential_scope = format!("{}/{}/{}/aws4_request", date_str, region, service);
+        let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
             datetime_str, credential_scope, canonical_request_hash
@@ -207,37 +256,31 @@ impl BedrockProvider {
         // Signing key: HMAC-SHA256 chain.
         let sign_key = {
             let k_date = {
-                let mut mac = HmacSha256::new_from_slice(
-                    format!("AWS4{}", secret_key).as_bytes(),
-                )
-                .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(format!("AWS4{}", secret_key).as_bytes())
+                    .expect("HMAC init failed");
                 mac.update(date_str.as_bytes());
                 mac.finalize().into_bytes()
             };
             let k_region = {
-                let mut mac = HmacSha256::new_from_slice(&k_date)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_date).expect("HMAC init failed");
                 mac.update(region.as_bytes());
                 mac.finalize().into_bytes()
             };
             let k_service = {
-                let mut mac = HmacSha256::new_from_slice(&k_region)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_region).expect("HMAC init failed");
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            
+
             {
-                let mut mac = HmacSha256::new_from_slice(&k_service)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_service).expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
             }
         };
 
         let signature = {
-            let mut mac =
-                HmacSha256::new_from_slice(&sign_key).expect("HMAC init failed");
+            let mut mac = HmacSha256::new_from_slice(&sign_key).expect("HMAC init failed");
             mac.update(string_to_sign.as_bytes());
             hex::encode(mac.finalize().into_bytes())
         };
@@ -342,6 +385,22 @@ impl BedrockProvider {
         }
     }
 
+    fn tool_result_has_images(content: &ToolResultContent, depth: usize) -> bool {
+        if depth > claurst_core::media::MediaLimits::default().max_nesting {
+            return false;
+        }
+        match content {
+            ToolResultContent::Text(_) => false,
+            ToolResultContent::Blocks(blocks) => blocks.iter().any(|block| match block {
+                ContentBlock::Image { .. } => true,
+                ContentBlock::ToolResult { content, .. } => {
+                    Self::tool_result_has_images(content, depth + 1)
+                }
+                _ => false,
+            }),
+        }
+    }
+
     // `role` is threaded through to the recursive calls for tool-result blocks
     // to keep the Converse mapping symmetric; keep the parameter rather than
     // dropping it and changing the recursion's shape.
@@ -356,24 +415,20 @@ impl BedrockProvider {
                     .as_deref()
                     .unwrap_or("image/png")
                     .replace("image/", "");
-                if let Some(data) = &source.data {
-                    Some(json!({
+                source.data.as_ref().map(|data| {
+                    json!({
                         "image": {
                             "format": media_type,
                             "source": {
                                 "bytes": data
                             }
                         }
-                    }))
-                } else if let Some(url) = &source.url {
-                    // Bedrock doesn't support URL images natively; skip.
-                    debug!("Bedrock does not support URL images: {}", url);
-                    None
-                } else {
-                    None
-                }
+                    })
+                })
             }
-            ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some(json!({
                 "toolUse": {
                     "toolUseId": id,
                     "name": name,
@@ -387,6 +442,9 @@ impl BedrockProvider {
             } => {
                 let result_content = match content {
                     ToolResultContent::Text(t) => vec![json!({ "text": t })],
+                    ToolResultContent::Blocks(_) if !Self::tool_result_has_images(content, 0) => {
+                        vec![json!({ "text": tool_result_text(content) })]
+                    }
                     ToolResultContent::Blocks(inner) => inner
                         .iter()
                         .filter_map(|b| Self::content_block_to_converse(b, role))
@@ -425,15 +483,27 @@ impl BedrockProvider {
     async fn send_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, AdmissionLease), ProviderError> {
+        let selected = preflight_provider_request(ProviderId::AMAZON_BEDROCK, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
         let bedrock_model = self.model_id_with_prefix(&request.model);
         let url = self.endpoint_url(&bedrock_model);
 
         let body = Self::build_converse_body(request);
-        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let prepared = selected
+            .prepare_json(&url, true, &body)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+        let body_str =
+            String::from_utf8(prepared.into_body()).map_err(|_| ProviderError::Other {
+                provider: self.id.clone(),
+                message: "prepared JSON body was not UTF-8".into(),
+                status: None,
+                body: None,
+            })?;
 
         let now = chrono::Utc::now();
         let auth_headers = self.sign_request("POST", &url, &body_str, &now);
+        let admission = self.acquire_inference().await?;
 
         let mut req_builder = self
             .http_client
@@ -462,26 +532,34 @@ impl BedrockProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        Ok(resp)
+        Ok((resp, admission))
     }
 
     async fn send_non_streaming(
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        let selected = preflight_provider_request(ProviderId::AMAZON_BEDROCK, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
         let bedrock_model = self.model_id_with_prefix(&request.model);
         // Non-streaming uses /converse (not /converse-stream)
-        let url = format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-            self.region,
-            urlencoding::encode(&bedrock_model)
-        );
+        let url = self.non_streaming_endpoint_url(&bedrock_model);
 
         let body = Self::build_converse_body(request);
-        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let prepared = selected
+            .prepare_json(&url, false, &body)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+        let body_str =
+            String::from_utf8(prepared.into_body()).map_err(|_| ProviderError::Other {
+                provider: self.id.clone(),
+                message: "prepared JSON body was not UTF-8".into(),
+                status: None,
+                body: None,
+            })?;
 
         let now = chrono::Utc::now();
         let auth_headers = self.sign_request("POST", &url, &body_str, &now);
+        let _admission = self.acquire_inference().await?;
 
         let mut req_builder = self
             .http_client
@@ -544,9 +622,8 @@ impl BedrockProvider {
                 body: None,
             })?;
 
-        let content_blocks = Self::parse_converse_content(
-            message.get("content").and_then(|c| c.as_array()),
-        );
+        let content_blocks =
+            Self::parse_converse_content(message.get("content").and_then(|c| c.as_array()));
 
         let stop_reason_str = json
             .get("stopReason")
@@ -624,14 +701,8 @@ impl BedrockProvider {
             None => return UsageInfo::default(),
         };
         UsageInfo {
-            input_tokens: u
-                .get("inputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: u
-                .get("outputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            input_tokens: u.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            output_tokens: u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         }
@@ -656,6 +727,7 @@ impl LlmProvider for BedrockProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         self.send_non_streaming(&request).await
     }
 
@@ -664,7 +736,8 @@ impl LlmProvider for BedrockProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.send_streaming(&request).await?;
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let (resp, admission) = self.send_streaming(&request).await?;
         let provider_id = self.id.clone();
 
         // TODO(#228): this AWS event-stream framing + Converse event decode is the
@@ -724,7 +797,7 @@ impl LlmProvider for BedrockProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -765,7 +838,7 @@ impl LlmProvider for BedrockProvider {
             tool_calling: true,
             thinking: true,
             image_input: true,
-            pdf_input: true,
+            pdf_input: false,
             audio_input: false,
             video_input: false,
             caching: true,
@@ -845,7 +918,9 @@ fn parse_bedrock_event(
         } else {
             events.push(Ok(StreamEvent::ContentBlockStart {
                 index,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             }));
         }
         return events;
@@ -865,7 +940,9 @@ fn parse_bedrock_event(
             }));
             events.push(Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             }));
             *message_started = true;
         }
@@ -1163,7 +1240,11 @@ fn drain_event_stream_frames(
 mod tests {
     use super::*;
     use claurst_core::provider_id::ProviderId;
+    use claurst_core::types::{ImageSource, Message};
     use serde_json::Value;
+
+    const TINY_PNG: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
     /// Build a valid AWS event-stream frame carrying a single `:event-type`
     /// string header plus the given JSON payload (prelude + headers + payload +
@@ -1295,5 +1376,117 @@ mod tests {
     fn reports_incomplete_when_prelude_missing() {
         // Fewer than the 12 prelude bytes: cannot know the frame length yet.
         assert!(parse_event_stream_frame(&[0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn converse_tool_result_text_keeps_empty_and_nested_slots_without_newlines() {
+        let content = MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_nested".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::Text {
+                    text: String::new(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "inner".into(),
+                    content: ToolResultContent::Blocks(vec![
+                        ContentBlock::Text { text: "é".into() },
+                        ContentBlock::Text { text: "b".into() },
+                    ]),
+                    is_error: None,
+                },
+            ]),
+            is_error: None,
+        }]);
+
+        let wire = BedrockProvider::message_content_to_converse(&content, &Role::User);
+        assert_eq!(wire[0]["toolResult"]["content"][0]["text"], "aéb");
+    }
+
+    #[test]
+    fn converse_body_preserves_text_and_nested_native_images() {
+        let image = ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".into(),
+                media_type: Some("image/png".into()),
+                data: Some(TINY_PNG.into()),
+                url: None,
+            },
+        };
+        let request = ProviderRequest {
+            model: "anthropic.claude-sonnet-4-6".into(),
+            messages: vec![Message::user_blocks(vec![
+                ContentBlock::Text {
+                    text: "keep this text".into(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: ToolResultContent::Blocks(vec![image]),
+                    is_error: None,
+                },
+            ])],
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: Some(
+                crate::provider_wire::WireBudget::finite(
+                    30_000,
+                    20_000,
+                    1_000,
+                    50_000,
+                    crate::provider_wire::MediaAccounting::None,
+                )
+                .unwrap(),
+            ),
+            dispatch: None,
+        };
+
+        let body = BedrockProvider::build_converse_body(&request);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "keep this text");
+        assert_eq!(
+            body["messages"][0]["content"][1]["toolResult"]["content"][0]["image"]["source"]
+                ["bytes"],
+            TINY_PNG
+        );
+
+        let selected = preflight_provider_request(ProviderId::AMAZON_BEDROCK, &request)
+            .expect("canonical Bedrock media should preflight");
+        let prepared = selected
+            .prepare_json("/model/test/converse", true, &body)
+            .expect("normalized Bedrock body should match canonical media");
+        assert!(matches!(
+            prepared.media(),
+            crate::provider_wire::MediaAccounting::Images(_)
+        ));
+
+        let mut dropped = body.clone();
+        dropped["messages"][0]["content"][1]["toolResult"]["content"] = json!([]);
+        assert!(matches!(
+            selected.prepare_json("/model/test/converse", true, &dropped),
+            Err(crate::provider_wire::WireBudgetError::MediaMismatch)
+        ));
+
+        let mut extra = body;
+        extra["messages"][0]["content"][1]["toolResult"]["content"]
+            .as_array_mut()
+            .expect("tool result content should be an array")
+            .push(json!({
+                "image": {
+                    "format": "png",
+                    "source": { "bytes": TINY_PNG }
+                }
+            }));
+        assert!(matches!(
+            selected.prepare_json("/model/test/converse", true, &extra),
+            Err(crate::provider_wire::WireBudgetError::MediaMismatch)
+        ));
     }
 }

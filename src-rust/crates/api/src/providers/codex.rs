@@ -13,6 +13,7 @@
 //   so we use the `CODEX_MODELS` constant from `claurst-core`.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,15 +30,27 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::error_handling::parse_error_response;
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus,
+    ResponseContinuationSupport, StopReason, StreamEvent, SystemPromptStyle,
+};
+use crate::provider_wire::prepare_provider_json;
+use crate::provider_witness::{
+    NativeResponseBinding, PreparedWitnessAttempt, ProviderWireWitnessSeed, WireAttemptOutcome,
 };
 
 // Re-use Copilot's message translation helpers via the public Copilot type.
 use crate::providers::copilot::CopilotProvider;
+
+const MAX_CODEX_SSE_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_CODEX_SSE_LINE_BYTES: usize = 256 * 1024;
+const MAX_CODEX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_CODEX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAX_CODEX_TOOL_CALLS: usize = 256;
+const MAX_CODEX_OUTPUT_ITEMS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // CodexProvider
@@ -46,22 +59,63 @@ use crate::providers::copilot::CopilotProvider;
 pub struct CodexProvider {
     id: ProviderId,
     http_client: reqwest::Client,
+    api_endpoint: String,
     /// Mutable token cache: updated in-place when a refresh succeeds.
     tokens: Arc<Mutex<CodexTokens>>,
+    inference_admission: Arc<InferenceAdmission>,
+    response_continuation_enabled: bool,
+    response_continuation_rejected: AtomicBool,
 }
 
 impl CodexProvider {
     pub fn new(tokens: CodexTokens) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(crate::request_timeout())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build reqwest client");
 
         Self {
             id: ProviderId::new(ProviderId::CODEX),
             http_client,
+            api_endpoint: CODEX_API_ENDPOINT.to_string(),
             tokens: Arc::new(Mutex::new(tokens)),
+            inference_admission: InferenceAdmission::process(),
+            response_continuation_enabled: false,
+            response_continuation_rejected: AtomicBool::new(false),
         }
+    }
+
+    /// Override the Responses endpoint while retaining the Codex wire shape.
+    /// This is used by bounded loopback fixtures and private compatible hosts.
+    pub fn with_base_url(mut self, api_endpoint: impl Into<String>) -> Self {
+        self.api_endpoint = api_endpoint.into();
+        self
+    }
+
+    /// Enable response-ID continuation for an explicitly compatible Responses
+    /// route. The stock Codex HTTP/SSE route remains disabled because its
+    /// `store: false` contract does not provide WebSocket-scoped state.
+    pub fn with_response_continuation(mut self) -> Self {
+        self.response_continuation_enabled = true;
+        self.response_continuation_rejected = AtomicBool::new(false);
+        self
+    }
+
+    /// Inject a process admission service, primarily for bounded tests.
+    pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+        self.inference_admission = admission;
+        self
+    }
+
+    async fn acquire_inference(&self) -> Result<AdmissionLease, ProviderError> {
+        self.inference_admission
+            .acquire()
+            .await
+            .map_err(|error| ProviderError::AdmissionRejected {
+                provider: self.id.clone(),
+                error,
+            })
     }
 
     /// Construct from stored tokens; returns `None` if no tokens are saved.
@@ -202,8 +256,8 @@ impl CodexProvider {
         }
         updated.expires_at = new_expires_at;
 
-        if let Err(e) = save_codex_tokens(&updated) {
-            warn!("Failed to persist refreshed Codex tokens: {}", e);
+        if save_codex_tokens(&updated).is_err() {
+            warn!("Failed to persist refreshed Codex tokens");
         }
 
         {
@@ -252,14 +306,21 @@ impl CodexProvider {
     }
 
     /// Build the Responses-API request body for Codex.
-    fn build_responses_body(request: &ProviderRequest) -> Value {
-        // Re-use the same message translation that the Copilot provider uses.
-        let input = CopilotProvider::to_responses_input_pub(request);
+    fn build_responses_body(request: &ProviderRequest, allow_response_continuation: bool) -> Value {
+        let response_continuation = allow_response_continuation
+            .then(|| request.validated_response_continuation())
+            .flatten();
+        let messages = response_continuation.map_or(request.messages.as_slice(), |continuation| {
+            &request.messages[continuation.message_prefix_len()..]
+        });
+        // Codex carries system text in top-level `instructions`; omit it from
+        // Responses input to keep one stable prefix and avoid duplicate policy.
+        let input = CopilotProvider::to_responses_messages_pub(messages);
         let instructions = Self::system_prompt_to_text(request);
 
         let tools: Vec<Value> = request
-            .tools
-            .iter()
+            .stable_tools()
+            .into_iter()
             .map(|tool| {
                 json!({
                     "type": "function",
@@ -275,8 +336,16 @@ impl CodexProvider {
             "model": request.model,
             "input": input,
             "instructions": instructions,
+            "max_output_tokens": request.max_tokens,
             "store": false,
         });
+
+        if let Some(scope) = request.cache_scope.as_ref() {
+            body["prompt_cache_key"] = json!(scope.key());
+        }
+        if let Some(continuation) = response_continuation {
+            body["previous_response_id"] = json!(continuation.previous_response_id());
+        }
 
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -292,62 +361,158 @@ impl CodexProvider {
         body
     }
 
-    fn extract_stream_error_message(json_val: &Value) -> String {
-        json_val
-            .pointer("/error/message")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                json_val
-                    .pointer("/response/error/message")
-                    .and_then(|value| value.as_str())
-            })
-            .or_else(|| {
-                json_val
-                    .pointer("/message")
-                    .and_then(|value| value.as_str())
-            })
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| json_val.to_string())
+    fn continuation_rejected(status: u16, body: &str) -> bool {
+        matches!(status, 400 | 404) && {
+            let lower = body.to_ascii_lowercase();
+            lower.contains("previous_response_id")
+                || lower.contains("previous response")
+                || lower.contains("previous_response_not_found")
+        }
+    }
+
+    fn can_continue_response(&self) -> bool {
+        self.response_continuation_enabled
+            && !self.response_continuation_rejected.load(Ordering::Acquire)
+    }
+
+    fn stream_error(message: impl Into<String>) -> ProviderError {
+        ProviderError::StreamError {
+            provider: ProviderId::new(ProviderId::CODEX),
+            message: message.into(),
+            partial_response: None,
+        }
+    }
+
+    fn required_output_index(value: &Value, event: &str) -> Result<usize, String> {
+        value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| format!("Codex {event} lacks output_index"))
+    }
+
+    fn valid_function_arguments(arguments: &str) -> bool {
+        serde_json::from_str::<Value>(arguments)
+            .map(|value| value.is_object())
+            .unwrap_or(false)
+    }
+
+    fn register_output_item_kind(
+        output_item_kinds: &mut std::collections::HashMap<usize, &'static str>,
+        output_index: usize,
+        kind: &'static str,
+    ) -> Result<(), String> {
+        if let Some(existing) = output_item_kinds.get(&output_index) {
+            if *existing != kind {
+                return Err(format!(
+                    "Codex output index changed kind from {existing} to {kind}"
+                ));
+            }
+            return Ok(());
+        }
+        if output_item_kinds.len() >= MAX_CODEX_OUTPUT_ITEMS {
+            return Err("Codex output item count exceeded the bound".to_string());
+        }
+        output_item_kinds.insert(output_index, kind);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // HTTP call
     // -----------------------------------------------------------------------
 
+    async fn post_responses_body(
+        &self,
+        token: &str,
+        account_id: Option<&str>,
+        accept: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let builder = self
+            .http_client
+            .post(&self.api_endpoint)
+            .header("Content-Type", "application/json")
+            .header("Accept", accept);
+        self.codex_headers(builder, token, account_id)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("HTTP request failed: {error}"),
+                status: None,
+                body: None,
+            })
+    }
+
     async fn send_responses_request(
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        let body = Self::build_responses_body(request, self.can_continue_response());
+        let used_continuation = body.get("previous_response_id").is_some();
+        // Run all local validation before checking or refreshing OAuth. A
+        // rejected request must not cause remote token traffic.
+        let prepared = prepare_provider_json("codex", &self.api_endpoint, false, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+        let full_context = if used_continuation {
+            let full_body = Self::build_responses_body(request, false);
+            Some(
+                prepare_provider_json("codex", &self.api_endpoint, false, &full_body, request)
+                    .map_err(|error| ProviderError::budget(self.id.clone(), error))?,
+            )
+        } else {
+            None
+        };
         let token = self.access_token().await?;
         let account_id = self.account_id();
+        let _admission = self.acquire_inference().await?;
 
-        let body = Self::build_responses_body(request);
-
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
+        let mut resp = self
+            .post_responses_body(
+                &token,
+                account_id.as_deref(),
+                "application/json",
+                prepared.into_body(),
+            )
+            .await?;
+        let mut status = resp.status().as_u16();
+        let mut text = resp.text().await.map_err(|error| ProviderError::Other {
             provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
+            message: format!("Failed to read response body: {error}"),
             status: Some(status),
             body: None,
         })?;
+
+        if used_continuation
+            && !(200..300).contains(&(status as usize))
+            && Self::continuation_rejected(status, &text)
+        {
+            self.response_continuation_rejected
+                .store(true, Ordering::Release);
+            debug!(
+                status,
+                "Codex route rejected response continuation; retrying full context once"
+            );
+            let Some(full_context) = full_context else {
+                return Err(parse_error_response(status, &text, &self.id));
+            };
+            resp = self
+                .post_responses_body(
+                    &token,
+                    account_id.as_deref(),
+                    "application/json",
+                    full_context.into_body(),
+                )
+                .await?;
+            status = resp.status().as_u16();
+            text = resp.text().await.map_err(|error| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Failed to read response body: {error}"),
+                status: Some(status),
+                body: None,
+            })?;
+        }
 
         if !(200..300).contains(&(status as usize)) {
             return Err(parse_error_response(status, &text, &self.id));
@@ -366,43 +531,111 @@ impl CodexProvider {
     async fn send_responses_streaming_request(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<
+        (
+            reqwest::Response,
+            AdmissionLease,
+            Option<ProviderWireWitnessSeed>,
+        ),
+        ProviderError,
+    > {
+        let mut body = Self::build_responses_body(request, self.can_continue_response());
+        let used_continuation = body.get("previous_response_id").is_some();
+        body["stream"] = json!(true);
+        let prepared = prepare_provider_json("codex", &self.api_endpoint, true, &body, request)
+            .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+        let initial_witness =
+            PreparedWitnessAttempt::from_prepared(&prepared, 0, used_continuation);
+        let full_context = if used_continuation {
+            let mut full_body = Self::build_responses_body(request, false);
+            full_body["stream"] = json!(true);
+            let prepared =
+                prepare_provider_json("codex", &self.api_endpoint, true, &full_body, request)
+                    .map_err(|error| ProviderError::budget(self.id.clone(), error))?;
+            Some((
+                PreparedWitnessAttempt::from_prepared(&prepared, 1, false),
+                prepared,
+            ))
+        } else {
+            None
+        };
         let token = self.access_token().await?;
         let account_id = self.account_id();
+        let admission = self.acquire_inference().await?;
 
-        let mut body = Self::build_responses_body(request);
-        body["stream"] = json!(true);
-
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
+        let mut attempts = Vec::with_capacity(2);
+        let mut resp = self
+            .post_responses_body(
+                &token,
+                account_id.as_deref(),
+                "text/event-stream",
+                prepared.into_body(),
+            )
+            .await?;
+        let mut status = resp.status().as_u16();
+        if used_continuation && !(200..300).contains(&(status as usize)) {
+            let text = resp.text().await.map_err(|error| ProviderError::Other {
                 provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
+                message: format!("Failed to read response body: {error}"),
+                status: Some(status),
                 body: None,
             })?;
+            if Self::continuation_rejected(status, &text) {
+                attempts
+                    .push(initial_witness.finish(status, WireAttemptOutcome::RejectedContinuation));
+                self.response_continuation_rejected
+                    .store(true, Ordering::Release);
+                debug!(
+                    status,
+                    "Codex route rejected response continuation; retrying full context once"
+                );
+                let Some((full_witness, full_context)) = full_context else {
+                    return Err(parse_error_response(status, &text, &self.id));
+                };
+                resp = self
+                    .post_responses_body(
+                        &token,
+                        account_id.as_deref(),
+                        "text/event-stream",
+                        full_context.into_body(),
+                    )
+                    .await?;
+                status = resp.status().as_u16();
+                attempts.push(full_witness.finish(
+                    status,
+                    if (200..300).contains(&(status as usize)) {
+                        WireAttemptOutcome::Accepted
+                    } else {
+                        WireAttemptOutcome::Failed
+                    },
+                ));
+            } else {
+                attempts.push(initial_witness.finish(status, WireAttemptOutcome::Failed));
+                return Err(parse_error_response(status, &text, &self.id));
+            }
+        } else {
+            attempts.push(initial_witness.finish(
+                status,
+                if (200..300).contains(&(status as usize)) {
+                    WireAttemptOutcome::Accepted
+                } else {
+                    WireAttemptOutcome::Failed
+                },
+            ));
+        }
 
-        let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
-            let text = resp.text().await.map_err(|e| ProviderError::Other {
+            let text = resp.text().await.map_err(|error| ProviderError::Other {
                 provider: self.id.clone(),
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {error}"),
                 status: Some(status),
                 body: None,
             })?;
             return Err(parse_error_response(status, &text, &self.id));
         }
 
-        Ok(resp)
+        let witness_seed = ProviderWireWitnessSeed::try_new(attempts).ok();
+        Ok((resp, admission, witness_seed))
     }
 
     // -----------------------------------------------------------------------
@@ -542,7 +775,6 @@ impl CodexProvider {
             model,
         })
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +795,7 @@ impl LlmProvider for CodexProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
         self.send_responses_request(&request).await
     }
 
@@ -571,115 +804,121 @@ impl LlmProvider for CodexProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.send_responses_streaming_request(&request).await?;
+        crate::dispatch_request::reject_unsupported_dispatch(&self.id, request.dispatch.as_ref())?;
+        let (resp, admission, witness_seed) =
+            self.send_responses_streaming_request(&request).await?;
         let provider_id = self.id.clone();
 
         let s = stream! {
-            let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
-            let mut current_event = String::new();
-            let mut current_data: Vec<String> = Vec::new();
-            let mut message_started = false;
-            let mut message_id = String::from("unknown");
-            let mut model_name = String::from(DEFAULT_CODEX_MODEL);
-            let mut saw_tool_call = false;
-            let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                    let mut byte_stream = resp.bytes_stream();
+                    let mut decoder = crate::SseByteDecoder::new();
+                    let mut current_event = String::new();
+                    let mut current_data: Vec<String> = Vec::new();
+                    let mut current_data_bytes = 0_usize;
+                    let mut message_started = false;
+                    let mut message_id = String::from("unknown");
+                    let mut model_name = String::from(DEFAULT_CODEX_MODEL);
+                    let mut native_binding = NativeResponseBinding::default();
+                    let mut saw_tool_call = false;
+                    let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                    // Every output index has one immutable semantic kind.  Keeping
+                    // text and function-call indices in the same map prevents a
+                    // later event from reusing an index across kinds.
+                    let mut output_item_kinds: std::collections::HashMap<usize, &'static str> =
+                        std::collections::HashMap::new();
+                    let mut tool_call_indices_by_call_id: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    // Responses can send arguments in deltas, in a completion-only
+                    // `response.function_call_arguments.done`, or both. Keep one
+                    // bounded buffer per output index and bind finalization to the
+                    // function-call item's stable `id`.
+                    let mut tool_call_item_ids: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut tool_call_call_ids: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut tool_call_names: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut tool_call_indices_by_item_id: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    let mut tool_call_argument_buffers: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut finalized_tool_calls: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
+                    let mut finalized_tool_call_arguments: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    let mut completed_tool_call_items: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
+                    let mut completed_output_items: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
+                    let mut tool_argument_bytes = 0_usize;
 
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(chunk) => chunk,
-                    Err(e) => {
-                        yield Err(ProviderError::StreamError {
-                            provider: provider_id.clone(),
-                            message: format!("Stream read error: {}", e),
-                            partial_response: None,
-                        });
-                        return;
-                    }
-                };
-
-                let text = String::from_utf8_lossy(&chunk);
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for raw_line in lines {
-                    let line = raw_line.trim_end_matches('\r');
-
-                    if line.is_empty() {
-                        if current_data.is_empty() {
-                            current_event.clear();
-                            continue;
-                        }
-
-                        let data = current_data.join("\n");
-                        current_data.clear();
-                        let trimmed = data.trim();
-                        if trimmed.is_empty() || trimmed == "[DONE]" {
-                            current_event.clear();
-                            continue;
-                        }
-
-                        let json_val: Value = match serde_json::from_str(trimmed) {
-                            Ok(value) => value,
+                    while let Some(chunk_result) = byte_stream.next().await {
+                        let chunk = match chunk_result {
+                            Ok(chunk) => chunk,
                             Err(e) => {
                                 yield Err(ProviderError::StreamError {
                                     provider: provider_id.clone(),
-                                    message: format!("Failed to parse Codex stream JSON: {}", e),
-                                    partial_response: Some(trimmed.to_string()),
+                                    message: format!("Stream read error: {}", e),
+                                    partial_response: None,
                                 });
                                 return;
                             }
                         };
 
-                        let event_name = if current_event.is_empty() {
-                            json_val
-                                .get("type")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        } else {
-                            current_event.clone()
-                        };
+                        if chunk.len() > MAX_CODEX_SSE_CHUNK_BYTES {
+                            yield Err(Self::stream_error("Codex stream chunk exceeded the 1 MiB limit"));
+                            return;
+                        }
 
-                        match event_name.as_str() {
-                            "response.created" | "response.in_progress" => {
-                                if let Some(response) = json_val.get("response") {
-                                    if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
-                                        message_id = id.to_string();
-                                    }
-                                    if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
-                                        model_name = model.to_string();
-                                    }
-                                    if !message_started {
-                                        yield Ok(StreamEvent::MessageStart {
-                                            id: message_id.clone(),
-                                            model: model_name.clone(),
-                                            usage: UsageInfo::default(),
-                                        });
-                                        message_started = true;
-                                    }
-                                }
+                        for raw_line in decoder.push(&chunk) {
+                            if raw_line.len() > MAX_CODEX_SSE_LINE_BYTES {
+                                yield Err(Self::stream_error("Codex stream line exceeded the 256 KiB limit"));
+                                return;
                             }
-                            "response.output_item.added" => {
-                                let output_index = json_val
-                                    .get("output_index")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0) as usize;
-                                if let Some(item) = json_val.get("item") {
-                                    match item.get("type").and_then(|value| value.as_str()) {
-                                        Some("message") => {
-                                            if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                            let line = raw_line.trim_end_matches('\r');
+
+                            if line.is_empty() {
+                                if current_data.is_empty() {
+                                    current_event.clear();
+                                    continue;
+                                }
+
+                                let data = current_data.join("\n");
+                                current_data.clear();
+                                current_data_bytes = 0;
+                                let trimmed = data.trim();
+                                if trimmed.is_empty() || trimmed == "[DONE]" {
+                                    current_event.clear();
+                                    continue;
+                                }
+
+                                let json_val: Value = match serde_json::from_str(trimmed) {
+                                    Ok(value) => value,
+                                    Err(_) => {
+                                        yield Err(Self::stream_error("Codex stream contained malformed JSON"));
+                                        return;
+                                    }
+                                };
+
+                                let event_name = if current_event.is_empty() {
+                                    json_val
+                                        .get("type")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("")
+                                        .to_string()
+                                } else {
+                                    current_event.clone()
+                                };
+
+                                match event_name.as_str() {
+                                    "response.created" | "response.in_progress" => {
+                                        native_binding.observe(json_val.get("response"), false);
+                                        if let Some(response) = json_val.get("response") {
+                                            if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
                                                 message_id = id.to_string();
+                                            }
+                                            if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
+                                                model_name = model.to_string();
                                             }
                                             if !message_started {
                                                 yield Ok(StreamEvent::MessageStart {
@@ -690,42 +929,265 @@ impl LlmProvider for CodexProvider {
                                                 message_started = true;
                                             }
                                         }
-                                        Some("function_call") => {
-                                            saw_tool_call = true;
-                                            let call_id = item
-                                                .get("call_id")
-                                                .or_else(|| item.get("id"))
-                                                .and_then(|value| value.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let name = item
-                                                .get("name")
-                                                .and_then(|value| value.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            if open_blocks.insert(output_index) {
-                                                yield Ok(StreamEvent::ContentBlockStart {
-                                                    index: output_index,
-                                                    content_block: claurst_core::types::ContentBlock::ToolUse {
-                                                        id: call_id,
-                                                        name,
-                                                        input: json!({}),
-                                                        thought_signature: None,
-                                                    },
-                                                });
-                                            }
-                                        }
-                                        _ => {}
                                     }
-                                }
-                            }
-                            "response.content_part.added" => {
-                                let output_index = json_val
-                                    .get("output_index")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0) as usize;
-                                if let Some(part) = json_val.get("part") {
-                                    if matches!(part.get("type").and_then(|value| value.as_str()), Some("output_text") | Some("text")) {
+                                    "response.output_item.added" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "response.output_item.added",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        let Some(item) = json_val.get("item") else {
+                                            yield Err(Self::stream_error(
+                                                "Codex output item event lacks an item object",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex output item event lacks a string type",
+                                            ));
+                                            return;
+                                        };
+                                        if output_item_kinds.contains_key(&output_index) {
+                                            let message = if completed_output_items.contains(&output_index) {
+                                                "Codex output item arrived after completion"
+                                            } else {
+                                                "Codex output index was reused across output items"
+                                            };
+                                            yield Err(Self::stream_error(message));
+                                            return;
+                                        }
+                                        match item_type {
+                                                "message" => {
+                                                    if let Err(message) = Self::register_output_item_kind(
+                                                        &mut output_item_kinds,
+                                                        output_index,
+                                                        "text",
+                                                    ) {
+                                                        yield Err(Self::stream_error(message));
+                                                        return;
+                                                    }
+                                                    if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                                                        message_id = id.to_string();
+                                                    }
+                                                    if !message_started {
+                                                        yield Ok(StreamEvent::MessageStart {
+                                                            id: message_id.clone(),
+                                                            model: model_name.clone(),
+                                                            usage: UsageInfo::default(),
+                                                        });
+                                                        message_started = true;
+                                                    }
+                                                }
+                                                "function_call" => {
+                                                    saw_tool_call = true;
+                                                    if tool_call_item_ids.len() >= MAX_CODEX_TOOL_CALLS {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call count exceeded the bound",
+                                                        ));
+                                                        return;
+                                                    }
+                                                    let Some(item_id) = item
+                                                        .get("id")
+                                                        .and_then(|value| value.as_str())
+                                                        .filter(|value| !value.is_empty())
+                                                    else {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item lacks a stable id",
+                                                        ));
+                                                        return;
+                                                    };
+                                                    if tool_call_item_ids.contains_key(&output_index) {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call output index was duplicated",
+                                                        ));
+                                                        return;
+                                                    }
+                                                    if tool_call_indices_by_item_id
+                                                        .insert(item_id.to_string(), output_index)
+                                                        .is_some()
+                                                    {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item id was reused across output indices",
+                                                        ));
+                                                        return;
+                                                    }
+                                                    let call_id = item
+                                                        .get("call_id")
+                                                        .and_then(|value| value.as_str())
+                                                        .filter(|value| !value.is_empty())
+                                                        .map(str::to_string);
+                                                    let Some(call_id) = call_id else {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item lacks a stable call_id",
+                                                        ));
+                                                        return;
+                                                    };
+                                                    if let Some(existing) = tool_call_indices_by_call_id
+                                                        .insert(call_id.clone(), output_index)
+                                                    {
+                                                        if existing == output_index {
+                                                            yield Err(Self::stream_error(
+                                                                "Codex function_call call_id was duplicated",
+                                                            ));
+                                                            return;
+                                                        }
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call call_id was reused across output indices",
+                                                        ));
+                                                        return;
+                                                    }
+                                                    let Some(name) = item
+                                                        .get("name")
+                                                        .and_then(|value| value.as_str())
+                                                        .filter(|value| !value.is_empty())
+                                                        .map(str::to_string)
+                                                    else {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item lacks a stable name",
+                                                        ));
+                                                        return;
+                                                    };
+                                                    tool_call_item_ids.insert(output_index, item_id.to_string());
+                                                    if let Err(message) = Self::register_output_item_kind(
+                                                        &mut output_item_kinds,
+                                                        output_index,
+                                                        "function_call",
+                                                    ) {
+                                                        yield Err(Self::stream_error(message));
+                                                        return;
+                                                    }
+                                                    tool_call_call_ids.insert(output_index, call_id.clone());
+                                                    tool_call_names.insert(output_index, name.clone());
+                                                    tool_call_argument_buffers.entry(output_index).or_default();
+                                                    if open_blocks.insert(output_index) {
+                                                        yield Ok(StreamEvent::ContentBlockStart {
+                                                            index: output_index,
+                                                            content_block: claurst_core::types::ContentBlock::ToolUse {
+                                                                id: call_id,
+                                                                name,
+                                                                input: json!({}),
+                                                                thought_signature: None,
+                                                            },
+                                                        });
+                                                    }
+                                                }
+                                                _ => {
+                                                    if let Err(message) = Self::register_output_item_kind(
+                                                        &mut output_item_kinds,
+                                                        output_index,
+                                                        "other",
+                                                    ) {
+                                                        yield Err(Self::stream_error(message));
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                    }
+                                    "response.content_part.added" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "response.content_part.added",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        let Some(part) = json_val.get("part") else {
+                                            yield Err(Self::stream_error(
+                                                "Codex content part event lacks a part object",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(part_type) = part.get("type").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex content part event lacks a string type",
+                                            ));
+                                            return;
+                                        };
+                                        if matches!(part_type, "output_text" | "text") {
+                                            if completed_output_items.contains(&output_index) {
+                                                yield Err(Self::stream_error(
+                                                    "Codex content part arrived after output item completion",
+                                                ));
+                                                return;
+                                            }
+                                            if output_item_kinds.get(&output_index) == Some(&"function_call") {
+                                                yield Err(Self::stream_error(
+                                                    "Codex text content part reused a function_call output index",
+                                                ));
+                                                return;
+                                            }
+                                            if let Err(message) = Self::register_output_item_kind(
+                                                &mut output_item_kinds,
+                                                output_index,
+                                                "text",
+                                            ) {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                            if !message_started {
+                                                    yield Ok(StreamEvent::MessageStart {
+                                                        id: message_id.clone(),
+                                                        model: model_name.clone(),
+                                                        usage: UsageInfo::default(),
+                                                    });
+                                                    message_started = true;
+                                                }
+                                                if open_blocks.insert(output_index) {
+                                                    yield Ok(StreamEvent::ContentBlockStart {
+                                                        index: output_index,
+                                                        content_block: claurst_core::types::ContentBlock::Text {
+                                                            text: String::new(),
+                                                        },
+                                                    });
+                                                }
+                                        }
+                                    }
+                                    "response.output_text.delta" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "response.output_text.delta",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        let Some(delta) = json_val.get("delta").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex text delta event lacks a string delta",
+                                            ));
+                                            return;
+                                        };
+                                        if completed_output_items.contains(&output_index) {
+                                            yield Err(Self::stream_error(
+                                                "Codex text delta arrived after output item completion",
+                                            ));
+                                            return;
+                                        }
+                                        if output_item_kinds.get(&output_index) == Some(&"function_call") {
+                                            yield Err(Self::stream_error(
+                                                "Codex text delta reused a function_call output index",
+                                            ));
+                                            return;
+                                        }
+                                        if let Err(message) = Self::register_output_item_kind(
+                                            &mut output_item_kinds,
+                                            output_index,
+                                            "text",
+                                        ) {
+                                            yield Err(Self::stream_error(message));
+                                            return;
+                                        }
                                         if !message_started {
                                             yield Ok(StreamEvent::MessageStart {
                                                 id: message_id.clone(),
@@ -742,167 +1204,559 @@ impl LlmProvider for CodexProvider {
                                                 },
                                             });
                                         }
-                                    }
-                                }
-                            }
-                            "response.output_text.delta" => {
-                                let output_index = json_val
-                                    .get("output_index")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0) as usize;
-                                let delta = json_val
-                                    .get("delta")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("");
-                                if !message_started {
-                                    yield Ok(StreamEvent::MessageStart {
-                                        id: message_id.clone(),
-                                        model: model_name.clone(),
-                                        usage: UsageInfo::default(),
-                                    });
-                                    message_started = true;
-                                }
-                                if open_blocks.insert(output_index) {
-                                    yield Ok(StreamEvent::ContentBlockStart {
-                                        index: output_index,
-                                        content_block: claurst_core::types::ContentBlock::Text {
-                                            text: String::new(),
-                                        },
-                                    });
-                                }
-                                if !delta.is_empty() {
-                                    yield Ok(StreamEvent::TextDelta {
-                                        index: output_index,
-                                        text: delta.to_string(),
-                                    });
-                                }
-                            }
-                            "response.function_call_arguments.delta" => {
-                                let output_index = json_val
-                                    .get("output_index")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0) as usize;
-                                let delta = json_val
-                                    .get("delta")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("");
-                                if !delta.is_empty() {
-                                    yield Ok(StreamEvent::InputJsonDelta {
-                                        index: output_index,
-                                        partial_json: delta.to_string(),
-                                    });
-                                }
-                            }
-                            "response.output_item.done" => {
-                                let output_index = json_val
-                                    .get("output_index")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0) as usize;
-                                if open_blocks.remove(&output_index) {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
-                                }
-                            }
-                            "response.completed" => {
-                                if let Some(response) = json_val.get("response") {
-                                    if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
-                                        message_id = id.to_string();
-                                    }
-                                    if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
-                                        model_name = model.to_string();
-                                    }
-
-                                    if !message_started {
-                                        yield Ok(StreamEvent::MessageStart {
-                                            id: message_id.clone(),
-                                            model: model_name.clone(),
-                                            usage: UsageInfo::default(),
-                                        });
-                                        // No reassignment: this branch is the
-                                        // stream-completion handler — execution
-                                        // never re-enters the guard below.
-                                    }
-
-                                    let mut remaining: Vec<usize> = open_blocks.drain().collect();
-                                    remaining.sort_unstable();
-                                    for index in remaining {
-                                        yield Ok(StreamEvent::ContentBlockStop { index });
-                                    }
-
-                                    let usage_json = response.get("usage");
-                                    let usage = UsageInfo {
-                                        input_tokens: usage_json
-                                            .and_then(|value| value.get("input_tokens"))
-                                            .and_then(|value| value.as_u64())
-                                            .unwrap_or(0),
-                                        output_tokens: usage_json
-                                            .and_then(|value| value.get("output_tokens"))
-                                            .and_then(|value| value.as_u64())
-                                            .unwrap_or(0),
-                                        cache_creation_input_tokens: 0,
-                                        cache_read_input_tokens: usage_json
-                                            .and_then(|value| value.get("input_tokens_details"))
-                                            .and_then(|value| value.get("cached_tokens"))
-                                            .and_then(|value| value.as_u64())
-                                            .unwrap_or(0),
-                                    };
-
-                                    let stop_reason = if saw_tool_call {
-                                        StopReason::ToolUse
-                                    } else {
-                                        match response
-                                            .get("incomplete_details")
-                                            .and_then(|value| value.get("reason"))
-                                            .and_then(|value| value.as_str())
-                                        {
-                                            Some("max_output_tokens") => StopReason::MaxTokens,
-                                            Some("content_filter") => StopReason::ContentFiltered,
-                                            Some(other) if !other.is_empty() => StopReason::Other(other.to_string()),
-                                            _ => StopReason::EndTurn,
+                                        if !delta.is_empty() {
+                                            yield Ok(StreamEvent::TextDelta {
+                                                index: output_index,
+                                                text: delta.to_string(),
+                                            });
                                         }
-                                    };
+                                    }
+                                    "response.function_call_arguments.delta" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "function_call_arguments.delta",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        if output_item_kinds.get(&output_index) != Some(&"function_call") {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta lacks a prior function_call item",
+                                            ));
+                                            return;
+                                        }
+                                        if completed_output_items.contains(&output_index) {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta arrived after output item completion",
+                                            ));
+                                            return;
+                                        }
+                                        let Some(item_id) = json_val
+                                            .get("item_id")
+                                            .and_then(|value| value.as_str())
+                                            .filter(|value| !value.is_empty())
+                                        else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta lacks item_id",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(expected_item_id) = tool_call_item_ids.get(&output_index) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta lacks a prior item",
+                                            ));
+                                            return;
+                                        };
+                                        if expected_item_id != item_id {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta changed item identity",
+                                            ));
+                                            return;
+                                        }
+                                        let Some(delta) = json_val.get("delta").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta lacks a string delta",
+                                            ));
+                                            return;
+                                        };
+                                        if finalized_tool_calls.contains(&output_index) {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call arguments arrived after finalization",
+                                            ));
+                                            return;
+                                        }
+                                        let Some(buffer) = tool_call_argument_buffers.get_mut(&output_index) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call argument delta lacks a prior item",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(next_len) = buffer.len().checked_add(delta.len()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call arguments exceeded the bound",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(next_total) = tool_argument_bytes.checked_add(delta.len()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call arguments exceeded the bound",
+                                            ));
+                                            return;
+                                        };
+                                        if next_len > MAX_CODEX_TOOL_ARGUMENT_BYTES
+                                            || next_total > MAX_CODEX_TOOL_ARGUMENT_BYTES
+                                        {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call arguments exceeded the bound",
+                                            ));
+                                            return;
+                                        }
+                                        buffer.push_str(delta);
+                                        tool_argument_bytes = next_total;
+                                        if !delta.is_empty() {
+                                            yield Ok(StreamEvent::InputJsonDelta {
+                                                index: output_index,
+                                                partial_json: delta.to_string(),
+                                            });
+                                        }
+                                    }
+                                    "response.function_call_arguments.done" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "function_call_arguments.done",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        let Some(item_id) = json_val.get("item_id").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments lack item_id",
+                                            ));
+                                            return;
+                                        };
+                                        let Some(expected_item_id) = tool_call_item_ids.get(&output_index) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments lack a prior item",
+                                            ));
+                                            return;
+                                        };
+                                        if expected_item_id != item_id {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments changed item identity",
+                                            ));
+                                            return;
+                                        }
+                                        let Some(arguments) = json_val.get("arguments").and_then(|value| value.as_str()) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments lack arguments",
+                                            ));
+                                            return;
+                                        };
+                                        if !Self::valid_function_arguments(arguments) {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments were not a JSON object",
+                                            ));
+                                            return;
+                                        }
+                                        if !finalized_tool_calls.insert(output_index) {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments were duplicated",
+                                            ));
+                                            return;
+                                        }
+                                        let Some(buffer) = tool_call_argument_buffers.get(&output_index) else {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments lack a buffer",
+                                            ));
+                                            return;
+                                        };
+                                        if !buffer.is_empty() && buffer != arguments {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments disagree with deltas",
+                                            ));
+                                            return;
+                                        }
+                                        if buffer.is_empty()
+                                            && (arguments.len() > MAX_CODEX_TOOL_ARGUMENT_BYTES
+                                                || tool_argument_bytes
+                                                    .checked_add(arguments.len())
+                                                    .is_none_or(|total| total > MAX_CODEX_TOOL_ARGUMENT_BYTES))
+                                        {
+                                            yield Err(Self::stream_error(
+                                                "Codex finalized function_call arguments exceeded the bound",
+                                            ));
+                                            return;
+                                        }
+                                        if buffer.is_empty() && !arguments.is_empty() {
+                                            tool_call_argument_buffers.insert(output_index, arguments.to_string());
+                                            tool_argument_bytes += arguments.len();
+                                            yield Ok(StreamEvent::InputJsonDelta {
+                                                index: output_index,
+                                                partial_json: arguments.to_string(),
+                                            });
+                                        }
+                                        finalized_tool_call_arguments.insert(output_index, arguments.to_string());
+                                    }
+                                    "response.output_item.done" => {
+                                        let output_index = match Self::required_output_index(
+                                            &json_val,
+                                            "output_item.done",
+                                        ) {
+                                            Ok(index) => index,
+                                            Err(message) => {
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        };
+                                        if completed_output_items.contains(&output_index) {
+                                            let message = if output_item_kinds.get(&output_index) == Some(&"function_call") {
+                                                "Codex function_call item completion was duplicated"
+                                            } else {
+                                                "Codex output item completion was duplicated"
+                                            };
+                                            yield Err(Self::stream_error(message));
+                                            return;
+                                        }
+                                        let item_type = match json_val.get("item") {
+                                            None => None,
+                                            Some(item) => {
+                                                let Some(item_object) = item.as_object() else {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex output item completion item is not an object",
+                                                    ));
+                                                    return;
+                                                };
+                                                let Some(item_type) = item_object.get("type").and_then(|value| value.as_str()) else {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex output item completion lacks a string type",
+                                                    ));
+                                                    return;
+                                                };
+                                                Some(item_type)
+                                            }
+                                        };
+                                        match output_item_kinds.get(&output_index).copied() {
+                                            Some("text") => {
+                                                if item_type == Some("function_call") {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex function_call item completion changed output index type",
+                                                    ));
+                                                    return;
+                                                }
+                                            }
+                                            Some("function_call") => {
+        if !completed_tool_call_items.insert(output_index) {
+                                            yield Err(Self::stream_error(
+                                                "Codex function_call item completion was duplicated",
+                                            ));
+                                            return;
+                                        }
+                                        if let Some(expected_item_id) = tool_call_item_ids.get(&output_index) {
+                                            if let Some(item) = json_val.get("item") {
+                                                if item.get("type").and_then(|value| value.as_str()) != Some("function_call") {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex function_call item completion changed item type",
+                                                    ));
+                                                    return;
+                                                }
+                                                let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex function_call item completion lacks a stable id",
+                                                    ));
+                                                    return;
+                                                };
+                                                if item_id != expected_item_id {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex function_call item completion changed item identity",
+                                                    ));
+                                                    return;
+                                                }
+                                                if let Some(expected_call_id) = tool_call_call_ids.get(&output_index) {
+                                                    if item.get("call_id").and_then(|value| value.as_str()) != Some(expected_call_id) {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item completion changed call identity",
+                                                        ));
+                                                        return;
+                                                    }
+                                                }
+                                                if let Some(expected_name) = tool_call_names.get(&output_index) {
+                                                    if item.get("name").and_then(|value| value.as_str()) != Some(expected_name) {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item completion changed tool name",
+                                                        ));
+                                                        return;
+                                                    }
+                                                }
+                                                if let Some(arguments) = item.get("arguments").and_then(|value| value.as_str()) {
+                                                    if !Self::valid_function_arguments(arguments) {
+                                                        yield Err(Self::stream_error(
+                                                            "Codex function_call item arguments were not a JSON object",
+                                                        ));
+                                                        return;
+                                                    }
+                                                    if finalized_tool_calls.contains(&output_index) {
+                                                        if finalized_tool_call_arguments.get(&output_index).map(String::as_str) != Some(arguments) {
+                                                            yield Err(Self::stream_error(
+                                                                "Codex function_call item completion changed finalized arguments",
+                                                            ));
+                                                            return;
+                                                        }
+                                                    } else {
+                                                        let Some(buffer) = tool_call_argument_buffers.get(&output_index) else {
+                                                            yield Err(Self::stream_error(
+                                                                "Codex function_call item completion lacks a buffer",
+                                                            ));
+                                                            return;
+                                                        };
+                                                        if !buffer.is_empty() && buffer != arguments {
+                                                            yield Err(Self::stream_error(
+                                                                "Codex function_call item completion disagrees with deltas",
+                                                            ));
+                                                            return;
+                                                        }
+                                                        if buffer.is_empty()
+                                                            && (arguments.len() > MAX_CODEX_TOOL_ARGUMENT_BYTES
+                                                                || tool_argument_bytes
+                                                                    .checked_add(arguments.len())
+                                                                    .is_none_or(|total| total > MAX_CODEX_TOOL_ARGUMENT_BYTES))
+                                                        {
+                                                            yield Err(Self::stream_error(
+                                                                "Codex function_call item completion exceeded the bound",
+                                                            ));
+                                                            return;
+                                                        }
+                                                        if buffer.is_empty() && !arguments.is_empty() {
+                                                            tool_call_argument_buffers.insert(output_index, arguments.to_string());
+                                                            tool_argument_bytes += arguments.len();
+                                                            yield Ok(StreamEvent::InputJsonDelta {
+                                                                index: output_index,
+                                                                partial_json: arguments.to_string(),
+                                                            });
+                                                        }
+                                                        finalized_tool_calls.insert(output_index);
+                                                        finalized_tool_call_arguments.insert(output_index, arguments.to_string());
+                                                    }
+                                                } else if !finalized_tool_calls.contains(&output_index) {
+                                                    yield Err(Self::stream_error(
+                                                        "Codex function_call item ended before finalized arguments",
+                                                    ));
+                                                    return;
+                                                }
+                                            } else if !finalized_tool_calls.contains(&output_index) {
+                                                yield Err(Self::stream_error(
+                                                    "Codex function_call item ended before finalized arguments",
+                                                ));
+                                                return;
+                                            }
+                                            }
+                                            }
+                                            Some("other") if item_type.is_some() && !matches!(item_type, Some("function_call") | Some("message")) => {}
+                                            _ => {
+                                                let message = if item_type == Some("function_call") {
+                                                    "Codex function_call item completion lacks a prior item"
+                                                } else {
+                                                    "Codex output item completion lacks a prior output item"
+                                                };
+                                                yield Err(Self::stream_error(message));
+                                                return;
+                                            }
+                                        }
+                                        completed_output_items.insert(output_index);
+                                        if open_blocks.remove(&output_index) {
+                                            yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                        }
+                                    }
+                                    "response.completed" => {
+                                        if tool_call_item_ids
+                                            .keys()
+                                            .any(|index| !finalized_tool_calls.contains(index))
+                                        {
+                                            yield Err(Self::stream_error(
+                                                "Codex response completed before finalized function_call arguments",
+                                            ));
+                                            return;
+                                        }
+                                        if let Some(response) = json_val.get("response") {
+                                            native_binding.observe(Some(response), true);
+                                            if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
+                                                message_id = id.to_string();
+                                            }
+                                            if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
+                                                model_name = model.to_string();
+                                            }
 
-                                    yield Ok(StreamEvent::MessageDelta {
-                                        stop_reason: Some(stop_reason),
-                                        usage: Some(usage),
-                                    });
-                                    yield Ok(StreamEvent::MessageStop);
-                                    return;
+                                            if !message_started {
+                                                yield Ok(StreamEvent::MessageStart {
+                                                    id: message_id.clone(),
+                                                    model: model_name.clone(),
+                                                    usage: UsageInfo::default(),
+                                                });
+                                                // No reassignment: this branch is the
+                                                // stream-completion handler — execution
+                                                // never re-enters the guard below.
+                                            }
+
+                                            let mut remaining: Vec<usize> = open_blocks.drain().collect();
+                                            remaining.sort_unstable();
+                                            for index in remaining {
+                                                yield Ok(StreamEvent::ContentBlockStop { index });
+                                            }
+
+                                            let usage_json = response.get("usage");
+                                            let usage = UsageInfo {
+                                                input_tokens: usage_json
+                                                    .and_then(|value| value.get("input_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                                output_tokens: usage_json
+                                                    .and_then(|value| value.get("output_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                                cache_creation_input_tokens: 0,
+                                                cache_read_input_tokens: usage_json
+                                                    .and_then(|value| value.get("input_tokens_details"))
+                                                    .and_then(|value| value.get("cached_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                            };
+
+                                            let stop_reason = if saw_tool_call {
+                                                StopReason::ToolUse
+                                            } else {
+                                                match response
+                                                    .get("incomplete_details")
+                                                    .and_then(|value| value.get("reason"))
+                                                    .and_then(|value| value.as_str())
+                                                {
+                                                    Some("max_output_tokens") => StopReason::MaxTokens,
+                                                    Some("content_filter") => StopReason::ContentFiltered,
+                                                    Some(other) if !other.is_empty() => StopReason::Other(other.to_string()),
+                                                    _ => StopReason::EndTurn,
+                                                }
+                                            };
+
+                                            if let Some(seed) = witness_seed.as_ref() {
+                                                if let Some(witness) = native_binding.finalize(seed) {
+                                                    yield Ok(StreamEvent::ProviderWireWitness(witness));
+                                                }
+                                            }
+
+                                            yield Ok(StreamEvent::MessageDelta {
+                                                stop_reason: Some(stop_reason),
+                                                usage: Some(usage),
+                                            });
+                                            yield Ok(StreamEvent::MessageStop);
+                                            return;
+                                        }
+                                    }
+                                    "response.incomplete" => {
+                                        if saw_tool_call {
+                                            yield Err(Self::stream_error(
+                                                "Codex response became incomplete with a function_call",
+                                            ));
+                                            return;
+                                        }
+                                        if tool_call_item_ids
+                                            .keys()
+                                            .any(|index| !finalized_tool_calls.contains(index))
+                                        {
+                                            yield Err(Self::stream_error(
+                                                "Codex response became incomplete before finalized function_call arguments",
+                                            ));
+                                            return;
+                                        }
+                                        if let Some(response) = json_val.get("response") {
+                                            if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
+                                                message_id = id.to_string();
+                                            }
+                                            if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
+                                                model_name = model.to_string();
+                                            }
+                                            if !message_started {
+                                                yield Ok(StreamEvent::MessageStart {
+                                                    id: message_id.clone(),
+                                                    model: model_name.clone(),
+                                                    usage: UsageInfo::default(),
+                                                });
+                                            }
+
+                                            let mut remaining: Vec<usize> = open_blocks.drain().collect();
+                                            remaining.sort_unstable();
+                                            for index in remaining {
+                                                yield Ok(StreamEvent::ContentBlockStop { index });
+                                            }
+
+                                            let usage_json = response.get("usage");
+                                            let usage = UsageInfo {
+                                                input_tokens: usage_json
+                                                    .and_then(|value| value.get("input_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                                output_tokens: usage_json
+                                                    .and_then(|value| value.get("output_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                                cache_creation_input_tokens: 0,
+                                                cache_read_input_tokens: usage_json
+                                                    .and_then(|value| value.get("input_tokens_details"))
+                                                    .and_then(|value| value.get("cached_tokens"))
+                                                    .and_then(|value| value.as_u64())
+                                                    .unwrap_or(0),
+                                            };
+                                            let stop_reason = if saw_tool_call {
+                                                StopReason::ToolUse
+                                            } else {
+                                                match response
+                                                    .get("incomplete_details")
+                                                    .and_then(|value| value.get("reason"))
+                                                    .and_then(|value| value.as_str())
+                                                {
+                                                    Some("max_output_tokens") => StopReason::MaxTokens,
+                                                    Some("content_filter") => StopReason::ContentFiltered,
+                                                    Some(other) if !other.is_empty() => StopReason::Other(other.to_string()),
+                                                    _ => StopReason::EndTurn,
+                                                }
+                                            };
+                                            yield Ok(StreamEvent::MessageDelta {
+                                                stop_reason: Some(stop_reason),
+                                                usage: Some(usage),
+                                            });
+                                            yield Ok(StreamEvent::MessageStop);
+                                            return;
+                                        }
+                                    }
+                                    "response.failed" | "response.error" | "error" => {
+                                        yield Err(Self::stream_error("Codex stream reported a terminal error"));
+                                        return;
+                                    }
+                                    _ => {}
                                 }
+
+                                current_event.clear();
+                                continue;
                             }
-                            "response.failed" | "response.error" | "error" => {
-                                yield Err(ProviderError::StreamError {
-                                    provider: provider_id.clone(),
-                                    message: Self::extract_stream_error_message(&json_val),
-                                    partial_response: Some(trimmed.to_string()),
-                                });
-                                return;
+
+                            if let Some(rest) = line.strip_prefix("event:") {
+                                current_event = rest.trim().to_string();
+                                continue;
                             }
-                            _ => {}
+
+                            if let Some(rest) = line.strip_prefix("data:") {
+                                let data_line = rest.trim_start();
+                                current_data_bytes = match current_data_bytes
+                                    .checked_add(data_line.len())
+                                    .and_then(|bytes| bytes.checked_add(1))
+                                {
+                                    Some(bytes) if bytes <= MAX_CODEX_SSE_EVENT_BYTES => bytes,
+                                    _ => {
+                                        yield Err(Self::stream_error("Codex stream event exceeded the 1 MiB limit"));
+                                        return;
+                                    }
+                                };
+                                current_data.push(data_line.to_string());
+                            }
                         }
 
-                        current_event.clear();
-                        continue;
+                        if decoder.buffered_len() > MAX_CODEX_SSE_LINE_BYTES {
+                            yield Err(Self::stream_error("Codex stream line exceeded the 256 KiB limit"));
+                            return;
+                        }
                     }
 
-                    if let Some(rest) = line.strip_prefix("event:") {
-                        current_event = rest.trim().to_string();
-                        continue;
-                    }
+                    yield Err(ProviderError::StreamError {
+                        provider: provider_id,
+                        message: "Codex stream ended before response.completed".to_string(),
+                        partial_response: None,
+                    });
+                };
 
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        current_data.push(rest.trim_start().to_string());
-                    }
-                }
-            }
-
-            yield Err(ProviderError::StreamError {
-                provider: provider_id,
-                message: "Codex stream ended before response.completed".to_string(),
-                partial_response: None,
-            });
-        };
-
-        Ok(Box::pin(s))
+        Ok(crate::inference_admission::hold_stream(s, admission))
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -957,4 +1811,37 @@ impl LlmProvider for CodexProvider {
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
     }
+
+    fn response_continuation_support(&self) -> ResponseContinuationSupport {
+        if self.can_continue_response() {
+            ResponseContinuationSupport::FullContextFallback
+        } else {
+            ResponseContinuationSupport::Unsupported
+        }
+    }
+
+    fn response_continuation_route_identity(&self, model: &str) -> Option<String> {
+        if !self.can_continue_response() {
+            return None;
+        }
+        let account_id = self
+            .tokens
+            .lock()
+            .ok()?
+            .account_id
+            .clone()
+            .unwrap_or_default();
+        let encoded = serde_json::to_vec(&(
+            "forge-codex-continuation-route-v1",
+            &self.api_endpoint,
+            account_id,
+            model,
+        ))
+        .ok()?;
+        Some(claurst_core::crypto_utils::sha256_hex(&encoded))
+    }
 }
+
+#[cfg(test)]
+#[path = "codex_stream_tests.rs"]
+mod stream_regressions;

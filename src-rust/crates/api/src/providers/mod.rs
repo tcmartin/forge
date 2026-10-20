@@ -41,3 +41,46 @@ pub use copilot::CopilotProvider;
 
 pub mod codex;
 pub use codex::CodexProvider;
+
+#[cfg(test)]
+async fn read_loopback_fixture_request(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut request = Vec::new();
+        loop {
+            let mut bytes = [0_u8; 4096];
+            let size = socket.read(&mut bytes).await.expect("fixture request read");
+            assert!(size > 0, "fixture request closed before its body completed");
+            request.extend_from_slice(&bytes[..size]);
+            assert!(
+                request.len() <= 256 * 1024,
+                "fixture request exceeded bound"
+            );
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).expect("fixture headers");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("fixture content length")
+                    })
+                })
+                .expect("fixture content-length header");
+            assert!(
+                length <= 256 * 1024,
+                "fixture content length exceeded bound"
+            );
+            if request.len() >= header_end + 4 + length {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("fixture request timeout");
+}

@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawnSync } = require('child_process');
+const native = require('../native');
+let installed;
+try { installed = native.installedBinary(native.getPlatform()); }
+catch (error) { console.error(`forge: ${error.message}`); process.exit(1); }
+if (!installed) {
+  console.error(
+    'forge: a verified binary for this package version is unavailable.\n' +
+    'Reinstall this local package with FORGE_BINARY_PATH set to a verified Forge binary.\n' +
+    'Run: FORGE_BINARY_PATH=/absolute/path/to/forge npm rebuild forge-coding-agent-local'
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(installed.binary, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: process.env,
+});
+
+process.exit(result.status ?? 1);

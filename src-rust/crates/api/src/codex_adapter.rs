@@ -4,9 +4,9 @@
 //! CreateMessageRequest format to OpenAI's ChatCompletion API format, and responses
 //! are translated back to Anthropic's CreateMessageResponse format.
 
-use serde_json::{json, Value};
 use super::types::{CreateMessageRequest, CreateMessageResponse, SystemPrompt};
 use claurst_core::types::UsageInfo;
+use serde_json::{json, Value};
 
 /// OpenAI Codex API endpoint for responses
 pub const CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -31,13 +31,11 @@ pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {
     if let Some(system) = &request.system {
         let system_text = match system {
             SystemPrompt::Text(text) => text.clone(),
-            SystemPrompt::Blocks(blocks) => {
-                blocks
-                    .iter()
-                    .map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            SystemPrompt::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| b.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
 
         openai_messages.push(json!({
@@ -53,7 +51,7 @@ pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {
     let mut openai_req = json!({
         "model": request.model,
         "messages": openai_messages,
-        "max_tokens": request.max_tokens,
+        "max_output_tokens": request.max_tokens,
         "stream": request.stream,
     });
 
@@ -175,13 +173,16 @@ mod tests {
             stop_sequences: None,
             stream: false,
             thinking: None,
+            cache_control: None,
+            wire_budget: None,
+            dispatch: None,
         };
 
         let openai_req = anthropic_to_openai_request(&request);
 
         // Verify structure
         assert_eq!(openai_req["model"], "gpt-5.2-codex");
-        assert_eq!(openai_req["max_tokens"], 1024);
+        assert_eq!(openai_req["max_output_tokens"], 1024);
         // `temperature` is stored as f32 (see CreateMessageRequest), so 0.7
         // widens to ~0.69999998 as the JSON f64. Compare with tolerance rather
         // than exact equality — the sub-ulp drift is irrelevant to the API.
@@ -227,13 +228,8 @@ mod tests {
 
     #[test]
     fn test_build_anthropic_response() {
-        let response = build_anthropic_response(
-            "Test response",
-            "end_turn",
-            100,
-            50,
-            "gpt-5.2-codex",
-        );
+        let response =
+            build_anthropic_response("Test response", "end_turn", 100, 50, "gpt-5.2-codex");
 
         assert_eq!(response.response_type, "message");
         assert_eq!(response.role, "assistant");

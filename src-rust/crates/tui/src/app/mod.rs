@@ -14,19 +14,13 @@ mod types;
 mod views;
 
 pub use types::{
-    ContextMenuKind, DisplayMessage, FocusTarget, HistorySearch,
-    RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus,
-    ToolUseBlock, TurnMetadata, recent_session_label,
+    recent_session_label, ContextMenuKind, DisplayMessage, FocusTarget, HistorySearch,
+    RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus, ToolUseBlock, TurnMetadata,
 };
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 
-use claurst_core::config::{Config, Settings, Theme};
-use claurst_core::cost::CostTracker;
-use claurst_core::file_history::FileHistory;
-use claurst_core::keybindings::{KeybindingResolver, UserKeybindings};
-use claurst_core::types::Message;
 use crate::agents_view::AgentsMenuState;
 use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
@@ -39,8 +33,7 @@ use crate::mcp_view::McpViewState;
 use crate::model_picker::{EffortLevel, ModelPickerState};
 use crate::notifications::NotificationQueue;
 use crate::overlays::{
-    GlobalSearchState, HelpOverlay, HistorySearchOverlay,
-    MessageSelectorOverlay, RewindFlowOverlay,
+    GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay, RewindFlowOverlay,
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::PromptInputState;
@@ -49,9 +42,14 @@ use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::theme_screen::ThemeScreen;
-use ratatui::style::Color;
-use commands::{PROMPT_SLASH_COMMANDS, help_overlay_entries};
+use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::cost::CostTracker;
+use claurst_core::file_history::FileHistory;
+use claurst_core::keybindings::{KeybindingResolver, UserKeybindings};
+use claurst_core::types::Message;
+use commands::{help_overlay_entries, PROMPT_SLASH_COMMANDS};
 use providers::{import_config_picker_items, provider_picker_items};
+use ratatui::style::Color;
 use types::{ContextMenuState, GoToLineDialog};
 
 /// Attempt to copy text to the system clipboard using platform CLI tools.
@@ -94,7 +92,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        for cmd in &["wl-copy", "xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &[
+            "wl-copy",
+            "xclip -selection clipboard",
+            "xsel --clipboard --input",
+        ] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 if let Ok(mut child) = std::process::Command::new(prog)
@@ -133,6 +135,9 @@ pub struct App {
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub is_streaming: bool,
+    /// Set by the configurable interrupt action; the CLI consumes this after
+    /// dispatching the key to cancel the owning query task.
+    query_cancel_requested: bool,
     pub streaming_text: String,
     pub streaming_thinking: String,
     pub status_message: Option<String>,
@@ -165,6 +170,12 @@ pub struct App {
     pub has_credentials: bool,
     /// Current effort level (controls extended-thinking budget_tokens).
     pub effort_level: EffortLevel,
+    /// Monotonic marker for host-visible effort selections.
+    ///
+    /// This increments even when a picker re-selects the currently displayed
+    /// level. Query configuration uses the marker to retain explicit-user
+    /// provenance instead of inferring it from a value comparison.
+    pub effort_revision: u64,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
     /// Current agent mode name: "build", "plan".
@@ -183,20 +194,17 @@ pub struct App {
     pub cursor_pos: usize,
 
     // ---- Scrollback / auto-scroll -----------------------------------------
-
     /// When `true`, the message pane follows the latest messages automatically.
     pub auto_scroll: bool,
     /// Count of messages that arrived while the user was scrolled up.
     pub new_messages_while_scrolled: usize,
 
     // ---- Token warning tracking -------------------------------------------
-
     /// Which threshold (0 = none, 80, 95, 100) was last notified so we only
     /// show each banner once.
     pub token_warning_threshold_shown: u8,
 
     // ---- Session timing ---------------------------------------------------
-
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
     /// Current Rustle pose for rendering (updated each frame).
@@ -221,7 +229,6 @@ pub struct App {
     pub transcript_version: Cell<u64>,
 
     // ---- New overlay / notification fields --------------------------------
-
     /// Full-screen help overlay (? / F1).
     pub help_overlay: HelpOverlay,
     /// Ctrl+R history search overlay.
@@ -261,7 +268,6 @@ pub struct App {
     pub current_turn: Option<Arc<std::sync::atomic::AtomicUsize>>,
 
     // ---- Visual mode indicators -------------------------------------------
-
     /// Plan mode — input border turns blue, [PLAN] shown in status bar.
     pub plan_mode: bool,
     /// "While you were away" summary text shown on the welcome screen.
@@ -270,7 +276,6 @@ pub struct App {
     pub stall_start: Option<std::time::Instant>,
 
     // ---- Settings / theme / privacy screens --------------------------------
-
     /// Full-screen tabbed settings screen (/config, /settings).
     pub settings_screen: SettingsScreen,
     /// Theme picker overlay (/theme).
@@ -300,7 +305,8 @@ pub struct App {
     /// Startup error dialog for malformed settings.json or AGENTS.md.
     pub invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState,
     /// Memory update notification banner.
-    pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
+    pub memory_update_notification:
+        crate::memory_update_notification::MemoryUpdateNotificationState,
     /// MCP elicitation dialog (form requested by an MCP server).
     pub elicitation: crate::elicitation_dialog::ElicitationDialogState,
     /// Model picker overlay (/model command).
@@ -429,7 +435,6 @@ pub struct App {
     pub auto_compact_running: bool,
 
     // ---- Voice hold-to-talk ------------------------------------------------
-
     /// The global voice recorder, Some when voice is enabled in config.
     pub voice_recorder: Option<Arc<Mutex<claurst_core::voice::VoiceRecorder>>>,
     /// True while recording is active (Alt+V toggled on).
@@ -453,7 +458,6 @@ pub struct App {
     pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
 
     // ---- Context window & rate limit info ----------------------------------
-
     /// Total context window size for the current model (tokens).
     pub context_window_size: u64,
     /// How many tokens are currently used in the context window.
@@ -563,6 +567,13 @@ pub fn accent_for_mode(mode: Option<&str>) -> Color {
 }
 
 impl App {
+    /// Record an effort choice made through a user-facing picker or command.
+    /// The revision is intentionally independent of the selected value.
+    pub fn mark_effort_selection(&mut self, level: EffortLevel) {
+        self.effort_level = level;
+        self.effort_revision = self.effort_revision.saturating_add(1);
+    }
+
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
@@ -591,6 +602,7 @@ impl App {
             history_index: None,
             scroll_offset: 0,
             is_streaming: false,
+            query_cancel_requested: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             status_message: None,
@@ -607,6 +619,7 @@ impl App {
             model_name,
             has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Medium,
+            effort_revision: 0,
             fast_mode: false,
             agent_mode: None,
             agent_mode_changed: false,
@@ -622,10 +635,12 @@ impl App {
             rustle_current_pose: crate::rustle::RustlePose::Default,
             rustle_pose_until: None,
             rustle_temp_pose: None,
-            rustle_next_blink: 200 + (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as u64 % 300),
+            rustle_next_blink: 200
+                + (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64
+                    % 300),
             turn_start: None,
             last_turn_elapsed: None,
             last_turn_verb: None,
@@ -669,7 +684,8 @@ impl App {
             voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState::new(),
             desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState::new(),
             invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState::new(),
-            memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState::new(),
+            memory_update_notification:
+                crate::memory_update_notification::MemoryUpdateNotificationState::new(),
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
@@ -683,7 +699,8 @@ impl App {
             mcp_session_trusted: std::collections::HashSet::new(),
             mcp_project_root: None,
             go_to_line_dialog: GoToLineDialog::new(),
-            bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
+            bypass_permissions_dialog:
+                crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
             file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             file_injection_force: false,
@@ -708,7 +725,10 @@ impl App {
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
-            import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
+            import_config_picker: DialogSelectState::new(
+                "Import config",
+                import_config_picker_items(),
+            ),
             import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
@@ -728,12 +748,15 @@ impl App {
             pr_number: None,
             pr_url: None,
             pr_state: None,
-            current_dir: std::env::current_dir().ok().and_then(|p| {
-                p.to_str().map(|s| s.to_string())
-            }),
+            current_dir: std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string())),
             git_branch: claurst_core::git_utils::get_repo_root(
-                std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
-            ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
+                std::env::current_dir()
+                    .as_deref()
+                    .unwrap_or_else(|_| std::path::Path::new(".")),
+            )
+            .map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
@@ -748,8 +771,8 @@ impl App {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                     || {
-                        let path = claurst_core::config::Settings::config_dir()
-                            .join("ui-settings.json");
+                        let path =
+                            claurst_core::config::Settings::config_dir().join("ui-settings.json");
                         std::fs::read_to_string(&path)
                             .ok()
                             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -833,6 +856,14 @@ impl App {
     /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
     /// and the loading spinner on stalls/errors.
     /// Call once per frame before rendering.
+    /// Return and clear the query cancellation request emitted by the
+    /// configurable interrupt keybinding.
+    pub fn take_query_cancel_requested(&mut self) -> bool {
+        let requested = self.query_cancel_requested;
+        self.query_cancel_requested = false;
+        requested
+    }
+
     pub fn tick_rustle_pose(&mut self) {
         // Loading spinner: shown when streaming has stalled (no data for 3s+).
         if self.is_streaming {
@@ -849,7 +880,9 @@ impl App {
         // Check if a temporary pose is active.
         if let Some(until) = self.rustle_pose_until {
             if std::time::Instant::now() < until {
-                self.rustle_current_pose = self.rustle_temp_pose.clone()
+                self.rustle_current_pose = self
+                    .rustle_temp_pose
+                    .clone()
                     .unwrap_or(crate::rustle::RustlePose::Default);
                 return;
             }
@@ -861,9 +894,8 @@ impl App {
         // Random eye-shift: every ~200-500 frames, briefly look right.
         if self.frame_count >= self.rustle_next_blink {
             self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookRight);
-            self.rustle_pose_until = Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(800)
-            );
+            self.rustle_pose_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
             // Schedule next blink 200-500 frames from now (random-ish).
             let jitter = (self.frame_count.wrapping_mul(7) % 300) + 200;
             self.rustle_next_blink = self.frame_count + jitter;
@@ -877,9 +909,8 @@ impl App {
     /// Trigger Rustle looking down briefly (called on Tab / mode switch).
     pub fn rustle_look_down(&mut self) {
         self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookDown);
-        self.rustle_pose_until = Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(1)
-        );
+        self.rustle_pose_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
     }
 
     /// Cycle to the next agent mode: build → plan → build.
@@ -908,7 +939,8 @@ impl App {
     /// Update the context window size from the model registry for the current model.
     pub fn refresh_context_window_size(&mut self) {
         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-        let model_id = self.model_name
+        let model_id = self
+            .model_name
             .strip_prefix(&format!("{}/", provider))
             .unwrap_or(&self.model_name);
         if let Some(entry) = self.model_registry.get(provider, model_id) {
@@ -940,6 +972,21 @@ impl App {
         let _ = settings.save_sync();
         self.status_message = Some(format!("Theme set to: {}", theme_name));
     }
-
 }
 
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn effort_selection_revision_changes_for_same_level() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        let level = app.effort_level;
+        assert_eq!(app.effort_revision, 0);
+        app.mark_effort_selection(level);
+        assert_eq!(app.effort_level, level);
+        assert_eq!(app.effort_revision, 1);
+        app.mark_effort_selection(level);
+        assert_eq!(app.effort_revision, 2);
+    }
+}

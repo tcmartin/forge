@@ -7,20 +7,101 @@ use async_trait::async_trait;
 
 pub struct McpCommand;
 
+#[derive(serde::Serialize)]
+struct McpCandidateEnvelope {
+    schema: &'static str,
+    entries: Vec<McpCandidateEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct McpCandidateEntry {
+    canonical_server: String,
+    raw_tool: String,
+    callable_name: String,
+    source_key: Option<String>,
+    definition_digest: String,
+    grant_candidate_effect: &'static str,
+    grant_match_status: &'static str,
+}
+
+/// Project a checked descriptor into the bounded diagnostic status space.
+///
+/// This deliberately has no authority effect: only the query-owned inventory
+/// path can turn the same exact identity into `Observation`.
+fn observation_candidate_status(
+    grants_valid: bool,
+    grants: &[claurst_core::config::McpObservationGrant],
+    source_key: Option<&str>,
+    canonical_server: &str,
+    raw_tool: &str,
+    definition_digest: &str,
+) -> (&'static str, &'static str) {
+    if !grants_valid {
+        return ("unknown", "invalid_configuration");
+    }
+    let Some(source_key) = source_key else {
+        return ("unknown", "stale");
+    };
+    if grants.iter().any(|grant| {
+        grant.source_key == source_key
+            && grant.server == canonical_server
+            && grant.raw_tool == raw_tool
+            && grant.definition_digest == definition_digest
+    }) {
+        return ("observation", "exact");
+    }
+    if grants.iter().any(|grant| {
+        grant.source_key == source_key
+            && grant.server == canonical_server
+            && grant.raw_tool == raw_tool
+    }) {
+        return ("unknown", "definition_mismatch");
+    }
+    if grants
+        .iter()
+        .any(|grant| grant.server == canonical_server && grant.raw_tool == raw_tool)
+    {
+        return ("unknown", "source_mismatch");
+    }
+    ("unknown", "no_grant")
+}
+
+fn encode_candidate_envelope(entries: Vec<McpCandidateEntry>) -> Result<String, &'static str> {
+    if entries.len() > 4096 {
+        return Err("MCP tool candidate limit exceeded.");
+    }
+    let result = McpCandidateEnvelope {
+        schema: "forge.mcp-observation-candidates.v1",
+        entries,
+    };
+    let encoded =
+        serde_json::to_string(&result).map_err(|_| "MCP tool candidate serialization failed.")?;
+    if encoded.len() > 256 * 1024 {
+        return Err("MCP tool candidate output limit exceeded.");
+    }
+    Ok(encoded)
+}
+
 // ---- /mcp ----------------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for McpCommand {
-    fn name(&self) -> &str { "mcp" }
-    fn description(&self) -> &str { "Show MCP server status and manage connections" }
+    fn name(&self) -> &str {
+        "mcp"
+    }
+    fn description(&self) -> &str {
+        "Show MCP server status and manage connections"
+    }
     fn help(&self) -> &str {
-        "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
+        "Usage: /mcp [list|status|tools [server] [--json]|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
          MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
            /mcp status                 — detailed connection status for all servers\n\
+           /mcp tools [server]         — list available tools\n\
+           /mcp tools [server] --json  — inspect bounded observation candidates\n\
            /mcp auth <server>          — show OAuth auth instructions for a server\n\
            /mcp connect <server>       — reconnect a disconnected server\n\
            /mcp logs <server>          — show recent errors/logs for a server\n\
@@ -60,8 +141,7 @@ impl SlashCommand for McpCommand {
         // /mcp tools [server-name]
         if first_word == "tools" {
             let rest = sub["tools".len()..].trim();
-            let server_filter = if rest.is_empty() { None } else { Some(rest) };
-            return McpCommand::handle_tools(server_filter, ctx);
+            return McpCommand::handle_tools(rest, ctx);
         }
 
         // /mcp connect <server-name>
@@ -138,7 +218,7 @@ impl SlashCommand for McpCommand {
                 output.push_str(
                     "\nNote: MCP manager is not active in this session.\n\
                      Restart Claurst to connect to MCP servers.\n\
-                     Use /mcp connect <server> to retry a single server."
+                     Use /mcp connect <server> to retry a single server.",
                 );
             }
             return CommandResult::Message(output);
@@ -178,7 +258,7 @@ impl SlashCommand for McpCommand {
         }
         output.push_str(
             "\nSubcommands: status | auth <server> | connect <server> | logs <server>\n\
-             Also: resources | prompts | get-prompt <server> <prompt> [key=val ...]"
+             Also: resources | prompts | get-prompt <server> <prompt> [key=val ...]",
         );
         CommandResult::Message(output)
     }
@@ -192,15 +272,29 @@ impl McpCommand {
     ///
     /// For stdio servers: shows env-var auth instructions.
     async fn handle_auth(server_name: &str, ctx: &CommandContext) -> CommandResult {
-        let srv = match ctx.config.mcp_servers.iter().find(|s| s.name == server_name) {
+        let srv = match ctx
+            .config
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == server_name)
+        {
             Some(s) => s,
             None => {
-                let configured: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+                let configured: Vec<&str> = ctx
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
                 return CommandResult::Error(format!(
                     "No MCP server named '{}' is configured.\n\
                      Configured servers: {}",
                     server_name,
-                    if configured.is_empty() { "(none)".to_string() } else { configured.join(", ") }
+                    if configured.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        configured.join(", ")
+                    }
                 ));
             }
         };
@@ -232,7 +326,10 @@ impl McpCommand {
 
         if let Some(manager) = &ctx.mcp_manager {
             use claurst_mcp::McpServerStatus;
-            if matches!(manager.server_status(server_name), McpServerStatus::Connecting) {
+            if matches!(
+                manager.server_status(server_name),
+                McpServerStatus::Connecting
+            ) {
                 return CommandResult::Message(format!(
                     "MCP server '{}' is currently connecting — try again shortly.",
                     server_name
@@ -310,25 +407,52 @@ impl McpCommand {
     }
 
     /// Handle `/mcp tools [server]` — list available tools.
-    fn handle_tools(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
+    fn handle_tools(args: &str, ctx: &CommandContext) -> CommandResult {
+        let mut json = false;
+        let mut filter = None;
+        for token in args.split_whitespace() {
+            if token == "--json" {
+                if json {
+                    return CommandResult::Error("Usage: /mcp tools [server] --json".into());
+                }
+                json = true;
+            } else if token.starts_with('-') || filter.is_some() || json {
+                return CommandResult::Error("Usage: /mcp tools [server] --json".into());
+            } else {
+                filter = Some(token);
+            }
+        }
+        if json {
+            return Self::handle_tools_json(filter, ctx);
+        }
+        let server_filter = filter;
         let manager = match ctx.mcp_manager.as_ref() {
             Some(m) => m,
-            None => return CommandResult::Message(
-                "MCP manager is not active. No tool information available.\n\
-                 Restart Claurst to connect to MCP servers.".to_string()
-            ),
+            None => {
+                return CommandResult::Message(
+                    "MCP manager is not active. No tool information available.\n\
+                 Restart Claurst to connect to MCP servers."
+                        .to_string(),
+                )
+            }
         };
 
         let all_tools = manager.all_tool_definitions();
         let tools: Vec<_> = if let Some(filter) = server_filter {
-            all_tools.iter().filter(|(srv, _)| srv.as_str() == filter).collect()
+            all_tools
+                .iter()
+                .filter(|(srv, _)| srv.as_str() == filter)
+                .collect()
         } else {
             all_tools.iter().collect()
         };
 
         if tools.is_empty() {
             return CommandResult::Message(if let Some(filter) = server_filter {
-                format!("No tools available from server '{}' (not connected or has no tools).", filter)
+                format!(
+                    "No tools available from server '{}' (not connected or has no tools).",
+                    filter
+                )
             } else {
                 "No tools available from any connected MCP server.".to_string()
             });
@@ -347,24 +471,98 @@ impl McpCommand {
                 last_server = server.as_str();
             }
             // Strip the "servername_" prefix for display
-            let bare = tool.name.strip_prefix(&format!("{}_", server)).unwrap_or(&tool.name);
+            let bare = tool
+                .name
+                .strip_prefix(&format!("{}_", server))
+                .unwrap_or(&tool.name);
             let preview: String = tool.description.chars().take(80).collect();
-            let ellipsis = if tool.description.len() > 80 { "…" } else { "" };
+            let ellipsis = if tool.description.len() > 80 {
+                "…"
+            } else {
+                ""
+            };
             out.push_str(&format!("  {}\n    {}{}\n", bare, preview, ellipsis));
         }
         CommandResult::Message(out)
+    }
+
+    fn handle_tools_json(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
+        let Some(manager) = ctx.mcp_manager.as_ref() else {
+            return CommandResult::Error("MCP tool candidates unavailable.".into());
+        };
+        let snapshot = match manager.checked_catalog_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return CommandResult::Error("MCP tool candidates unavailable.".into()),
+        };
+        let filter = server_filter.map(|value| value.trim().to_ascii_lowercase());
+        let grants = ctx.config.validated_mcp_observation_grants();
+        let mut entries = Vec::new();
+        for descriptor in snapshot.descriptors {
+            let canonical_server = descriptor.server_name().trim().to_ascii_lowercase();
+            if filter
+                .as_deref()
+                .is_some_and(|value| value != canonical_server.as_str())
+            {
+                continue;
+            }
+            let source_key = manager.source_key_for_descriptor(&descriptor);
+            let (effect, status) = observation_candidate_status(
+                grants.is_ok(),
+                grants.as_deref().unwrap_or(&[]),
+                source_key.as_deref(),
+                &canonical_server,
+                descriptor.raw_name(),
+                descriptor.definition_digest(),
+            );
+            entries.push(McpCandidateEntry {
+                canonical_server,
+                raw_tool: descriptor.raw_name().to_owned(),
+                callable_name: descriptor.callable_name().to_owned(),
+                source_key,
+                definition_digest: descriptor.definition_digest().to_owned(),
+                grant_candidate_effect: effect,
+                grant_match_status: status,
+            });
+        }
+        entries.sort_by(|left, right| {
+            (
+                &left.canonical_server,
+                &left.raw_tool,
+                &left.callable_name,
+                &left.definition_digest,
+            )
+                .cmp(&(
+                    &right.canonical_server,
+                    &right.raw_tool,
+                    &right.callable_name,
+                    &right.definition_digest,
+                ))
+        });
+        match encode_candidate_envelope(entries) {
+            Ok(encoded) => CommandResult::Message(encoded),
+            Err(error) => CommandResult::Error(error.into()),
+        }
     }
 
     /// Handle `/mcp connect <server>` — attempt to reconnect a server.
     async fn handle_connect(server_name: &str, ctx: &CommandContext) -> CommandResult {
         // Validate that the server is configured.
         if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
-            let names: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+            let names: Vec<&str> = ctx
+                .config
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
             return CommandResult::Error(format!(
                 "No MCP server named '{}' is configured.\n\
                  Configured servers: {}",
                 server_name,
-                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
             ));
         }
 
@@ -384,21 +582,17 @@ impl McpCommand {
                 let current = manager.server_status(server_name);
                 use claurst_mcp::McpServerStatus;
                 match current {
-                    McpServerStatus::Connected { tool_count } => {
-                        CommandResult::Message(format!(
-                            "MCP server '{}' is already connected ({} tool{} available).",
-                            server_name,
-                            tool_count,
-                            if tool_count == 1 { "" } else { "s" }
-                        ))
-                    }
-                    McpServerStatus::Connecting => {
-                        CommandResult::Message(format!(
-                            "MCP server '{}' is already in the process of connecting.\n\
+                    McpServerStatus::Connected { tool_count } => CommandResult::Message(format!(
+                        "MCP server '{}' is already connected ({} tool{} available).",
+                        server_name,
+                        tool_count,
+                        if tool_count == 1 { "" } else { "s" }
+                    )),
+                    McpServerStatus::Connecting => CommandResult::Message(format!(
+                        "MCP server '{}' is already in the process of connecting.\n\
                              Check back in a moment.",
-                            server_name
-                        ))
-                    }
+                        server_name
+                    )),
                     McpServerStatus::Disconnected { .. } | McpServerStatus::Failed { .. } => {
                         // The McpManager doesn't expose a reconnect method — it's built at
                         // startup.  Inform the user and suggest a restart.
@@ -425,16 +619,28 @@ impl McpCommand {
     fn handle_logs(server_name: &str, ctx: &CommandContext) -> CommandResult {
         // Validate server name.
         if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
-            let names: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+            let names: Vec<&str> = ctx
+                .config
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
             return CommandResult::Error(format!(
                 "No MCP server named '{}' is configured.\n\
                  Configured servers: {}",
                 server_name,
-                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
             ));
         }
 
-        let mut lines = vec![format!("MCP Server Logs — '{}'\n──────────────────────", server_name)];
+        let mut lines = vec![format!(
+            "MCP Server Logs — '{}'\n──────────────────────",
+            server_name
+        )];
 
         if let Some(manager) = &ctx.mcp_manager {
             use claurst_mcp::McpServerStatus;
@@ -442,30 +648,52 @@ impl McpCommand {
             lines.push(format!("Current status:  {}", status.display()));
 
             match &status {
-                McpServerStatus::Disconnected { last_error: Some(e) } => {
+                McpServerStatus::Disconnected {
+                    last_error: Some(e),
+                } => {
                     lines.push(format!("\nLast connection error:\n  {}", e));
                     lines.push(String::new());
                     lines.push("Troubleshooting:".to_string());
-                    lines.push(format!("  /mcp auth {}    — check authentication", server_name));
-                    lines.push(format!("  /mcp connect {} — attempt reconnect", server_name));
+                    lines.push(format!(
+                        "  /mcp auth {}    — check authentication",
+                        server_name
+                    ));
+                    lines.push(format!(
+                        "  /mcp connect {} — attempt reconnect",
+                        server_name
+                    ));
                 }
                 McpServerStatus::Failed { error, retry_at } => {
                     lines.push(format!("\nConnection failure:\n  {}", error));
-                    let retry_secs = retry_at.saturating_duration_since(std::time::Instant::now()).as_secs();
+                    let retry_secs = retry_at
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs();
                     if retry_secs > 0 {
                         lines.push(format!("  Automatic retry in {}s", retry_secs));
                     }
                     let _ = retry_at; // used above
                 }
                 McpServerStatus::Connected { tool_count } => {
-                    lines.push(format!("\nServer is healthy — {} tool{} available.", tool_count, if *tool_count == 1 { "" } else { "s" }));
+                    lines.push(format!(
+                        "\nServer is healthy — {} tool{} available.",
+                        tool_count,
+                        if *tool_count == 1 { "" } else { "s" }
+                    ));
                     // Show catalog info if available.
                     if let Some(catalog) = manager.server_catalog(server_name) {
                         if !catalog.resources.is_empty() {
-                            lines.push(format!("Resources ({}): {}", catalog.resource_count, catalog.resources.join(", ")));
+                            lines.push(format!(
+                                "Resources ({}): {}",
+                                catalog.resource_count,
+                                catalog.resources.join(", ")
+                            ));
                         }
                         if !catalog.prompts.is_empty() {
-                            lines.push(format!("Prompts ({}): {}", catalog.prompt_count, catalog.prompts.join(", ")));
+                            lines.push(format!(
+                                "Prompts ({}): {}",
+                                catalog.prompt_count,
+                                catalog.prompts.join(", ")
+                            ));
                         }
                     }
                 }
@@ -492,9 +720,12 @@ impl McpCommand {
 
         // Hint about log files.
         lines.push(String::new());
-        lines.push("Note: Detailed stdio output from MCP server processes is not\n\
+        lines.push(
+            "Note: Detailed stdio output from MCP server processes is not\n\
                     captured by the manager. Run the server command directly in a\n\
-                    terminal to see its full output.".to_string());
+                    terminal to see its full output."
+                .to_string(),
+        );
 
         CommandResult::Message(lines.join("\n"))
     }
@@ -512,7 +743,8 @@ impl McpCommand {
                 let resources = manager.list_all_resources(filter).await;
                 if resources.is_empty() {
                     return Some(CommandResult::Message(
-                        "No resources available (servers may not support resources/list).".to_string()
+                        "No resources available (servers may not support resources/list)."
+                            .to_string(),
                     ));
                 }
                 let mut out = format!("MCP Resources ({})\n──────────────────\n", resources.len());
@@ -534,21 +766,36 @@ impl McpCommand {
                 let prompts = manager.list_all_prompts(filter).await;
                 if prompts.is_empty() {
                     return Some(CommandResult::Message(
-                        "No prompt templates available (servers may not support prompts/list).".to_string()
+                        "No prompt templates available (servers may not support prompts/list)."
+                            .to_string(),
                     ));
                 }
-                let mut out = format!("MCP Prompt Templates ({})\n─────────────────────────\n", prompts.len());
+                let mut out = format!(
+                    "MCP Prompt Templates ({})\n─────────────────────────\n",
+                    prompts.len()
+                );
                 for p in &prompts {
                     let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("?");
                     let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     let desc = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                    let args: Vec<String> = p.get("arguments")
+                    let args: Vec<String> = p
+                        .get("arguments")
                         .and_then(|a| a.as_array())
-                        .map(|arr| arr.iter()
-                            .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                            .collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|a| {
+                                    a.get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    let args_display = if args.is_empty() { String::new() } else { format!(" ({})", args.join(", ")) };
+                    let args_display = if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", args.join(", "))
+                    };
                     if desc.is_empty() {
                         out.push_str(&format!("  [{server}] {name}{args_display}\n"));
                     } else {
@@ -562,13 +809,22 @@ impl McpCommand {
                 // /mcp get-prompt <server> <prompt-name> [key=val key2=val2 ...]
                 let server = match parts.get(1) {
                     Some(s) => *s,
-                    None => return Some(CommandResult::Error("Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string())),
+                    None => {
+                        return Some(CommandResult::Error(
+                            "Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string(),
+                        ))
+                    }
                 };
                 let prompt_name = match parts.get(2) {
                     Some(p) => *p,
-                    None => return Some(CommandResult::Error("Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string())),
+                    None => {
+                        return Some(CommandResult::Error(
+                            "Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string(),
+                        ))
+                    }
                 };
-                let mut args: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut args: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
                 if let Some(kv_str) = parts.get(3) {
                     for kv in kv_str.split_whitespace() {
                         if let Some((k, v)) = kv.split_once('=') {
@@ -583,7 +839,9 @@ impl McpCommand {
                         for msg in &result.messages {
                             let text = match &msg.content {
                                 claurst_mcp::PromptMessageContent::Text { text } => text.clone(),
-                                claurst_mcp::PromptMessageContent::Image { .. } => "[image]".to_string(),
+                                claurst_mcp::PromptMessageContent::Image { .. } => {
+                                    "[image]".to_string()
+                                }
                                 claurst_mcp::PromptMessageContent::Resource { resource } => {
                                     resource.to_string()
                                 }
@@ -592,10 +850,183 @@ impl McpCommand {
                         }
                         Some(CommandResult::UserMessage(injected.trim().to_string()))
                     }
-                    Err(e) => Some(CommandResult::Error(format!("Failed to get prompt '{}' from '{}': {}", prompt_name, server, e))),
+                    Err(e) => Some(CommandResult::Error(format!(
+                        "Failed to get prompt '{}' from '{}': {}",
+                        prompt_name, server, e
+                    ))),
                 }
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(
+        source_key: &str,
+        server: &str,
+        raw_tool: &str,
+        definition_digest: &str,
+    ) -> claurst_core::config::McpObservationGrant {
+        claurst_core::config::McpObservationGrant {
+            version: claurst_core::config::MCP_OBSERVATION_GRANT_VERSION.into(),
+            source_key: source_key.into(),
+            server: server.into(),
+            raw_tool: raw_tool.into(),
+            definition_digest: definition_digest.into(),
+        }
+    }
+
+    fn entry(server: &str, raw_tool: &str) -> McpCandidateEntry {
+        McpCandidateEntry {
+            canonical_server: server.into(),
+            raw_tool: raw_tool.into(),
+            callable_name: format!("{server}_{raw_tool}"),
+            source_key: Some("a".repeat(64)),
+            definition_digest: "b".repeat(64),
+            grant_candidate_effect: "unknown",
+            grant_match_status: "no_grant",
+        }
+    }
+
+    fn context() -> CommandContext {
+        CommandContext {
+            config: claurst_core::config::Config::default(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            messages: Vec::new(),
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "mcp-command-test".into(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+        }
+    }
+
+    #[test]
+    fn candidate_status_is_fail_closed_for_all_grant_states() {
+        let source = "a".repeat(64);
+        let other_source = "c".repeat(64);
+        let digest = "b".repeat(64);
+        let other_digest = "d".repeat(64);
+        let exact = grant(&source, "demo", "read_file", &digest);
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[exact],
+                Some(&source),
+                "demo",
+                "read_file",
+                &digest,
+            ),
+            ("observation", "exact")
+        );
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[grant(&source, "demo", "read_file", &digest)],
+                Some(&source),
+                "demo",
+                "read_file",
+                &other_digest,
+            ),
+            ("unknown", "definition_mismatch")
+        );
+        assert_eq!(
+            observation_candidate_status(
+                true,
+                &[grant(&other_source, "demo", "read_file", &digest)],
+                Some(&source),
+                "demo",
+                "read_file",
+                &digest,
+            ),
+            ("unknown", "source_mismatch")
+        );
+        assert_eq!(
+            observation_candidate_status(true, &[], Some(&source), "demo", "read_file", &digest,),
+            ("unknown", "no_grant")
+        );
+        assert_eq!(
+            observation_candidate_status(true, &[], None, "demo", "read_file", &digest),
+            ("unknown", "stale")
+        );
+        assert_eq!(
+            observation_candidate_status(false, &[], Some(&source), "demo", "read_file", &digest),
+            ("unknown", "invalid_configuration")
+        );
+    }
+
+    #[test]
+    fn candidate_envelope_has_fixed_schema_keys_and_deterministic_order() {
+        let mut entries = vec![entry("zeta", "write"), entry("alpha", "read")];
+        entries.sort_by(|left, right| {
+            (
+                &left.canonical_server,
+                &left.raw_tool,
+                &left.callable_name,
+                &left.definition_digest,
+            )
+                .cmp(&(
+                    &right.canonical_server,
+                    &right.raw_tool,
+                    &right.callable_name,
+                    &right.definition_digest,
+                ))
+        });
+        let encoded = encode_candidate_envelope(entries).unwrap();
+        assert!(encoded.starts_with(
+            r#"{"schema":"forge.mcp-observation-candidates.v1","entries":[{"canonical_server""#
+        ));
+        assert!(encoded.find("alpha").unwrap() < encoded.find("zeta").unwrap());
+        for key in [
+            "canonical_server",
+            "raw_tool",
+            "callable_name",
+            "source_key",
+            "definition_digest",
+            "grant_candidate_effect",
+            "grant_match_status",
+        ] {
+            assert_eq!(encoded.matches(&format!("\"{key}\"")).count(), 2);
+        }
+    }
+
+    #[test]
+    fn candidate_envelope_enforces_count_and_utf8_byte_bounds() {
+        let too_many = (0..4097)
+            .map(|index| entry("demo", &format!("tool_{index}")))
+            .collect();
+        assert_eq!(
+            encode_candidate_envelope(too_many),
+            Err("MCP tool candidate limit exceeded.")
+        );
+
+        let mut oversized = entry("demo", "read");
+        oversized.raw_tool = "é".repeat(131_000);
+        assert_eq!(
+            encode_candidate_envelope(vec![oversized]),
+            Err("MCP tool candidate output limit exceeded.")
+        );
+    }
+
+    #[test]
+    fn tools_help_and_argument_errors_are_bounded() {
+        let command = McpCommand;
+        assert!(command.help().contains("tools [server] --json"));
+        let ctx = context();
+        for args in ["--unknown", "--json --json", "--json demo", "demo other"] {
+            assert!(matches!(
+                McpCommand::handle_tools(args, &ctx),
+                CommandResult::Error(message) if message == "Usage: /mcp tools [server] --json"
+            ));
+        }
+        assert!(matches!(
+            McpCommand::handle_tools("--json", &ctx),
+            CommandResult::Error(message) if message == "MCP tool candidates unavailable."
+        ));
     }
 }

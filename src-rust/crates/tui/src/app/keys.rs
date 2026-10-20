@@ -1,16 +1,16 @@
 //! Keyboard input: normalization and key-event dispatch.
 
-use claurst_core::config::Settings;
-use claurst_core::keybindings::{KeyContext, KeybindingResult, ParsedKeystroke};
+use super::types::{FocusTarget, HistorySearch};
+use super::App;
 use crate::agents_view::AgentsRoute;
 use crate::diff_viewer::DiffPane;
 use crate::export_dialog::ExportFormat;
 use crate::notifications::NotificationKind;
 use crate::overlays::HistorySearchOverlay;
 use crate::prompt_input::VimMode;
+use claurst_core::config::Settings;
+use claurst_core::keybindings::{KeyContext, KeybindingResult, ParsedKeystroke};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use super::App;
-use super::types::{FocusTarget, HistorySearch};
 
 /// Map a character to its QWERTY Latin keyboard-position equivalent.
 ///
@@ -33,20 +33,38 @@ pub(super) fn layout_to_latin(c: char) -> String {
     let lower = c.to_lowercase().next().unwrap_or(c);
     let mapped: Option<char> = match lower {
         // Row 1
-        'й' => Some('q'), 'ц' => Some('w'), 'у' => Some('e'),
-        'к' => Some('r'), 'е' => Some('t'), 'н' => Some('y'),
-        'г' => Some('u'), 'ш' => Some('i'), 'щ' => Some('o'),
+        'й' => Some('q'),
+        'ц' => Some('w'),
+        'у' => Some('e'),
+        'к' => Some('r'),
+        'е' => Some('t'),
+        'н' => Some('y'),
+        'г' => Some('u'),
+        'ш' => Some('i'),
+        'щ' => Some('o'),
         'з' => Some('p'),
         // Row 2
-        'ф' => Some('a'), 'ы' => Some('s'), 'в' => Some('d'),
-        'а' => Some('f'), 'п' => Some('g'), 'р' => Some('h'),
-        'о' => Some('j'), 'л' => Some('k'), 'д' => Some('l'),
+        'ф' => Some('a'),
+        'ы' => Some('s'),
+        'в' => Some('d'),
+        'а' => Some('f'),
+        'п' => Some('g'),
+        'р' => Some('h'),
+        'о' => Some('j'),
+        'л' => Some('k'),
+        'д' => Some('l'),
         // Row 3
-        'я' => Some('z'), 'ч' => Some('x'), 'с' => Some('c'),
-        'м' => Some('v'), 'и' => Some('b'), 'т' => Some('n'),
+        'я' => Some('z'),
+        'ч' => Some('x'),
+        'с' => Some('c'),
+        'м' => Some('v'),
+        'и' => Some('b'),
+        'т' => Some('n'),
         'ь' => Some('m'),
         // Ukrainian-specific letters on standard positions
-        'і' => Some('s'), 'ї' => Some(']'), 'є' => Some('\''),
+        'і' => Some('s'),
+        'ї' => Some(']'),
+        'є' => Some('\''),
         _ => None,
     };
     mapped.unwrap_or(lower).to_string()
@@ -102,23 +120,23 @@ pub(super) fn normalize_char_with_shift(c: char, modifiers: KeyModifiers) -> cha
 
 pub(super) fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     let normalized_key = match key.code {
         KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Delete    => "delete".to_string(),
-        KeyCode::Down      => "down".to_string(),
-        KeyCode::End       => "end".to_string(),
-        KeyCode::Enter     => "enter".to_string(),
-        KeyCode::Esc       => "escape".to_string(),
-        KeyCode::Home      => "home".to_string(),
-        KeyCode::Left      => "left".to_string(),
-        KeyCode::PageDown  => "pagedown".to_string(),
-        KeyCode::PageUp    => "pageup".to_string(),
-        KeyCode::Right     => "right".to_string(),
-        KeyCode::Tab       => "tab".to_string(),
-        KeyCode::Up        => "up".to_string(),
-        KeyCode::BackTab   => "tab".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "escape".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::BackTab => "tab".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
         KeyCode::Char(c) => {
             // For modifier-key combos (Ctrl/Alt + letter), normalize to the
@@ -214,7 +232,6 @@ impl App {
             self.dismiss_error_notifications();
             return false;
         }
-
 
         if self.global_search.visible {
             return self.handle_global_search_key(key);
@@ -330,7 +347,7 @@ impl App {
                     // Applying `Ultracode` here is equivalent to typing the
                     // `ultracode` keyword: it sets the effort to the top level.
                     let chosen = self.effort_picker.current();
-                    self.effort_level = chosen;
+                    self.mark_effort_selection(chosen);
                     self.effort_picker.close();
                     self.status_message = Some(format!(
                         "Effort set to {} {}.",
@@ -350,9 +367,15 @@ impl App {
                     self.device_auth_dialog.close();
                     self.device_auth_pending = None;
                 }
-                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Success(_)) => {
+                _ if matches!(
+                    self.device_auth_dialog.status,
+                    crate::device_auth_dialog::DeviceAuthStatus::Success(_)
+                ) =>
+                {
                     // Any key after success -> store credential and close
-                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) = self.device_auth_dialog.status {
+                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) =
+                        self.device_auth_dialog.status
+                    {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
@@ -383,17 +406,18 @@ impl App {
                         } else {
                             claurst_core::StoredCredential::ApiKey { key: token }
                         };
-                        self.auth_store.set(
-                            &provider_id,
-                            credential,
-                        );
+                        self.auth_store.set(&provider_id, credential);
                         self.device_auth_pending = None;
                         self.device_auth_dialog.close();
                         self.activate_provider(provider_id, provider_name, "Connected to");
                         return false;
                     }
                 }
-                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Error(_)) => {
+                _ if matches!(
+                    self.device_auth_dialog.status,
+                    crate::device_auth_dialog::DeviceAuthStatus::Error(_)
+                ) =>
+                {
                     // Any key after error -> close
                     self.device_auth_dialog.close();
                     self.device_auth_pending = None;
@@ -464,17 +488,28 @@ impl App {
                 KeyCode::Backspace => {
                     self.key_input_dialog.backspace();
                 }
-                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
+                KeyCode::Char('v')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER) =>
+                {
                     if let Some(text) = crate::image_paste::read_clipboard_text() {
                         if text.is_empty() {
-                            self.push_notification(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                            self.push_notification(
+                                NotificationKind::Warning,
+                                "Clipboard is empty".to_string(),
+                                Some(2),
+                            );
                         } else {
                             for ch in text.chars() {
                                 self.key_input_dialog.insert_char(ch);
                             }
                         }
                     } else {
-                        self.push_notification(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                        self.push_notification(
+                            NotificationKind::Warning,
+                            "Could not read clipboard".to_string(),
+                            Some(2),
+                        );
                     }
                 }
                 KeyCode::Char(c) => {
@@ -503,10 +538,8 @@ impl App {
                     if self.free_mode_dialog.can_submit() {
                         let values = self.free_mode_dialog.take_values();
                         for (provider_id, key) in values {
-                            self.auth_store.set(
-                                provider_id,
-                                claurst_core::StoredCredential::ApiKey { key },
-                            );
+                            self.auth_store
+                                .set(provider_id, claurst_core::StoredCredential::ApiKey { key });
                         }
                         self.activate_provider(
                             "free".to_string(),
@@ -571,15 +604,33 @@ impl App {
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
-                KeyCode::Esc => { self.connect_dialog.close(); }
-                KeyCode::Home => { self.connect_dialog.move_home(); }
-                KeyCode::End => { self.connect_dialog.move_end(); }
-                KeyCode::Up => { self.connect_dialog.move_up(); }
-                KeyCode::Down => { self.connect_dialog.move_down(); }
-                KeyCode::PageUp => { self.connect_dialog.page_up(); }
-                KeyCode::PageDown => { self.connect_dialog.page_down(); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_up(); }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_down(); }
+                KeyCode::Esc => {
+                    self.connect_dialog.close();
+                }
+                KeyCode::Home => {
+                    self.connect_dialog.move_home();
+                }
+                KeyCode::End => {
+                    self.connect_dialog.move_end();
+                }
+                KeyCode::Up => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Down => {
+                    self.connect_dialog.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.connect_dialog.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.connect_dialog.page_down();
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.connect_dialog.move_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
@@ -587,58 +638,74 @@ impl App {
                         match selected.id.as_str() {
                             // Local providers — activate immediately, no key needed
                             "ollama" | "lmstudio" | "llamacpp" => {
-                                self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                                self.activate_provider(
+                                    selected.id.clone(),
+                                    selected.title.clone(),
+                                    "Switched to",
+                                );
                             }
                             // "Free" composite mode — collects any subset of the
                             // free-tier upstreams (min 1; more = better availability).
                             "free" => {
-                                let existing: Vec<(&'static str, String)> = claurst_api::FREE_CATALOG
-                                    .iter()
-                                    .filter_map(|upstream| {
-                                        let key = match upstream.id {
-                                            "opencode-zen" => self
-                                                .auth_store
-                                                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
-                                                .or_else(|| {
-                                                    self.auth_store.api_key_for(
-                                                        claurst_core::ProviderId::OPENCODE_GO,
+                                let existing: Vec<(&'static str, String)> =
+                                    claurst_api::FREE_CATALOG
+                                        .iter()
+                                        .filter_map(|upstream| {
+                                            let key = match upstream.id {
+                                                "opencode-zen" => self
+                                                    .auth_store
+                                                    .api_key_for(
+                                                        claurst_core::ProviderId::OPENCODE_ZEN,
                                                     )
-                                                }),
-                                            other => self.auth_store.api_key_for(other),
-                                        };
-                                        key.filter(|k| !k.is_empty())
-                                            .map(|k| (upstream.id, k))
-                                    })
-                                    .collect();
+                                                    .or_else(|| {
+                                                        self.auth_store.api_key_for(
+                                                            claurst_core::ProviderId::OPENCODE_GO,
+                                                        )
+                                                    }),
+                                                other => self.auth_store.api_key_for(other),
+                                            };
+                                            key.filter(|k| !k.is_empty()).map(|k| (upstream.id, k))
+                                        })
+                                        .collect();
                                 self.free_mode_dialog.open(&existing);
                             }
                             "anthropic" => {
                                 // Anthropic: API key from console.anthropic.com.
-                                self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.key_input_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
                             }
                             "anthropic-oauth" => {
                                 // Claude Pro/Max subscription: claude.ai OAuth via
                                 // the browser (loopback capture), spawned by the
                                 // main loop. Note: usage draws from the account's
                                 // extra-usage pool, not subscription quota.
-                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.device_auth_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("anthropic-oauth".to_string());
                             }
                             "custom-openai" => {
-                                let current_url = Settings::load_sync()
-                                    .ok()
-                                    .and_then(|settings| settings.providers.get("custom-openai").and_then(|p| p.api_base.clone()));
-                                self.custom_provider_dialog
-                                    .open(selected.id.clone(), selected.title.clone(), current_url);
+                                let current_url = Settings::load_sync().ok().and_then(|settings| {
+                                    settings
+                                        .providers
+                                        .get("custom-openai")
+                                        .and_then(|p| p.api_base.clone())
+                                });
+                                self.custom_provider_dialog.open(
+                                    selected.id.clone(),
+                                    selected.title.clone(),
+                                    current_url,
+                                );
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow
-                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.device_auth_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("github-copilot".to_string());
                             }
                             "codex" | "openai-codex" => {
                                 // OpenAI Codex: browser OAuth flow (spawned by main loop)
-                                self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
+                                self.device_auth_dialog
+                                    .open("openai-codex".into(), "OpenAI Codex".into());
                                 self.device_auth_pending = Some("openai-codex".to_string());
                             }
                             // AWS Bedrock — accept a bearer token via key input dialog
@@ -654,8 +721,12 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
-                KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                KeyCode::Backspace => {
+                    self.connect_dialog.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.connect_dialog.filter_push(c);
+                }
                 _ => {}
             }
             return false;
@@ -664,15 +735,33 @@ impl App {
         // Import-config source picker
         if self.import_config_picker.visible {
             match key.code {
-                KeyCode::Esc => { self.import_config_picker.close(); }
-                KeyCode::Home => { self.import_config_picker.move_home(); }
-                KeyCode::End => { self.import_config_picker.move_end(); }
-                KeyCode::Up => { self.import_config_picker.move_up(); }
-                KeyCode::Down => { self.import_config_picker.move_down(); }
-                KeyCode::PageUp => { self.import_config_picker.page_up(); }
-                KeyCode::PageDown => { self.import_config_picker.page_down(); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_up(); }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_down(); }
+                KeyCode::Esc => {
+                    self.import_config_picker.close();
+                }
+                KeyCode::Home => {
+                    self.import_config_picker.move_home();
+                }
+                KeyCode::End => {
+                    self.import_config_picker.move_end();
+                }
+                KeyCode::Up => {
+                    self.import_config_picker.move_up();
+                }
+                KeyCode::Down => {
+                    self.import_config_picker.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.import_config_picker.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.import_config_picker.page_down();
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.import_config_picker.move_up();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.import_config_picker.move_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.import_config_picker.selected().cloned() {
                         self.import_config_picker.close();
@@ -681,8 +770,12 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => { self.import_config_picker.filter_pop(); }
-                KeyCode::Char(c) => { self.import_config_picker.filter_push(c); }
+                KeyCode::Backspace => {
+                    self.import_config_picker.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.import_config_picker.filter_push(c);
+                }
                 _ => {}
             }
             return false;
@@ -701,15 +794,33 @@ impl App {
         // Command palette (Ctrl+K)
         if self.command_palette.visible {
             match key.code {
-                KeyCode::Esc => { self.command_palette.close(); }
-                KeyCode::Home => { self.command_palette.move_home(); }
-                KeyCode::End => { self.command_palette.move_end(); }
-                KeyCode::Up => { self.command_palette.move_up(); }
-                KeyCode::Down => { self.command_palette.move_down(); }
-                KeyCode::PageUp => { self.command_palette.page_up(); }
-                KeyCode::PageDown => { self.command_palette.page_down(); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_up(); }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_down(); }
+                KeyCode::Esc => {
+                    self.command_palette.close();
+                }
+                KeyCode::Home => {
+                    self.command_palette.move_home();
+                }
+                KeyCode::End => {
+                    self.command_palette.move_end();
+                }
+                KeyCode::Up => {
+                    self.command_palette.move_up();
+                }
+                KeyCode::Down => {
+                    self.command_palette.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.command_palette.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.command_palette.page_down();
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.command_palette.move_up();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.command_palette.move_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.command_palette.selected().cloned() {
                         self.command_palette.close();
@@ -718,8 +829,12 @@ impl App {
                         return true; // signal to submit this as input
                     }
                 }
-                KeyCode::Backspace => { self.command_palette.filter_pop(); }
-                KeyCode::Char(c) => { self.command_palette.filter_push(c); }
+                KeyCode::Backspace => {
+                    self.command_palette.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.command_palette.filter_push(c);
+                }
                 _ => {}
             }
             return false;
@@ -746,17 +861,23 @@ impl App {
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.model_picker.select_prev()
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.model_picker.select_next()
+                }
                 KeyCode::Enter => {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
+                        if self.fast_mode
+                            && !self.model_picker.is_selected_fast_mode_model(&model_id)
+                        {
                             self.fast_mode = false;
                         }
                         if let Some(e) = effort {
-                            self.effort_level = e;
+                            self.mark_effort_selection(e);
                         }
                         // Store explicit selections in the canonical
                         // "provider/model" form for non-Anthropic providers.
@@ -772,7 +893,9 @@ impl App {
                         };
                         self.set_model(full_model.clone());
                         self.persist_provider_and_model();
-                        let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
+                        let effort_hint = effort
+                            .map(|e| format!(" [{}]", e.label()))
+                            .unwrap_or_default();
                         self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
                     }
                 }
@@ -787,47 +910,43 @@ impl App {
         if self.session_branching.visible {
             use crate::session_branching::BranchBrowserMode;
             match self.session_branching.mode {
-                BranchBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_branching.cancel(),
-                        KeyCode::Up => self.session_branching.select_prev(),
-                        KeyCode::Down => self.session_branching.select_next(),
-                        KeyCode::Char('n') => self.session_branching.start_create_new(),
-                        KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
-                        KeyCode::Enter => {
-                            if let Some(branch) = self.session_branching.selected_branch() {
-                                self.status_message = Some(format!("Switched to branch: {}", branch.name));
-                                self.session_branching.close();
-                            }
+                BranchBrowserMode::Browse => match key.code {
+                    KeyCode::Esc => self.session_branching.cancel(),
+                    KeyCode::Up => self.session_branching.select_prev(),
+                    KeyCode::Down => self.session_branching.select_next(),
+                    KeyCode::Char('n') => self.session_branching.start_create_new(),
+                    KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
+                    KeyCode::Enter => {
+                        if let Some(branch) = self.session_branching.selected_branch() {
+                            self.status_message =
+                                Some(format!("Switched to branch: {}", branch.name));
+                            self.session_branching.close();
                         }
-                        _ => {}
                     }
-                }
-                BranchBrowserMode::CreateNew => {
-                    match key.code {
-                        KeyCode::Esc => self.session_branching.cancel(),
-                        KeyCode::Enter => {
-                            if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
-                                self.status_message = Some(format!("Created branch: {} at message {}", name, at_msg));
-                                self.session_branching.close();
-                            }
+                    _ => {}
+                },
+                BranchBrowserMode::CreateNew => match key.code {
+                    KeyCode::Esc => self.session_branching.cancel(),
+                    KeyCode::Enter => {
+                        if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
+                            self.status_message =
+                                Some(format!("Created branch: {} at message {}", name, at_msg));
+                            self.session_branching.close();
                         }
-                        KeyCode::Backspace => self.session_branching.pop_create_char(),
-                        KeyCode::Char(c) => self.session_branching.push_create_char(c),
-                        _ => {}
                     }
-                }
-                BranchBrowserMode::ConfirmDelete => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
-                        KeyCode::Enter | KeyCode::Char('y') => {
-                            if let Some(branch_id) = self.session_branching.confirm_delete() {
-                                self.status_message = Some(format!("Deleted branch: {}", branch_id));
-                            }
+                    KeyCode::Backspace => self.session_branching.pop_create_char(),
+                    KeyCode::Char(c) => self.session_branching.push_create_char(c),
+                    _ => {}
+                },
+                BranchBrowserMode::ConfirmDelete => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        if let Some(branch_id) = self.session_branching.confirm_delete() {
+                            self.status_message = Some(format!("Deleted branch: {}", branch_id));
                         }
-                        _ => {}
                     }
-                }
+                    _ => {}
+                },
             }
             return false;
         }
@@ -836,38 +955,32 @@ impl App {
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
-                SessionBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
-                        KeyCode::Char('r') => self.session_browser.start_rename(),
-                        _ => {}
-                    }
-                }
-                SessionBrowserMode::Rename => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.cancel(),
-                        KeyCode::Enter => {
-                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                                self.session_title = Some(name.clone());
-                                self.status_message = Some(format!("Renamed to: {}", name));
-                            }
+                SessionBrowserMode::Browse => match key.code {
+                    KeyCode::Esc => self.session_browser.close(),
+                    KeyCode::Up => self.session_browser.select_prev(),
+                    KeyCode::Down => self.session_browser.select_next(),
+                    KeyCode::Char('r') => self.session_browser.start_rename(),
+                    _ => {}
+                },
+                SessionBrowserMode::Rename => match key.code {
+                    KeyCode::Esc => self.session_browser.cancel(),
+                    KeyCode::Enter => {
+                        if let Some((_id, name)) = self.session_browser.confirm_rename() {
+                            self.session_title = Some(name.clone());
+                            self.status_message = Some(format!("Renamed to: {}", name));
                         }
-                        KeyCode::Backspace => self.session_browser.pop_rename_char(),
-                        KeyCode::Char(c) => self.session_browser.push_rename_char(c),
-                        _ => {}
                     }
-                }
-                SessionBrowserMode::Confirm => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
-                        KeyCode::Enter | KeyCode::Char('y') => {
-                            self.session_browser.close();
-                        }
-                        _ => {}
+                    KeyCode::Backspace => self.session_browser.pop_rename_char(),
+                    KeyCode::Char(c) => self.session_browser.push_rename_char(c),
+                    _ => {}
+                },
+                SessionBrowserMode::Confirm => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.session_browser.close();
                     }
-                }
+                    _ => {}
+                },
             }
             return false;
         }
@@ -879,7 +992,9 @@ impl App {
                 KeyCode::Up => self.tasks_overlay.select_prev(),
                 KeyCode::Down => self.tasks_overlay.select_next(),
                 KeyCode::Enter => {
-                    if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                    if let Some((task_id, new_status)) =
+                        self.tasks_overlay.cycle_and_persist_status()
+                    {
                         self.status_message = Some(format!("Task {} → {}", task_id, new_status));
                     }
                 }
@@ -936,7 +1051,9 @@ impl App {
 
         // MCP approval dialog
         if self.mcp_approval.visible {
-            if let Some(choice) = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key) {
+            if let Some(choice) =
+                crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key)
+            {
                 self.handle_mcp_approval_decision(choice);
             }
             return false;
@@ -1199,7 +1316,8 @@ impl App {
         }
 
         // Clear any active text selection on key press (except Ctrl+C which copies it).
-        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_copy =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
             self.selection_anchor = None;
             self.selection_focus = None;
@@ -1289,7 +1407,9 @@ impl App {
                     | crate::prompt_input::VimMode::VisualBlock
             )
         {
-            use crate::image_paste::{read_clipboard_image, read_clipboard_text, read_primary_text};
+            use crate::image_paste::{
+                read_clipboard_image, read_clipboard_text, read_primary_text,
+            };
             if let Some(img) = read_clipboard_image() {
                 let label = img.label.clone();
                 let dims = img.dimensions;
@@ -1314,10 +1434,7 @@ impl App {
         }
 
         // ---- Enter while PTT recording: stop capture instead of submitting ----
-        if key.code == KeyCode::Enter
-            && self.voice_recording
-            && self.voice_recorder.is_some()
-        {
+        if key.code == KeyCode::Enter && self.voice_recording && self.voice_recorder.is_some() {
             self.handle_voice_ptt_stop();
             return false;
         }
@@ -1335,8 +1452,9 @@ impl App {
                 KeyCode::PageUp | KeyCode::PageDown => {
                     // Let these fall through to the normal scroll handling below.
                 }
-                KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                KeyCode::Char(_)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     // Printable char: switch focus to Input and process normally.
                     self.focus = FocusTarget::Input;
@@ -1348,6 +1466,7 @@ impl App {
         match key.code {
             // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
             KeyCode::Esc if self.is_streaming => {
+                self.query_cancel_requested = true;
                 self.is_streaming = false;
                 self.spinner_verb = None;
                 self.streaming_text.clear();
@@ -1360,7 +1479,9 @@ impl App {
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
-            KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 // If text is selected, copy it to clipboard instead of quitting.
                 let sel_text = self.selection_text.borrow().clone();
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
@@ -1370,10 +1491,15 @@ impl App {
                     self.selection_focus = None;
                     *self.selection_text.borrow_mut() = String::new();
                     if copied {
-                        self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        self.push_notification(
+                            NotificationKind::Info,
+                            "Copied to clipboard".to_string(),
+                            Some(2),
+                        );
                     }
                 } else if self.is_streaming {
                     // Cancel streaming.
+                    self.query_cancel_requested = true;
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
@@ -1643,7 +1769,10 @@ impl App {
             // when the cursor is already on the first/last visual row
             // (issue #149 follow-up).
             KeyCode::Up => {
-                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
+                if !self.prompt_input.suggestions.is_empty()
+                    && (self.prompt_input.text.starts_with('/')
+                        || self.prompt_input.has_active_file_ref())
+                {
                     self.prompt_input.suggestion_prev();
                 } else {
                     let area = self.last_input_area.get();
@@ -1657,7 +1786,10 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
+                if !self.prompt_input.suggestions.is_empty()
+                    && (self.prompt_input.text.starts_with('/')
+                        || self.prompt_input.has_active_file_ref())
+                {
                     self.prompt_input.suggestion_next();
                 } else {
                     let area = self.last_input_area.get();
@@ -1688,12 +1820,12 @@ impl App {
 
             // ---- Toggle last thinking block (t key) -------------------
             // (Removed: shadowed by KeyCode::Char(c) prompt input handler.)
-
             _ => {}
         }
 
         // Reset exit confirmation sequence if user presses any key other than Ctrl+C or Ctrl+D.
-        let is_exit_key = key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(c) if c == 'c' || c == 'd' || c == 'C' || c == 'D');
+        let is_exit_key = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(c) if c == 'c' || c == 'd' || c == 'C' || c == 'D');
         if !is_exit_key {
             self.last_exit_key_warning = None;
             self.exit_key_sequence_start = None;
@@ -1766,10 +1898,12 @@ impl App {
                 self.pending_mcp_reconnect = true;
                 self.status_message = Some("Reconnecting MCP runtime...".to_string());
             }
-            KeyCode::Char(c) if key.modifiers.is_empty()
-                && self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList => {
-                    self.mcp_view.push_search_char(c);
-                }
+            KeyCode::Char(c)
+                if key.modifiers.is_empty()
+                    && self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList =>
+            {
+                self.mcp_view.push_search_char(c);
+            }
             _ => {}
         }
         false
@@ -1836,10 +1970,9 @@ impl App {
             }
             KeyCode::PageUp => self.diff_viewer.scroll_detail_up(),
             KeyCode::PageDown => self.diff_viewer.scroll_detail_down(),
-            KeyCode::Char(' ')
-                if self.diff_viewer.active_pane == DiffPane::FileList => {
-                    self.diff_viewer.toggle_file_collapse();
-                }
+            KeyCode::Char(' ') if self.diff_viewer.active_pane == DiffPane::FileList => {
+                self.diff_viewer.toggle_file_collapse();
+            }
             _ => {}
         }
     }
@@ -2040,14 +2173,19 @@ impl App {
         }
 
         // Start new sequence (or show message for wrong key)
-        self.push_notification(NotificationKind::Info, exit_message(key_char).to_string(), Some(2));
+        self.push_notification(
+            NotificationKind::Info,
+            exit_message(key_char).to_string(),
+            Some(2),
+        );
         self.last_exit_key_warning = Some(std::time::Instant::now());
         self.exit_key_sequence_start = Some(key_char);
     }
 
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
-            "interrupt" => {
+            "cancelQuery" => {
+                self.query_cancel_requested = true;
                 if self.is_streaming {
                     self.is_streaming = false;
                     self.spinner_verb = None;
@@ -2055,6 +2193,20 @@ impl App {
                     self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
+                    self.complete_current_turn_snapshot(true);
+                }
+                false
+            }
+            "interrupt" => {
+                self.query_cancel_requested = true;
+                if self.is_streaming {
+                    self.is_streaming = false;
+                    self.spinner_verb = None;
+                    self.streaming_text.clear();
+                    self.streaming_thinking.clear();
+                    self.tool_use_blocks.clear();
+                    self.status_message = Some("Cancelled.".to_string());
+                    self.complete_current_turn_snapshot(true);
                 } else {
                     // Handle exit confirmation: require two exit key presses within 2 seconds.
                     // Always clear the prompt input on Ctrl+C.
@@ -2063,7 +2215,9 @@ impl App {
                         self.refresh_prompt_input();
                     }
 
-                    let elapsed = self.last_exit_key_warning.map(|t| t.elapsed().as_secs_f64());
+                    let elapsed = self
+                        .last_exit_key_warning
+                        .map(|t| t.elapsed().as_secs_f64());
                     let is_valid = elapsed.map(|e| e <= 2.0).unwrap_or(false);
 
                     if self.last_exit_key_warning.is_some() && is_valid {
@@ -2073,7 +2227,11 @@ impl App {
                         self.exit_key_sequence_start = None;
                     } else {
                         // First press or timeout expired: show exit confirmation.
-                        self.push_notification(NotificationKind::Info, "Press Ctrl+C again to exit".to_string(), Some(2));
+                        self.push_notification(
+                            NotificationKind::Info,
+                            "Press Ctrl+C again to exit".to_string(),
+                            Some(2),
+                        );
                         self.last_exit_key_warning = Some(std::time::Instant::now());
                         self.exit_key_sequence_start = Some('c');
                     }
@@ -2116,7 +2274,8 @@ impl App {
             "historyPrev" => {
                 // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
+                    && (self.prompt_input.text.starts_with('/')
+                        || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_prev();
                     self.refresh_prompt_input();
@@ -2134,7 +2293,8 @@ impl App {
             "historyNext" => {
                 // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
+                    && (self.prompt_input.text.starts_with('/')
+                        || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_next();
                     self.refresh_prompt_input();
@@ -2376,7 +2536,7 @@ impl App {
                         self.refresh_prompt_input();
                     } else if self.prompt_input.is_empty() {
                         self.cycle_agent_mode();
-                    self.rustle_look_down();
+                        self.rustle_look_down();
                     }
                 }
                 false
@@ -2552,8 +2712,8 @@ impl App {
             return false;
         }
 
-        if let Some(text) = crate::image_paste::read_primary_text()
-            .or_else(crate::image_paste::read_clipboard_text)
+        if let Some(text) =
+            crate::image_paste::read_primary_text().or_else(crate::image_paste::read_clipboard_text)
         {
             self.focus = FocusTarget::Input;
             self.clear_selection();
@@ -2574,8 +2734,8 @@ impl App {
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
     pub fn handle_paste_data(&mut self, data: String) {
-        use crate::prompt_input::detect_pasted_path;
         use crate::image_paste::PastedImage;
+        use crate::prompt_input::detect_pasted_path;
 
         if let Some(path) = detect_pasted_path(&data) {
             let ext = path
@@ -2592,7 +2752,11 @@ impl App {
                     .and_then(|n| n.to_str())
                     .unwrap_or("image")
                     .to_string();
-                let img = PastedImage { path, label: label.clone(), dimensions: None };
+                let img = PastedImage {
+                    path,
+                    label: label.clone(),
+                    dimensions: None,
+                };
                 self.prompt_input.add_image(img);
                 self.push_notification(
                     crate::notifications::NotificationKind::Info,
@@ -2630,8 +2794,7 @@ impl App {
     /// queued composition, and a raw-key paste flood must be captured there
     /// too instead of submitting on every pasted newline.
     pub fn paste_burst_allowed(&self) -> bool {
-        !self.any_modal_open()
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+        !self.any_modal_open() && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
     }
 
     /// Drain any immediately-available key events from the crossterm event
@@ -2652,10 +2815,7 @@ impl App {
     /// single keystroke.  If a non-character key is encountered while
     /// draining, it is stored in `self.pending_key` and will be replayed at
     /// the top of the next event-loop iteration.
-    pub fn try_detect_paste_burst(
-        &mut self,
-        first: char,
-    ) -> Option<String> {
+    pub fn try_detect_paste_burst(&mut self, first: char) -> Option<String> {
         use crossterm::event::{Event, KeyCode, KeyEventKind};
 
         // Minimum number of chars (including `first`) to classify as a paste.
@@ -2687,7 +2847,8 @@ impl App {
                         // map it back to a newline or Unix pastes lose their
                         // line breaks (they'd insert a literal 'j').
                         KeyCode::Char('j')
-                            if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            if k.modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             buf.push('\n')
                         }
@@ -2722,5 +2883,4 @@ impl App {
             None
         }
     }
-
 }

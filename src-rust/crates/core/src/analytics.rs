@@ -131,8 +131,8 @@ impl MetricsSummary {
     }
 }
 
-/// Event types for first-party analytics (privacy-respecting — no PII).
-#[derive(Debug, Clone)]
+/// Event values may contain content. Debug output exposes only bounded metrics.
+#[derive(Clone)]
 pub enum AnalyticsEvent {
     SessionStarted {
         model: String,
@@ -159,19 +159,58 @@ pub enum AnalyticsEvent {
     },
 }
 
-/// Analytics sink — currently logs via `tracing`; can be extended to push
-/// events to a first-party endpoint.
+impl std::fmt::Debug for AnalyticsEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionStarted { is_interactive, .. } => formatter
+                .debug_struct("SessionStarted")
+                .field("is_interactive", is_interactive)
+                .finish(),
+            Self::SessionEnded {
+                turn_count,
+                cost_usd,
+                duration_ms,
+                had_errors,
+            } => formatter
+                .debug_struct("SessionEnded")
+                .field("turn_count", turn_count)
+                .field("cost_usd", cost_usd)
+                .field("duration_ms", duration_ms)
+                .field("had_errors", had_errors)
+                .finish(),
+            Self::ToolUsed {
+                success,
+                duration_ms,
+                ..
+            } => formatter
+                .debug_struct("ToolUsed")
+                .field("success", success)
+                .field("duration_ms", duration_ms)
+                .finish(),
+            Self::CommandExecuted { success, .. } => formatter
+                .debug_struct("CommandExecuted")
+                .field("success", success)
+                .finish(),
+            Self::CompactionTriggered {
+                tokens_before,
+                tokens_after,
+            } => formatter
+                .debug_struct("CompactionTriggered")
+                .field("tokens_before", tokens_before)
+                .field("tokens_after", tokens_after)
+                .finish(),
+        }
+    }
+}
+
+/// Local numeric diagnostic sink. It does not export events or content.
 pub struct Analytics {
     enabled: bool,
-    session_id: String,
 }
 
 impl Analytics {
-    pub fn new(session_id: String, enabled: bool) -> Self {
-        Self {
-            enabled,
-            session_id,
-        }
+    pub fn new(_session_id: String, enabled: bool) -> Self {
+        Self { enabled }
     }
 
     pub fn track(&self, event: AnalyticsEvent) {
@@ -179,7 +218,6 @@ impl Analytics {
             return;
         }
         tracing::debug!(
-            session_id = %self.session_id,
             event = ?event,
             "analytics event"
         );
@@ -426,5 +464,41 @@ mod tests {
             success: true,
             duration_ms: 42,
         });
+    }
+    #[test]
+    fn diagnostic_event_debug_excludes_content_strings() {
+        let secret = "synthetic-secret-prompt-code-canary";
+        let events = [
+            AnalyticsEvent::SessionStarted {
+                model: secret.into(),
+                is_interactive: true,
+            },
+            AnalyticsEvent::ToolUsed {
+                tool_name: secret.into(),
+                success: false,
+                duration_ms: 42,
+            },
+            AnalyticsEvent::CommandExecuted {
+                command: secret.into(),
+                success: false,
+            },
+        ];
+        for event in events {
+            let diagnostic = format!("{event:?}");
+            assert!(!diagnostic.contains(secret));
+            assert!(!diagnostic.contains("model:"));
+            assert!(!diagnostic.contains("tool_name:"));
+            assert!(!diagnostic.contains("command:"));
+        }
+        assert_eq!(
+            format!(
+                "{:?}",
+                AnalyticsEvent::CommandExecuted {
+                    command: secret.into(),
+                    success: true,
+                }
+            ),
+            "CommandExecuted { success: true }"
+        );
     }
 }

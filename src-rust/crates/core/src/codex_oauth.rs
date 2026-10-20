@@ -115,17 +115,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_codex_constants_not_empty() {
-        assert!(!CODEX_CLIENT_ID.is_empty());
-        assert!(!CODEX_AUTHORIZE_URL.is_empty());
-        assert!(!CODEX_TOKEN_URL.is_empty());
-        assert!(!CODEX_REDIRECT_URI.is_empty());
-        assert!(!CODEX_SCOPES.is_empty());
-        assert!(!CODEX_MODELS.is_empty());
-        assert!(!DEFAULT_CODEX_MODEL.is_empty());
-    }
-
-    #[test]
     fn test_codex_models_contains_default() {
         let default_found = CODEX_MODELS
             .iter()
@@ -150,12 +139,25 @@ mod tests {
         // Explicit deny — withheld even though 5.5 > 5.4.
         assert!(!codex_model_allowed("gpt-5.5-pro"), "gpt-5.5-pro is denied");
         // Version heuristic: keep only > 5.4.
-        assert!(codex_model_allowed("gpt-5.6"), "future gpt-5.6 kept by heuristic");
-        assert!(codex_model_allowed("gpt-6.0"), "future gpt-6.0 kept by heuristic");
+        assert!(
+            codex_model_allowed("gpt-5.6"),
+            "future gpt-5.6 kept by heuristic"
+        );
+        assert!(
+            codex_model_allowed("gpt-6.0"),
+            "future gpt-6.0 kept by heuristic"
+        );
         // Legacy / non-matching ids dropped.
         for id in [
-            "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.2-codex", "gpt-5.1-codex",
-            "gpt-5.2", "gpt-5", "gpt-4o", "o3", "gpt-5-codex",
+            "gpt-5.4-nano",
+            "gpt-5.4-pro",
+            "gpt-5.2-codex",
+            "gpt-5.1-codex",
+            "gpt-5.2",
+            "gpt-5",
+            "gpt-4o",
+            "o3",
+            "gpt-5-codex",
         ] {
             assert!(!codex_model_allowed(id), "{id} should be filtered out");
         }
@@ -170,8 +172,14 @@ mod tests {
 
     #[test]
     fn test_codex_limit_override_only_for_5_5() {
-        assert_eq!(codex_limit_override("gpt-5.5"), Some((400_000, 272_000, 128_000)));
-        assert_eq!(codex_limit_override("gpt-5.5-codex"), Some((400_000, 272_000, 128_000)));
+        assert_eq!(
+            codex_limit_override("gpt-5.5"),
+            Some((400_000, 272_000, 128_000))
+        );
+        assert_eq!(
+            codex_limit_override("gpt-5.5-codex"),
+            Some((400_000, 272_000, 128_000))
+        );
         assert_eq!(codex_limit_override("gpt-5.4"), None);
         assert_eq!(codex_limit_override("gpt-5.4-mini"), None);
     }

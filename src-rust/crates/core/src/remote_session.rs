@@ -86,7 +86,10 @@ impl RemoteSessionManager {
     ) -> Result<(), String> {
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("{}/api/sessions/{}/messages", self.base_url, session_id))
+            .post(format!(
+                "{}/api/sessions/{}/messages",
+                self.base_url, session_id
+            ))
             .header("Authorization", format!("Bearer {}", self.access_token))
             .header("Content-Type", "application/json")
             .body(entry_json.to_string())
@@ -150,10 +153,7 @@ impl SessionsWebSocket {
 
     /// Connect to the sessions WebSocket, emit events, and reconnect on disconnect.
     /// Runs until the sender is dropped or the task is cancelled.
-    pub async fn connect(
-        &self,
-        event_tx: mpsc::Sender<SessionEvent>,
-    ) -> Result<(), String> {
+    pub async fn connect(&self, event_tx: mpsc::Sender<SessionEvent>) -> Result<(), String> {
         let mut backoff_secs: u64 = 1;
         loop {
             match self.run_once(&event_tx).await {
@@ -161,8 +161,11 @@ impl SessionsWebSocket {
                     // Server closed cleanly — reconnect.
                     tracing::debug!("SessionsWebSocket: server closed connection, reconnecting");
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, backoff = backoff_secs, "SessionsWebSocket: error, backing off");
+                Err(_) => {
+                    tracing::warn!(
+                        backoff = backoff_secs,
+                        "SessionsWebSocket: error, backing off"
+                    );
                 }
             }
             if event_tx.is_closed() {
@@ -181,10 +184,13 @@ impl SessionsWebSocket {
             self.ws_url,
             urlencoding::encode(&self.access_token)
         );
-        let request = url.as_str().into_client_request().map_err(|e| e.to_string())?;
+        let request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
 
         let (ws_stream, _) = connect_async(request).await.map_err(|e| e.to_string())?;
-        tracing::info!(url = %self.ws_url, "SessionsWebSocket: connected");
+        tracing::info!("SessionsWebSocket: connected");
 
         let mut read = ws_stream;
         while let Some(msg) = read.next().await {
@@ -196,8 +202,11 @@ impl SessionsWebSocket {
                                 return Ok(()); // receiver dropped
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, raw = %text, "SessionsWebSocket: unrecognised event");
+                        Err(_) => {
+                            tracing::debug!(
+                                bytes = text.len(),
+                                "SessionsWebSocket: unrecognised event"
+                            );
                         }
                     }
                 }

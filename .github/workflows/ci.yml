@@ -7,7 +7,7 @@ on:
       - 'src-rust/**'
       - '.github/workflows/ci.yml'
   pull_request:
-    branches: [main]
+    branches: [main, forge/baseline-b0637c9]
     paths:
       - 'src-rust/**'
       - '.github/workflows/ci.yml'
@@ -16,8 +16,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
 
 jobs:
   test:
@@ -46,8 +50,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev pkg-config
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
+      - name: Restore cargo registry & build
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -61,7 +66,41 @@ jobs:
         # Run serially: a number of tests mutate process-global state (env vars
         # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
         # parallel execution, flaking non-deterministically across runners.
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
+
+      - name: Build Windows CLI for PE verification
+        id: windows_cli_build
+        if: runner.os == 'Windows' && always()
+        working-directory: src-rust
+        run: cargo build --locked --package claurst --bin forge
+
+      - name: Verify Windows executable stack reserve
+        if: runner.os == 'Windows' && always() && steps.windows_cli_build.outcome == 'success'
+        shell: pwsh
+        working-directory: src-rust
+        run: |
+          $path = 'target/debug/forge.exe'
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) $path))
+          if ([BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) { throw 'Missing DOS header' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw 'Missing PE signature' }
+          $optional = $pe + 24
+          if ([BitConverter]::ToUInt16($bytes, $optional) -ne 0x20b) { throw 'Expected PE32+ executable' }
+          $reserve = [BitConverter]::ToUInt64($bytes, $optional + 72)
+          $commit = [BitConverter]::ToUInt64($bytes, $optional + 80)
+          if ($reserve -ne 8388608) { throw "Unexpected main stack reserve: $reserve" }
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          $revision = git rev-parse HEAD
+          Write-Output "checkout=$revision forge.exe sha256=$hash stack_reserve_bytes=$reserve stack_commit_bytes=$commit"
+
+      - name: Repeat queued-event close regression
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: src-rust
+        run: |
+          for attempt in {1..20}; do
+            cargo test --package claurst-mcp --locked streamable_get_close_joins_reader_before_return_and_blocks_events -- --test-threads=1
+          done
 
       # Enforced (#227): clippy is clean under `-D warnings`, aside from a few
       # documented crate-level / targeted `#[allow]`s for noisy or risky lints.
@@ -78,3 +117,15 @@ jobs:
         working-directory: src-rust
         continue-on-error: true
         run: cargo fmt --all --check
+
+      # Keep reusable dependencies when a source/test failure stops the job.
+      # Cache scope stays per platform and lockfile, with no secrets or app state.
+      - name: Save cargo registry & build
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

@@ -10,7 +10,10 @@
 // - Authentication via API key from env or config
 
 use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
+use claurst_core::dispatch::{DispatchDenied, DispatchRoute};
+use claurst_core::effort::EffortLevel;
 use claurst_core::error::ClaudeError;
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -20,19 +23,43 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::dispatch_policy::{
+    authorize_anthropic_dispatch, AuthorizedInferenceLease, DispatchIdentity, DispatchPolicy,
+};
+use crate::inference_admission::{AdmissionLease, InferenceAdmission};
+
+fn wire_budget_claude_error(provider: &str, error: provider_wire::WireBudgetError) -> ClaudeError {
+    ClaudeError::from(provider_error::ProviderError::budget(
+        ProviderId::new(provider),
+        error,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
 pub mod bun_tls;
+pub mod client_factory;
 pub mod codex_adapter;
+pub mod dispatch_policy;
+pub mod dispatch_request;
+#[cfg(test)]
+mod dispatch_request_tests;
+#[cfg(test)]
+mod final_request_coverage_tests;
+pub mod inference_admission;
+#[cfg(test)]
+mod inference_admission_tests;
 
 // Provider-agnostic unified types (Phase 1A).
-pub mod provider_types;
 pub mod provider_error;
+pub mod provider_types;
+pub mod provider_wire;
+pub mod provider_witness;
 
 // Provider abstraction traits (Phase 1B).
-pub mod provider;
 pub mod auth;
+pub mod provider;
 pub mod stream_parser;
 pub mod transform;
 
@@ -65,17 +92,21 @@ pub mod transformers;
 // Public re-exports
 // ---------------------------------------------------------------------------
 pub use client::AnthropicClient;
+pub use client_factory::AnthropicClientFactory;
 pub use streaming::{AnthropicStreamEvent, StreamHandler};
 pub use types::*;
 
 // Phase 1A re-exports — provider-agnostic layer.
-pub use provider_types::*;
+pub use dispatch_request::DispatchRequest;
 pub use provider_error::ProviderError;
+pub use provider_types::*;
+pub use provider_wire::*;
+pub use provider_witness::*;
 
 // Phase 1B re-exports — provider abstraction traits.
-pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use provider::{LlmProvider, ModelInfo};
+pub use stream_parser::{JsonLinesStreamParser, SseByteDecoder, SseStreamParser, StreamParser};
 pub use transform::MessageTransformer;
 
 // #228 protocol layer re-exports.
@@ -91,12 +122,12 @@ pub use providers::MinimaxProvider;
 pub use providers::OpenAiProvider;
 
 // Phase 3 re-exports — model registry.
-pub use model_registry::{
-    CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
-    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
-    effective_model_for_config,
-};
 pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use model_registry::{
+    effective_model_for_config, CostBreakdown, CostTier, CostTierCondition, ExperimentalMode,
+    InterleavedReasoning, Modality, ModelEntry, ModelRegistry, ModelStatus, ProviderEntry,
+    ProviderOverride,
+};
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
@@ -111,8 +142,7 @@ pub use providers::CopilotProvider;
 
 // Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
 pub use providers::{
-    OpenAiCompatProvider,
-    ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
+    deepseek, groq, lm_studio, mistral, ollama, opencode_zen, openrouter, xai, OpenAiCompatProvider,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,7 +168,11 @@ static REQUEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_
 /// Override the process-wide request timeout. A value of `0` resets to
 /// [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Idempotent; safe to call multiple times.
 pub fn set_request_timeout_secs(secs: u64) {
-    let value = if secs == 0 { DEFAULT_REQUEST_TIMEOUT_SECS } else { secs };
+    let value = if secs == 0 {
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    } else {
+        secs
+    };
     REQUEST_TIMEOUT_SECS.store(value, Ordering::Relaxed);
 }
 
@@ -203,6 +237,17 @@ pub mod types {
         pub stream: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub thinking: Option<ThinkingConfig>,
+        /// Anthropic native automatic prompt-caching control. Other adapters
+        /// never serialize this legacy Messages request type.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cache_control: Option<CacheControl>,
+        /// Finite preflight policy retained for the transport boundary.
+        /// This metadata is never serialized into provider JSON.
+        #[serde(skip)]
+        pub wire_budget: Option<provider_wire::WireBudget>,
+        /// Host-owned dispatch authorization metadata, omitted from provider JSON.
+        #[serde(skip)]
+        pub dispatch: Option<crate::DispatchRequest>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,14 +407,9 @@ pub mod streaming {
             content_block: ContentBlock,
         },
         /// Incremental delta for an existing content block.
-        ContentBlockDelta {
-            index: usize,
-            delta: ContentDelta,
-        },
+        ContentBlockDelta { index: usize, delta: ContentDelta },
         /// A content block is finished.
-        ContentBlockStop {
-            index: usize,
-        },
+        ContentBlockStop { index: usize },
         /// Final message-level delta (stop_reason, usage).
         MessageDelta {
             stop_reason: Option<String>,
@@ -378,14 +418,10 @@ pub mod streaming {
         /// The message is complete.
         MessageStop,
         /// An error occurred during streaming.
-        Error {
-            error_type: String,
-            message: String,
-        },
+        Error { error_type: String, message: String },
         /// A ping/keep-alive event.
         Ping,
     }
-
 
     /// The delta payload inside a `content_block_delta` event.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,8 +521,7 @@ pub mod client {
     use super::*;
 
     /// Provider selection for API calls.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum Provider {
         /// Use Anthropic's API
         #[default]
@@ -494,8 +529,6 @@ pub mod client {
         /// Use OpenAI Codex via OAuth
         Codex,
     }
-
-    
 
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
@@ -538,12 +571,27 @@ pub mod client {
     pub struct AnthropicClient {
         http: wreq::Client,
         config: ClientConfig,
+        inference_admission: Arc<InferenceAdmission>,
+        dispatch_identity: DispatchIdentity,
+        dispatch_policy: Option<Arc<DispatchPolicy>>,
+        /// Account UUID captured from the same stored token snapshot as
+        /// `config.api_key`. It never follows later active-account switches.
+        oauth_account_uuid: Option<String>,
+        /// Per-client profile result. A process-wide cache can mix account
+        /// metadata after a switch, so each credential owner keeps its own.
+        oauth_account_meta: tokio::sync::OnceCell<Option<(String, bool)>>,
         /// Stable per-client session id; the official client reuses one id for
         /// the whole session, in both the header and `metadata.user_id`.
         session_id: String,
     }
 
     impl AnthropicClient {
+        /// The selected legacy transport, independent of credential contents.
+        /// This does not establish support for verified dispatch.
+        pub fn provider_kind(&self) -> Provider {
+            self.config.provider
+        }
+
         /// Returns `true` when the client was constructed without an API key.
         ///
         /// The query loop checks this to know whether it should fall back to
@@ -557,6 +605,11 @@ pub mod client {
         /// request builders check this to enable stealth-impersonation.
         pub fn is_oauth(&self) -> bool {
             self.config.use_bearer_auth
+        }
+
+        #[cfg(test)]
+        pub(crate) fn captured_oauth_account_uuid(&self) -> Option<&str> {
+            self.oauth_account_uuid.as_deref()
         }
 
         /// First user (non-meta) message text — input to the `cc_version` client
@@ -592,7 +645,7 @@ pub mod client {
         /// `"You are Claude Code…"` identity block (`system[1]`), and strip
         /// Claurst's own attribution so the official identity is the only one the
         /// server sees. No-op for API-key auth.
-        fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
+        pub(crate) fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
             if !self.config.use_bearer_auth {
                 return;
             }
@@ -603,10 +656,12 @@ pub mod client {
                 text,
                 cache_control: None,
             };
-            let billing_block =
-                text_block(claurst_core::oauth_config::claude_code_billing_header(&first_user_text));
-            let identity_block =
-                text_block(claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
+            let billing_block = text_block(claurst_core::oauth_config::claude_code_billing_header(
+                &first_user_text,
+            ));
+            let identity_block = text_block(
+                claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string(),
+            );
 
             // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
             // the injected official identity must be the only one the server sees.
@@ -624,35 +679,34 @@ pub mod client {
                 text.to_string()
             };
 
-            request.system = match request.system.take() {
-                None => Some(SystemPrompt::Blocks(vec![billing_block, identity_block])),
+            let mut preserved = match request.system.take() {
+                None => Vec::new(),
                 Some(SystemPrompt::Text(existing)) => {
-                    let mut blocks = vec![billing_block, identity_block];
                     let stripped = strip_attr(&existing);
-                    if !stripped.is_empty() {
-                        blocks.push(text_block(stripped));
-                    }
-                    Some(SystemPrompt::Blocks(blocks))
+                    (!stripped.is_empty())
+                        .then(|| text_block(stripped))
+                        .into_iter()
+                        .collect()
                 }
-                Some(SystemPrompt::Blocks(mut blocks)) => {
-                    let has_billing = blocks
-                        .first()
-                        .is_some_and(|b| b.text.starts_with("x-anthropic-billing-header:"));
-                    if !has_billing {
-                        if let Some(first) = blocks.first_mut() {
-                            first.text = strip_attr(&first.text);
-                        }
-                        let has_identity = blocks.first().is_some_and(|b| {
-                            b.text == claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
-                        });
-                        if !has_identity {
-                            blocks.insert(0, identity_block);
-                        }
-                        blocks.insert(0, billing_block);
-                    }
-                    Some(SystemPrompt::Blocks(blocks))
-                }
+                Some(SystemPrompt::Blocks(blocks)) => blocks
+                    .into_iter()
+                    .filter(|block| {
+                        !block.text.starts_with("x-anthropic-billing-header:")
+                            && block.text
+                                != claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
+                    })
+                    .collect(),
             };
+            if let Some(first) = preserved.first_mut() {
+                first.text = strip_attr(&first.text);
+            }
+            preserved.retain(|block| !block.text.is_empty());
+
+            let mut blocks = Vec::with_capacity(preserved.len() + 2);
+            blocks.push(billing_block);
+            blocks.push(identity_block);
+            blocks.extend(preserved);
+            request.system = Some(SystemPrompt::Blocks(blocks));
         }
 
         /// Build a new client. Uses a `wreq`/BoringSSL client whose TLS
@@ -660,11 +714,99 @@ pub mod client {
         /// allowed; validation is deferred to the first call.
         pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
             let http = crate::bun_tls::build_anthropic_client(config.request_timeout)?;
+            let oauth_account_uuid = config
+                .use_bearer_auth
+                .then(|| {
+                    claurst_core::oauth::OAuthTokens::active_account_uuid_for_credential(
+                        &config.api_key,
+                    )
+                })
+                .flatten();
             Ok(Self {
                 http,
                 config,
+                inference_admission: InferenceAdmission::process(),
+                dispatch_identity: DispatchIdentity::fresh(),
+                dispatch_policy: None,
+                oauth_account_uuid,
+                oauth_account_meta: tokio::sync::OnceCell::const_new(),
                 session_id: uuid::Uuid::new_v4().to_string(),
             })
+        }
+
+        /// Use a caller-owned process admission service. This is primarily
+        /// useful for bounded tests and hosts that configure a shared limit.
+        pub fn with_inference_admission(mut self, admission: Arc<InferenceAdmission>) -> Self {
+            self.inference_admission = admission;
+            self
+        }
+
+        /// Install a host-owned dispatch policy. Replacing the policy rotates
+        /// the client identity, invalidating envelopes minted for the prior
+        /// policy instance.
+        pub fn with_dispatch_policy(mut self, policy: Arc<DispatchPolicy>) -> Self {
+            self.dispatch_identity = DispatchIdentity::fresh();
+            self.dispatch_policy = Some(policy);
+            self
+        }
+
+        fn dispatch_endpoint(&self) -> String {
+            format!("{}/v1/messages", self.config.api_base)
+        }
+
+        /// Construct a pure Anthropic API-key route. OAuth, Codex, missing
+        /// credentials, and absent policy are unsupported by this bridge.
+        pub fn dispatch_route(
+            &self,
+            model: &str,
+            effort: EffortLevel,
+        ) -> Result<DispatchRoute, DispatchDenied> {
+            if self.config.provider != Provider::Anthropic
+                || self.config.use_bearer_auth
+                || self.config.api_key.is_empty()
+            {
+                return Err(DispatchDenied::UnsupportedRoute);
+            }
+            let policy = self
+                .dispatch_policy
+                .as_ref()
+                .ok_or(DispatchDenied::UnsupportedRoute)?;
+            policy.anthropic_route(
+                &self.dispatch_identity,
+                &self.dispatch_endpoint(),
+                model,
+                effort,
+            )
+        }
+
+        fn validate_dispatch_request(
+            &self,
+            dispatch: Option<&crate::DispatchRequest>,
+        ) -> Result<(), ClaudeError> {
+            let Some(dispatch) = dispatch else {
+                return Ok(());
+            };
+            if self.config.provider != Provider::Anthropic
+                || self.config.use_bearer_auth
+                || self.config.api_key.is_empty()
+            {
+                return Err(ClaudeError::InferenceDispatchDenied(
+                    DispatchDenied::UnsupportedRoute,
+                ));
+            }
+            let policy =
+                self.dispatch_policy
+                    .as_ref()
+                    .ok_or(ClaudeError::InferenceDispatchDenied(
+                        DispatchDenied::UnsupportedRoute,
+                    ))?;
+            policy
+                .validate_anthropic_envelope(
+                    &self.dispatch_identity,
+                    &self.dispatch_endpoint(),
+                    dispatch,
+                )
+                .map_err(ClaudeError::InferenceDispatchDenied)
         }
 
         /// Convenience constructor that resolves the key from config/env.
@@ -688,6 +830,7 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
+            self.validate_dispatch_request(request.dispatch.as_ref())?;
             // Deferred key validation — fail here rather than at construction
             // so that non-Anthropic provider setups don't crash on startup.
             if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
@@ -699,7 +842,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -731,11 +878,13 @@ pub mod client {
                     )
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Route to Codex if configured
             if self.config.provider == Provider::Codex {
@@ -746,12 +895,22 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
+            let (resp, _lease) = self
+                .send_with_retry(
+                    &body,
+                    request.wire_budget.as_ref(),
+                    request.dispatch.as_ref(),
+                    false,
+                )
+                .await?;
             let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|_| ClaudeError::Api("Failed to read provider response".into()))?;
 
             if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                return Err(Self::parse_api_error(status.as_u16(), &text));
             }
 
             serde_json::from_str(&text).map_err(ClaudeError::Json)
@@ -762,42 +921,15 @@ pub mod client {
             &self,
             request: &CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
-            // Convert Anthropic format to OpenAI format
-            let openai_req = codex_adapter::anthropic_to_openai_request(request);
-
-            // Send to Codex endpoint
-            let client = reqwest::Client::new();
-            let resp = client
-                .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("Content-Type", "application/json")
-                .json(&openai_req)
-                .timeout(self.config.request_timeout)
-                .send()
-                .await
-                .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
-
-            let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-
-            if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
-            }
-
-            // Parse OpenAI response and convert to Anthropic format
-            let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
-            let (content, stop_reason, input_tokens, output_tokens) =
-                codex_adapter::parse_openai_response(&openai_resp);
-
-            let response = codex_adapter::build_anthropic_response(
-                &content,
-                &stop_reason,
-                input_tokens,
-                output_tokens,
-                &request.model,
-            );
-
-            Ok(response)
+            crate::dispatch_request::reject_unsupported_dispatch(
+                &ProviderId::new(ProviderId::CODEX),
+                request.dispatch.as_ref(),
+            )
+            .map_err(ClaudeError::from)?;
+            Err(ClaudeError::Other(
+                "The legacy Codex client cannot safely translate Chat messages to the Responses API; use the modern Codex provider"
+                    .to_string(),
+            ))
         }
 
         // ---- Streaming create message ------------------------------------
@@ -810,6 +942,7 @@ pub mod client {
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            self.validate_dispatch_request(request.dispatch.as_ref())?;
             // Deferred key validation
             if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
                 let model = &request.model;
@@ -818,7 +951,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -826,7 +963,10 @@ pub mod client {
                 } else if model.starts_with("deepseek") {
                     format!("Model '{}' is a DeepSeek model. Use `--provider deepseek` or set DEEPSEEK_API_KEY.", model)
                 } else if model.starts_with("grok") {
-                    format!("Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.", model)
+                    format!(
+                        "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
+                        model
+                    )
                 } else if model.starts_with("mistral") || model.starts_with("codestral") {
                     format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
                 } else if model.starts_with("command-") {
@@ -835,11 +975,13 @@ pub mod client {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Codex provider doesn't support streaming yet
             if self.config.provider == Provider::Codex {
@@ -852,25 +994,56 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
+            let (resp, lease) = self
+                .send_with_retry(
+                    &body,
+                    request.wire_budget.as_ref(),
+                    request.dispatch.as_ref(),
+                    true,
+                )
+                .await?;
             let status = resp.status();
 
             if !status.is_success() {
-                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|_| ClaudeError::Api("Failed to read provider response".into()))?;
+                return Err(Self::parse_api_error(status.as_u16(), &text));
             }
 
             let (tx, rx) = mpsc::channel(256);
 
             // Spawn a task that reads the SSE byte stream and emits events.
+            let process_handler = Arc::clone(&handler);
             tokio::spawn(async move {
-                if let Err(e) = Self::process_sse_stream(resp, handler, tx.clone()).await {
-                    let _ = tx
-                        .send(streaming::AnthropicStreamEvent::Error {
-                            error_type: "stream_error".into(),
-                            message: e.to_string(),
-                        })
-                        .await;
+                let lease = lease;
+                let result = tokio::select! {
+                    _ = tx.closed() => Ok(None),
+                    result = Self::process_sse_stream(resp, process_handler, tx.clone()) => result,
+                };
+                // `process_sse_stream` owns the response body. Drop both it
+                // and the authorization/admission lease before delivering a
+                // terminal event to a retained receiver.
+                drop(lease);
+                match result {
+                    Ok(Some(event)) => {
+                        if !tx.is_closed() {
+                            handler.on_event(&event);
+                            let _ = tx.send(event).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if !tx.is_closed() {
+                            let _ = tx
+                                .send(streaming::AnthropicStreamEvent::Error {
+                                    error_type: "stream_error".into(),
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
                 }
             });
 
@@ -930,22 +1103,36 @@ pub mod client {
         async fn send_with_retry(
             &self,
             body: &Value,
-        ) -> Result<wreq::Response, ClaudeError> {
-            let url = format!("{}/v1/messages", self.config.api_base);
+            budget: Option<&provider_wire::WireBudget>,
+            dispatch: Option<&crate::DispatchRequest>,
+            stream: bool,
+        ) -> Result<(wreq::Response, AuthorizedInferenceLease), ClaudeError> {
+            self.validate_dispatch_request(dispatch)?;
+            let url = self.dispatch_endpoint();
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
+
+            // Validate the unmodified request before OAuth account metadata
+            // lookup. This keeps malformed, oversized, or unsupported-media
+            // requests entirely local; the final body is prepared again after
+            // metadata mutation below.
+            provider_wire::prepare_json_checked("anthropic", &url, stream, body, budget)
+                .map_err(|error| wire_budget_claude_error("anthropic", error))?;
 
             let use_oauth = self.config.use_bearer_auth;
             let session_id = self.session_id.clone();
 
-            // Active OAuth account, fetched once and cached for the process
-            // lifetime. `account_uuid` -> `metadata.user_id`; `has_premium`
+            // Active OAuth account, fetched once for this exact client
+            // credential. `account_uuid` -> `metadata.user_id`; `has_premium`
             // selects the account-tier `anthropic-beta` set.
             let (account_uuid, has_premium): (String, bool) = if use_oauth {
-                use tokio::sync::OnceCell;
-                static CACHE: OnceCell<Option<(String, bool)>> = OnceCell::const_new();
-                CACHE
-                    .get_or_init(claurst_core::oauth::current_anthropic_account_meta)
+                self.oauth_account_meta
+                    .get_or_init(|| {
+                        claurst_core::oauth::anthropic_account_meta_for_credential(
+                            &self.config.api_key,
+                            self.oauth_account_uuid.clone(),
+                        )
+                    })
                     .await
                     .clone()
                     .unwrap_or_default()
@@ -957,7 +1144,7 @@ pub mod client {
             // step: the interactive CLI sends a literal `cch=00000` and its real
             // client hash rides in the `cc_version` suffix (set in
             // `apply_oauth_stealth`). See `claude-re/findings/CCH-NATIVE.md`.
-            let body_str = if use_oauth {
+            let body_val = if use_oauth {
                 let mut body_val = body.clone();
                 if let serde_json::Value::Object(map) = &mut body_val {
                     let device_id = {
@@ -992,11 +1179,14 @@ pub mod client {
                         }
                     }
                 }
-                serde_json::to_string(&body_val)
+                body_val
             } else {
-                serde_json::to_string(body)
-            }
-            .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
+                body.clone()
+            };
+            let prepared =
+                provider_wire::prepare_json_checked("anthropic", &url, stream, &body_val, budget)
+                    .map_err(|error| wire_budget_claude_error("anthropic", error))?;
+            let body_bytes = prepared.bytes().to_vec();
 
             // Account-tier `anthropic-beta` set (Pro vs Max), stable across retries.
             let anthropic_beta = if use_oauth {
@@ -1026,6 +1216,8 @@ pub mod client {
                 "x86" => "x32",
                 other => other,
             };
+
+            let mut admission: Option<AdmissionLease> = None;
 
             loop {
                 attempts += 1;
@@ -1070,14 +1262,47 @@ pub mod client {
                     req = req.header("x-api-key", &self.config.api_key);
                 }
 
-                let req = req.body(body_str.clone());
-
-                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                if dispatch.is_some() {
+                    req = req.redirect(wreq::redirect::Policy::none());
+                }
+                let request = req
+                    .body(body_bytes.clone())
+                    .build()
+                    .map_err(|_| ClaudeError::Api("HTTP request construction failed".into()))?;
+                let endpoint = request.uri().to_string();
+                if admission.is_none() {
+                    admission =
+                        Some(self.inference_admission.acquire().await.map_err(|error| {
+                            ClaudeError::Api(format!("Inference admission failed: {error}"))
+                        })?);
+                }
+                let authorization = authorize_anthropic_dispatch(
+                    self.dispatch_policy.as_deref(),
+                    &self.dispatch_identity,
+                    &endpoint,
+                    &prepared,
+                    dispatch,
+                )
+                .await
+                .map_err(ClaudeError::InferenceDispatchDenied)?;
+                let resp = self
+                    .http
+                    .execute(request)
+                    .await
+                    .map_err(|_| ClaudeError::Api("Provider HTTP request failed".into()))?;
                 let status = resp.status().as_u16();
 
                 // 200-299: success
                 if resp.status().is_success() {
-                    return Ok(resp);
+                    let Some(admission) = admission.take() else {
+                        return Err(ClaudeError::Api(
+                            "inference admission lease unavailable".into(),
+                        ));
+                    };
+                    return Ok((
+                        resp,
+                        AuthorizedInferenceLease::new(admission, authorization),
+                    ));
                 }
 
                 // 429 (rate limit) or 529 (overloaded): retry
@@ -1097,6 +1322,11 @@ pub mod client {
                         wait_secs = wait.as_secs(),
                         "Retryable API error, backing off"
                     );
+                    // Fully consume the retry response before waiting. This
+                    // keeps the response body lifetime inside the admission
+                    // lease and lets the transport reuse the connection.
+                    let _ = resp.text().await;
+                    drop(authorization);
                     tokio::time::sleep(wait).await;
                     delay = (delay * 2).min(self.config.max_retry_delay);
                     continue;
@@ -1104,30 +1334,27 @@ pub mod client {
 
                 // Non-retryable error – return immediately
                 let text = resp.text().await.unwrap_or_default();
-                return Err(self.parse_api_error(status, &text));
+                drop(authorization);
+                return Err(Self::parse_api_error(status, &text));
             }
         }
 
-        /// Parse an API error body into a typed `ClaudeError`.
-        fn parse_api_error(&self, status: u16, body: &str) -> ClaudeError {
-            if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(body) {
-                match status {
-                    401 => ClaudeError::Auth(err.error.message),
-                    429 => ClaudeError::RateLimit,
-                    529 => ClaudeError::ApiStatus {
-                        status,
-                        message: format!("Overloaded: {}", err.error.message),
-                    },
-                    _ => ClaudeError::ApiStatus {
-                        status,
-                        message: err.error.message,
-                    },
+        /// Map a provider failure to a typed error without carrying response
+        /// content into logs or user-facing output.
+        pub(super) fn parse_api_error(status: u16, _body: &str) -> ClaudeError {
+            match status {
+                401 | 403 => {
+                    ClaudeError::Auth("Provider rejected the configured credentials".into())
                 }
-            } else {
-                ClaudeError::ApiStatus {
+                429 => ClaudeError::RateLimit,
+                529 => ClaudeError::ApiStatus {
                     status,
-                    message: body.to_string(),
-                }
+                    message: "Provider overloaded".into(),
+                },
+                _ => ClaudeError::ApiStatus {
+                    status,
+                    message: "Provider request failed".into(),
+                },
             }
         }
 
@@ -1147,7 +1374,7 @@ pub mod client {
             resp: wreq::Response,
             handler: Arc<dyn StreamHandler>,
             tx: mpsc::Sender<streaming::AnthropicStreamEvent>,
-        ) -> Result<(), ClaudeError> {
+        ) -> Result<Option<streaming::AnthropicStreamEvent>, ClaudeError> {
             use sse_parser::SseLineParser;
 
             let mut parser = SseLineParser::new();
@@ -1157,26 +1384,46 @@ pub mod client {
             let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
 
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            loop {
+                let chunk_result = tokio::select! {
+                    _ = tx.closed() => return Ok(None),
+                    chunk = byte_stream.next() => chunk,
+                };
+                let Some(chunk_result) = chunk_result else {
+                    break;
+                };
+                let chunk = chunk_result
+                    .map_err(|_| ClaudeError::Api("Provider stream read failed".into()))?;
 
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
-                        if let Some(event) =
-                            Self::frame_to_event(&frame.event, &frame.data)
-                        {
+                        if let Some(event) = Self::frame_to_event(&frame.event, &frame.data) {
+                            if tx.is_closed() {
+                                return Ok(None);
+                            }
+                            let terminal = matches!(
+                                &event,
+                                streaming::AnthropicStreamEvent::MessageStop
+                                    | streaming::AnthropicStreamEvent::Error { .. }
+                            );
+                            if terminal {
+                                return Ok(Some(event));
+                            }
                             handler.on_event(&event);
-                            if tx.send(event).await.is_err() {
-                                // Receiver dropped – stop reading.
-                                return Ok(());
+                            let send_result = tokio::select! {
+                                _ = tx.closed() => return Ok(None),
+                                result = tx.send(event) => result,
+                            };
+                            if send_result.is_err() {
+                                return Ok(None);
                             }
                         }
                     }
                 }
             }
 
-            Ok(())
+            Ok(None)
         }
 
         /// Convert a parsed SSE frame into a typed `AnthropicStreamEvent`.
@@ -1290,6 +1537,9 @@ impl CreateMessageRequest {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            cache_control: None,
+            wire_budget: None,
+            dispatch: None,
         }
     }
 }
@@ -1305,6 +1555,9 @@ pub struct CreateMessageRequestBuilder {
     top_k: Option<u32>,
     stop_sequences: Option<Vec<String>>,
     thinking: Option<ThinkingConfig>,
+    cache_control: Option<CacheControl>,
+    wire_budget: Option<provider_wire::WireBudget>,
+    dispatch: Option<crate::DispatchRequest>,
 }
 
 impl CreateMessageRequestBuilder {
@@ -1358,6 +1611,21 @@ impl CreateMessageRequestBuilder {
         self
     }
 
+    pub fn cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+
+    pub fn wire_budget(mut self, budget: provider_wire::WireBudget) -> Self {
+        self.wire_budget = Some(budget);
+        self
+    }
+
+    pub fn dispatch(mut self, dispatch: crate::DispatchRequest) -> Self {
+        self.dispatch = Some(dispatch);
+        self
+    }
+
     pub fn build(self) -> CreateMessageRequest {
         CreateMessageRequest {
             model: self.model,
@@ -1371,6 +1639,9 @@ impl CreateMessageRequestBuilder {
             stop_sequences: self.stop_sequences,
             stream: true,
             thinking: self.thinking,
+            cache_control: self.cache_control,
+            wire_budget: self.wire_budget,
+            dispatch: self.dispatch,
         }
     }
 }
@@ -1443,7 +1714,10 @@ impl StreamAccumulator {
                         name: name.clone(),
                         json_buf: String::new(),
                     },
-                    ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => PartialBlock::Thinking {
                         thinking_buf: thinking.clone(),
                         signature_buf: signature.clone(),
                     },
@@ -1488,7 +1762,12 @@ impl StreamAccumulator {
                         PartialBlock::ToolUse { id, name, json_buf } => {
                             let input = serde_json::from_str(&json_buf)
                                 .unwrap_or(Value::Object(Default::default()));
-                            ContentBlock::ToolUse { id, name, input, thought_signature: None }
+                            ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature: None,
+                            }
                         }
                         PartialBlock::Thinking {
                             thinking_buf,
@@ -1541,6 +1820,154 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oauth_clients_keep_coherent_account_and_identity_snapshots() {
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("CLAURST_HOME", value),
+                    None => std::env::remove_var("CLAURST_HOME"),
+                }
+            }
+        }
+        struct TempRoot(std::path::PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().await;
+        let temp = TempRoot(
+            std::env::temp_dir().join(format!("claurst-oauth-snapshot-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&temp.0).expect("temporary account root");
+        let _restore = EnvRestore(std::env::var_os("CLAURST_HOME"));
+        std::env::set_var("CLAURST_HOME", &temp.0);
+
+        let tokens = |access_token: &str, account_uuid: &str, email: &str| {
+            claurst_core::oauth::OAuthTokens {
+                access_token: access_token.to_string(),
+                scopes: vec![claurst_core::oauth::CLAUDE_AI_INFERENCE_SCOPE.to_string()],
+                account_uuid: Some(account_uuid.to_string()),
+                email: Some(email.to_string()),
+                ..Default::default()
+            }
+        };
+
+        tokens("first-token", "account-one", "one@example.com")
+            .save_and_register(Some("one"))
+            .await
+            .expect("save first account");
+        let first = client::AnthropicClient::new(client::ClientConfig {
+            api_key: "first-token".into(),
+            use_bearer_auth: true,
+            ..Default::default()
+        })
+        .expect("first OAuth client");
+        assert_eq!(first.captured_oauth_account_uuid(), Some("account-one"));
+
+        tokens("second-token", "account-two", "two@example.com")
+            .save_and_register(Some("two"))
+            .await
+            .expect("save second account");
+        let second = client::AnthropicClient::new(client::ClientConfig {
+            api_key: "second-token".into(),
+            use_bearer_auth: true,
+            ..Default::default()
+        })
+        .expect("second OAuth client");
+        let stale_credential = client::AnthropicClient::new(client::ClientConfig {
+            api_key: "first-token".into(),
+            use_bearer_auth: true,
+            ..Default::default()
+        })
+        .expect("stale-credential client");
+
+        assert_eq!(first.captured_oauth_account_uuid(), Some("account-one"));
+        assert_eq!(second.captured_oauth_account_uuid(), Some("account-two"));
+        assert_eq!(stale_credential.captured_oauth_account_uuid(), None);
+
+        let mut request = CreateMessageRequest::builder("fixture-model", 128)
+            .messages(vec![ApiMessage {
+                role: "user".into(),
+                content: Value::String("hello".into()),
+            }])
+            .system(SystemPrompt::Blocks(vec![
+                SystemBlock {
+                    block_type: "text".into(),
+                    text: "x-anthropic-billing-header: stale".into(),
+                    cache_control: None,
+                },
+                SystemBlock {
+                    block_type: "text".into(),
+                    text: claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.into(),
+                    cache_control: None,
+                },
+                SystemBlock {
+                    block_type: "text".into(),
+                    text: "You are Claurst.\n\nKeep this instruction.".into(),
+                    cache_control: None,
+                },
+            ]))
+            .build();
+
+        first.apply_oauth_stealth(&mut request);
+        let once = serde_json::to_value(&request.system).expect("serialize identity blocks");
+        first.apply_oauth_stealth(&mut request);
+        assert_eq!(
+            serde_json::to_value(&request.system).expect("serialize identity blocks"),
+            once,
+            "OAuth identity mutation must be idempotent"
+        );
+
+        let Some(SystemPrompt::Blocks(blocks)) = request.system else {
+            panic!("OAuth identity must use structured blocks");
+        };
+        assert!(blocks[0].text.starts_with("x-anthropic-billing-header:"));
+        assert_eq!(
+            blocks[1].text,
+            claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
+        );
+        assert_eq!(blocks[2].text, "Keep this instruction.");
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.text.starts_with("x-anthropic-billing-header:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| {
+                    block.text == claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_provider_errors_exclude_response_content() {
+        const PRIVATE: &str = "PRIVATE_PROVIDER_RESPONSE_AND_URL_CANARY";
+        for (status, expected) in [
+            (400, "Provider request failed"),
+            (401, "Provider rejected the configured credentials"),
+            (403, "Provider rejected the configured credentials"),
+            (429, "Rate limit exceeded"),
+            (529, "Provider overloaded"),
+        ] {
+            let body = format!(r#"{{"error":{{"type":"fixture","message":"{PRIVATE}"}}}}"#);
+            let presented = client::AnthropicClient::parse_api_error(status, &body).to_string();
+            assert!(presented.contains(expected));
+            assert!(!presented.contains(PRIVATE));
+        }
+    }
 
     #[test]
     fn test_sse_parser_basic() {
@@ -1643,15 +2070,13 @@ mod tests {
 
         // A byte stream that never yields models a provider that begins a
         // streamed response and then pauses indefinitely (issue #185).
-        let mut stalled =
-            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let mut stalled = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
 
         // The exact construct used by the streaming loops: wrapping the chunk
         // read in tokio::time::timeout must elapse rather than hang forever.
         // A short duration keeps the test fast; production uses the generous
         // stream_idle_timeout() value asserted below.
-        let result =
-            tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
         assert!(
             result.is_err(),
             "a stalled stream must hit the idle timeout, not hang"

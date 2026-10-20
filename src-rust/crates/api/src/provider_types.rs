@@ -4,13 +4,17 @@
 // These types form a provider-agnostic layer that every concrete provider
 // adapter (Anthropic, OpenAI, Google, …) maps to/from.
 
+use claurst_core::crypto_utils::sha256_hex;
 use claurst_core::types::{ContentBlock, Message, ToolDefinition, UsageInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 // Re-export ThinkingConfig and SystemPrompt from the api types module so
 // callers only need to import from this module.
-pub use crate::types::{ThinkingConfig, SystemPrompt};
+use crate::provider_wire::WireBudget;
+use crate::provider_witness::ProviderWireWitness;
+pub use crate::types::{SystemPrompt, ThinkingConfig};
 
 // ---------------------------------------------------------------------------
 // StopReason
@@ -36,10 +40,153 @@ pub enum StopReason {
     Other(String),
 }
 
-
 // ---------------------------------------------------------------------------
 // ProviderRequest
 // ---------------------------------------------------------------------------
+
+const MAX_CACHE_SCOPE_COMPONENT_BYTES: usize = 4096;
+const MAX_PROVIDER_RESPONSE_ID_BYTES: usize = 512;
+
+/// Opaque provider-cache routing key bound to one workspace and conversation.
+///
+/// The raw workspace and session labels never reach a provider. Adapters may
+/// map the bounded digest to their native cache hint when the route supports
+/// one; content equality still decides whether a provider cache can hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCacheScope {
+    key: String,
+}
+
+impl ProviderCacheScope {
+    pub fn for_session(
+        workspace_scope: &str,
+        session_id: &str,
+    ) -> Result<Self, ProviderContinuityError> {
+        if workspace_scope.is_empty()
+            || session_id.is_empty()
+            || workspace_scope.len() > MAX_CACHE_SCOPE_COMPONENT_BYTES
+            || session_id.len() > MAX_CACHE_SCOPE_COMPONENT_BYTES
+        {
+            return Err(ProviderContinuityError::InvalidCacheScope);
+        }
+        let mut framed = Vec::with_capacity(
+            workspace_scope
+                .len()
+                .saturating_add(session_id.len())
+                .saturating_add(48),
+        );
+        framed.extend_from_slice(b"forge-provider-cache-v1\0");
+        framed.extend_from_slice(&(workspace_scope.len() as u64).to_be_bytes());
+        framed.extend_from_slice(workspace_scope.as_bytes());
+        framed.extend_from_slice(&(session_id.len() as u64).to_be_bytes());
+        framed.extend_from_slice(session_id.as_bytes());
+        Ok(Self {
+            key: sha256_hex(&framed),
+        })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Exact anchor for a provider-managed response continuation.
+///
+/// It is host metadata: provider adapters serialize only the prior response ID
+/// and only after validating the retained message prefix and all stable request
+/// fields against the current request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseContinuation {
+    previous_response_id: String,
+    message_prefix_len: usize,
+    message_prefix_digest: String,
+    request_fingerprint: String,
+}
+
+impl ResponseContinuation {
+    pub fn new(
+        previous_response_id: impl Into<String>,
+        completed_message_prefix: &[Message],
+        request_fingerprint: String,
+    ) -> Result<Self, ProviderContinuityError> {
+        let previous_response_id = previous_response_id.into();
+        if previous_response_id.is_empty()
+            || previous_response_id.len() > MAX_PROVIDER_RESPONSE_ID_BYTES
+        {
+            return Err(ProviderContinuityError::InvalidResponseId);
+        }
+        if completed_message_prefix.is_empty() || request_fingerprint.len() != 64 {
+            return Err(ProviderContinuityError::InvalidAnchor);
+        }
+        Ok(Self {
+            previous_response_id,
+            message_prefix_len: completed_message_prefix.len(),
+            message_prefix_digest: message_digest(completed_message_prefix)?,
+            request_fingerprint,
+        })
+    }
+
+    pub fn previous_response_id(&self) -> &str {
+        &self.previous_response_id
+    }
+
+    pub fn message_prefix_len(&self) -> usize {
+        self.message_prefix_len
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContinuityError {
+    InvalidCacheScope,
+    InvalidResponseId,
+    InvalidAnchor,
+    Serialization(String),
+}
+
+impl fmt::Display for ProviderContinuityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCacheScope => formatter.write_str("provider cache scope is invalid"),
+            Self::InvalidResponseId => formatter.write_str("provider response id is invalid"),
+            Self::InvalidAnchor => formatter.write_str("provider continuation anchor is invalid"),
+            Self::Serialization(_) => {
+                formatter.write_str("provider continuity metadata could not be serialized")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderContinuityError {}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        Value::Object(values) => {
+            let mut names: Vec<&String> = values.keys().collect();
+            names.sort();
+            let mut canonical = serde_json::Map::new();
+            for name in names {
+                if let Some(value) = values.get(name) {
+                    canonical.insert(name.clone(), canonical_json(value));
+                }
+            }
+            Value::Object(canonical)
+        }
+        primitive => primitive.clone(),
+    }
+}
+
+fn hash_canonical(value: &Value) -> Result<String, ProviderContinuityError> {
+    serde_json::to_vec(&canonical_json(value))
+        .map(|encoded| sha256_hex(&encoded))
+        .map_err(|error| ProviderContinuityError::Serialization(error.to_string()))
+}
+
+fn message_digest(messages: &[Message]) -> Result<String, ProviderContinuityError> {
+    serde_json::to_value(messages)
+        .map_err(|error| ProviderContinuityError::Serialization(error.to_string()))
+        .and_then(|value| hash_canonical(&value))
+}
 
 /// A normalised request that any provider adapter can consume.
 ///
@@ -88,6 +235,94 @@ pub struct ProviderRequest {
     /// Defaults to an empty JSON object `{}`.
     #[serde(default)]
     pub provider_options: Value,
+
+    /// Opaque workspace/conversation cache scope. Adapters map it only to
+    /// native cache controls supported by their active route.
+    #[serde(skip)]
+    pub cache_scope: Option<ProviderCacheScope>,
+
+    /// Optional response-ID continuation anchor. It is ignored unless both the
+    /// active provider route and the exact current request validate it.
+    #[serde(skip)]
+    pub response_continuation: Option<ResponseContinuation>,
+
+    /// Finite preflight policy for this inference request. The policy is
+    /// consumed by transports and deliberately omitted from provider JSON.
+    #[serde(skip)]
+    pub wire_budget: Option<WireBudget>,
+
+    /// Host-owned dispatch authorization metadata. It is never serialized into
+    /// provider JSON and present envelopes are rejected by uncertified routes.
+    #[serde(skip)]
+    pub dispatch: Option<crate::dispatch_request::DispatchRequest>,
+}
+
+impl ProviderRequest {
+    /// Return tool definitions in a canonical order shared by provider
+    /// adapters. Name is the primary identity; description and canonical
+    /// schema break malformed duplicate-name ties deterministically.
+    pub fn stable_tools(&self) -> Vec<&ToolDefinition> {
+        let mut tools: Vec<(&ToolDefinition, String)> = self
+            .tools
+            .iter()
+            .map(|tool| (tool, canonical_json(&tool.input_schema).to_string()))
+            .collect();
+        tools.sort_by(|(left, left_schema), (right, right_schema)| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.description.cmp(&right.description))
+                .then_with(|| left_schema.cmp(right_schema))
+        });
+        tools.into_iter().map(|(tool, _)| tool).collect()
+    }
+
+    /// Hash every stable provider field except conversation messages and the
+    /// response anchor itself. Tool order is canonicalized first.
+    pub fn continuity_fingerprint(&self) -> Result<String, ProviderContinuityError> {
+        let stable_tools: Vec<Value> = self
+            .stable_tools()
+            .into_iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": canonical_json(&tool.input_schema),
+                })
+            })
+            .collect();
+        let stable = serde_json::json!({
+            "version": 1,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "tools": stable_tools,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "stop_sequences": self.stop_sequences,
+            "thinking": self.thinking,
+            "provider_options": canonical_json(&self.provider_options),
+            "cache_scope": self.cache_scope.as_ref().map(ProviderCacheScope::key),
+        });
+        hash_canonical(&stable)
+    }
+
+    /// Validate a response anchor against the current retained prefix and all
+    /// stable request fields. Appended messages form the eligible delta.
+    pub fn validated_response_continuation(&self) -> Option<&ResponseContinuation> {
+        let anchor = self.response_continuation.as_ref()?;
+        if self.cache_scope.is_none()
+            || anchor.message_prefix_len == 0
+            || anchor.message_prefix_len >= self.messages.len()
+        {
+            return None;
+        }
+        let prefix = self.messages.get(..anchor.message_prefix_len)?;
+        let digest = message_digest(prefix).ok()?;
+        let fingerprint = self.continuity_fingerprint().ok()?;
+        (digest == anchor.message_prefix_digest && fingerprint == anchor.request_fingerprint)
+            .then_some(anchor)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +358,10 @@ pub struct ProviderResponse {
 /// so that the rest of the application can consume a single unified stream.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Content-free evidence for the exact serialized provider request and its
+    /// final native response binding.  This is emitted only by Codex.
+    ProviderWireWitness(ProviderWireWitness),
+
     /// The message has started; carries the provider-assigned id and model.
     MessageStart {
         id: String,
@@ -137,33 +376,19 @@ pub enum StreamEvent {
     },
 
     /// Incremental text delta for an in-progress block.
-    TextDelta {
-        index: usize,
-        text: String,
-    },
+    TextDelta { index: usize, text: String },
 
     /// Incremental thinking / reasoning delta.
-    ThinkingDelta {
-        index: usize,
-        thinking: String,
-    },
+    ThinkingDelta { index: usize, thinking: String },
 
     /// Incremental delta for tool-call JSON arguments.
-    InputJsonDelta {
-        index: usize,
-        partial_json: String,
-    },
+    InputJsonDelta { index: usize, partial_json: String },
 
     /// Incremental delta for a cryptographic signature block.
-    SignatureDelta {
-        index: usize,
-        signature: String,
-    },
+    SignatureDelta { index: usize, signature: String },
 
     /// An in-progress content block is now complete.
-    ContentBlockStop {
-        index: usize,
-    },
+    ContentBlockStop { index: usize },
 
     /// Final message-level delta carrying the stop reason and updated usage.
     MessageDelta {
@@ -175,16 +400,10 @@ pub enum StreamEvent {
     MessageStop,
 
     /// A provider-level error occurred mid-stream.
-    Error {
-        error_type: String,
-        message: String,
-    },
+    Error { error_type: String, message: String },
 
     /// Incremental reasoning / scratchpad delta (alias used by some providers).
-    ReasoningDelta {
-        index: usize,
-        reasoning: String,
-    },
+    ReasoningDelta { index: usize, reasoning: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -224,11 +443,19 @@ impl PartialBlock {
     fn from_start(block: ContentBlock) -> Self {
         match block {
             ContentBlock::Text { text } => PartialBlock::Text(text),
-            ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => PartialBlock::Thinking {
                 thinking_buf: thinking,
                 signature_buf: signature,
             },
-            ContentBlock::ToolUse { id, name, thought_signature, .. } => PartialBlock::ToolUse {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                thought_signature,
+                ..
+            } => PartialBlock::ToolUse {
                 id,
                 name,
                 json_buf: String::new(),
@@ -248,10 +475,20 @@ impl PartialBlock {
                 thinking: thinking_buf,
                 signature: signature_buf,
             },
-            PartialBlock::ToolUse { id, name, json_buf, thought_signature } => {
+            PartialBlock::ToolUse {
+                id,
+                name,
+                json_buf,
+                thought_signature,
+            } => {
                 let input =
                     serde_json::from_str(&json_buf).unwrap_or(Value::Object(Default::default()));
-                ContentBlock::ToolUse { id, name, input, thought_signature }
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                }
             }
             PartialBlock::Passthrough(block) => block,
         }
@@ -349,6 +586,24 @@ impl StreamBlockAccumulator {
 // ProviderCapabilities
 // ---------------------------------------------------------------------------
 
+/// Route-level response-ID continuation support.
+///
+/// `FullContextFallback` means the adapter may send a validated delta and must
+/// retry at most once with the already-available full context when the route
+/// rejects the continuation before a response stream opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseContinuationSupport {
+    #[default]
+    Unsupported,
+    FullContextFallback,
+}
+
+impl ResponseContinuationSupport {
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::FullContextFallback)
+    }
+}
+
 /// Describes the features supported by a particular provider/model combination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -420,15 +675,10 @@ pub enum ProviderStatus {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthMethod {
     /// A static API key sent as an HTTP header.
-    ApiKey {
-        key: String,
-        header: ApiKeyHeader,
-    },
+    ApiKey { key: String, header: ApiKeyHeader },
 
     /// A bearer token sent in the `Authorization` header.
-    Bearer {
-        token: String,
-    },
+    Bearer { token: String },
 
     /// AWS Signature V4 credentials for Amazon Bedrock.
     AwsCredentials {
@@ -467,6 +717,145 @@ pub enum ApiKeyHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claurst_core::types::Message;
+    use serde_json::json;
+
+    fn continuity_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "continuity-model".into(),
+            messages: vec![Message::user("first")],
+            system_prompt: Some(SystemPrompt::Text("stable system".into())),
+            tools: vec![
+                ToolDefinition {
+                    name: "Zulu".into(),
+                    description: "z".into(),
+                    input_schema: json!({"type":"object","properties":{"z":{"type":"string"}}}),
+                },
+                ToolDefinition {
+                    name: "Alpha".into(),
+                    description: "a".into(),
+                    input_schema: json!({"type":"object","properties":{"a":{"type":"string"}}}),
+                },
+            ],
+            max_tokens: 128,
+            temperature: Some(0.2),
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({"reasoningEffort":"low"}),
+            cache_scope: Some(
+                ProviderCacheScope::for_session("workspace-a", "session-a")
+                    .expect("bounded cache scope"),
+            ),
+            response_continuation: None,
+            wire_budget: None,
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn cache_scope_is_opaque_bounded_and_scope_sensitive() {
+        let first =
+            ProviderCacheScope::for_session("workspace-a", "session-a").expect("first scope");
+        let same = ProviderCacheScope::for_session("workspace-a", "session-a").expect("same scope");
+        let other_workspace =
+            ProviderCacheScope::for_session("workspace-b", "session-a").expect("workspace scope");
+        let other_session =
+            ProviderCacheScope::for_session("workspace-a", "session-b").expect("session scope");
+
+        assert_eq!(first.key(), same.key());
+        assert_eq!(first.key().len(), 64);
+        assert_ne!(first.key(), other_workspace.key());
+        assert_ne!(first.key(), other_session.key());
+        assert!(!first.key().contains("workspace"));
+        assert!(ProviderCacheScope::for_session("", "session").is_err());
+        assert!(ProviderCacheScope::for_session("workspace", "").is_err());
+    }
+
+    #[test]
+    fn continuity_fingerprint_canonicalizes_tool_order() {
+        let first = continuity_request();
+        let mut reordered = first.clone();
+        reordered.tools.reverse();
+
+        assert_eq!(
+            first.continuity_fingerprint().expect("first fingerprint"),
+            reordered
+                .continuity_fingerprint()
+                .expect("reordered fingerprint")
+        );
+        assert_eq!(
+            first
+                .stable_tools()
+                .into_iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "Zulu"]
+        );
+    }
+
+    #[test]
+    fn response_continuation_requires_exact_prefix_and_static_request() {
+        let mut request = continuity_request();
+        let fingerprint = request
+            .continuity_fingerprint()
+            .expect("continuity fingerprint");
+        let completed_prefix = vec![
+            Message::user("first"),
+            Message::assistant("provider response"),
+        ];
+        let anchor = ResponseContinuation::new("resp_1", &completed_prefix, fingerprint)
+            .expect("continuation anchor");
+
+        request.messages = completed_prefix.clone();
+        request.messages.push(Message::user("second"));
+        request.response_continuation = Some(anchor.clone());
+        assert_eq!(
+            request
+                .validated_response_continuation()
+                .expect("exact continuation")
+                .message_prefix_len(),
+            2
+        );
+
+        let mut changed_prefix = request.clone();
+        changed_prefix.messages[0] = Message::user("changed");
+        assert!(changed_prefix.validated_response_continuation().is_none());
+
+        let mut changed_tools = request.clone();
+        changed_tools.tools[0].description.push_str(" changed");
+        assert!(changed_tools.validated_response_continuation().is_none());
+
+        let mut changed_model = request.clone();
+        changed_model.model = "different-model".into();
+        assert!(changed_model.validated_response_continuation().is_none());
+
+        let mut changed_effort = request.clone();
+        changed_effort.provider_options = json!({"reasoningEffort":"high"});
+        assert!(changed_effort.validated_response_continuation().is_none());
+
+        let mut changed_sampling = request.clone();
+        changed_sampling.temperature = Some(0.7);
+        assert!(changed_sampling.validated_response_continuation().is_none());
+
+        let mut changed_output_limit = request.clone();
+        changed_output_limit.max_tokens += 1;
+        assert!(changed_output_limit
+            .validated_response_continuation()
+            .is_none());
+
+        let mut changed_scope = request.clone();
+        changed_scope.cache_scope = Some(
+            ProviderCacheScope::for_session("workspace-b", "session-a")
+                .expect("changed cache scope"),
+        );
+        assert!(changed_scope.validated_response_continuation().is_none());
+
+        let mut no_delta = request;
+        no_delta.messages = completed_prefix;
+        assert!(no_delta.validated_response_continuation().is_none());
+    }
 
     /// Regression test for issue #217. The non-streaming aggregators used by
     /// the Anthropic and MiniMax providers delegate to `StreamBlockAccumulator`.
@@ -543,7 +932,10 @@ mod tests {
         // appended non-text blocks last (usize::MAX), so thinking would have
         // landed *after* the text block.
         match &blocks[0] {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 assert_eq!(thinking, "Let me reason.", "thinking text captured");
                 assert_eq!(signature, "sig-abc123", "signature preserved verbatim");
             }
@@ -554,7 +946,12 @@ mod tests {
             other => panic!("expected Text block second, got {other:?}"),
         }
         match &blocks[2] {
-            ContentBlock::ToolUse { id, name, input, thought_signature } => {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 assert_eq!(id, "tool_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(

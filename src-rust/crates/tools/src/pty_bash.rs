@@ -16,6 +16,8 @@ use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::debug;
 

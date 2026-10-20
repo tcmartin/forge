@@ -21,11 +21,14 @@ pub const MAX_DISCOVERY_TERMS: usize = 64;
 static NEXT_CATALOG_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The immutable workspace/session binding for a catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolCatalogScope {
     workspace: PathBuf,
     workspace_identity: WorkspaceIdentity,
     session_id: String,
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    workspace_handle: Arc<fs::File>,
 }
 
 /// Stable identity for the workspace directory represented by a catalog.
@@ -43,6 +46,34 @@ enum WorkspaceIdentity {
     CanonicalPath,
 }
 
+#[cfg(unix)]
+fn workspace_identity(path: &Path) -> Result<(WorkspaceIdentity, Arc<fs::File>), ToolCatalogError> {
+    // Keep the directory open for the lifetime of the scope.  Unlinking an
+    // open directory may succeed, but the filesystem cannot recycle its inode
+    // while this handle still references the original object.
+    let handle = Arc::new(
+        fs::File::open(path)
+            .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?,
+    );
+    let metadata = handle
+        .metadata()
+        .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
+    if !metadata.is_dir() {
+        return Err(ToolCatalogError::ScopeUnavailable(
+            "catalog workspace is not a directory".to_string(),
+        ));
+    }
+    use std::os::unix::fs::MetadataExt;
+    Ok((
+        WorkspaceIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        handle,
+    ))
+}
+
+#[cfg(not(unix))]
 fn workspace_identity(path: &Path) -> Result<WorkspaceIdentity, ToolCatalogError> {
     let metadata = fs::metadata(path)
         .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
@@ -51,20 +82,18 @@ fn workspace_identity(path: &Path) -> Result<WorkspaceIdentity, ToolCatalogError
             "catalog workspace is not a directory".to_string(),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(WorkspaceIdentity::Unix {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        Ok(WorkspaceIdentity::CanonicalPath)
+    Ok(WorkspaceIdentity::CanonicalPath)
+}
+
+impl PartialEq for ToolCatalogScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.workspace == other.workspace
+            && self.workspace_identity == other.workspace_identity
+            && self.session_id == other.session_id
     }
 }
+
+impl Eq for ToolCatalogScope {}
 
 impl ToolCatalogScope {
     /// Capture the current host workspace and session identity. This metadata
@@ -73,6 +102,9 @@ impl ToolCatalogScope {
         let workspace = crate::worktree::workspace_root(ctx)
             .canonicalize()
             .map_err(|error| ToolCatalogError::ScopeUnavailable(error.to_string()))?;
+        #[cfg(unix)]
+        let (identity, workspace_handle) = workspace_identity(&workspace)?;
+        #[cfg(not(unix))]
         let identity = workspace_identity(&workspace)?;
         if ctx.session_id.is_empty() || ctx.session_id.len() > 256 {
             return Err(ToolCatalogError::ScopeUnavailable(
@@ -83,6 +115,8 @@ impl ToolCatalogScope {
             workspace,
             workspace_identity: identity,
             session_id: ctx.session_id.clone(),
+            #[cfg(unix)]
+            workspace_handle,
         })
     }
 
@@ -591,5 +625,20 @@ mod tests {
             receipt.resolve_names(&view, &ctx),
             Err(ToolCatalogError::ReceiptScopeMismatch)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_scope_accepts_same_workspace_content_changes() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let ctx = crate::test_support::allow_all_context(workspace.clone());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(PanicSchemaTool)];
+        let view = ToolCatalogView::from_tools(&ctx, &tools).expect("catalog");
+
+        fs::write(workspace.join("edited.txt"), b"ordinary workspace edit")
+            .expect("write workspace edit");
+        assert!(view.matches_context(&ctx));
     }
 }

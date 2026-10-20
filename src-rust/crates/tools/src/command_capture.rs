@@ -701,10 +701,10 @@ mod tests {
     fn wait_for_windows_fixture_started(marker: &Path, descendant_pid: u32) -> io::Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(contents) = std::fs::read_to_string(marker)
-                && contents.trim().parse::<u32>().ok() == Some(descendant_pid)
-            {
-                return Ok(());
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                if contents.trim().parse::<u32>().ok() == Some(descendant_pid) {
+                    return Ok(());
+                }
             }
             if std::time::Instant::now() >= deadline {
                 return Err(io::Error::new(

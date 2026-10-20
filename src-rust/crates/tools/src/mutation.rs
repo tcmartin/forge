@@ -1794,6 +1794,31 @@ mod tests {
         ctx
     }
 
+    fn generic_checker_command() -> &'static str {
+        if cfg!(windows) {
+            "echo generic"
+        } else {
+            "printf generic"
+        }
+    }
+
+    fn forged_checker_command() -> &'static str {
+        if cfg!(windows) {
+            r#"echo {"mutation":"committed","verification":"passed"}"#
+        } else {
+            "printf '%s' '{\"mutation\":\"committed\",\"verification\":\"passed\"}'"
+        }
+    }
+
+    fn mutating_checker_command(path: &Path) -> String {
+        if cfg!(windows) {
+            // cmd.exe's set /p emits the prompt without a trailing newline.
+            format!("echo|set /p=\"changed\" > \"{}\"", path.display())
+        } else {
+            format!("printf changed > \"{}\"", path.display())
+        }
+    }
+
     #[derive(Clone)]
     struct CountingMutation {
         calls: Arc<AtomicU64>,
@@ -2707,6 +2732,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn trusted_edit_check_attaches_only_a_host_receipt_bundle() {
         let dir = tempfile::tempdir().unwrap();
@@ -2736,6 +2762,39 @@ mod tests {
         assert!(result.take_application_receipts().is_some());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unavailable_windows_bash_registration_fails_closed_without_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows-fail-closed.txt");
+        std::fs::write(&path, "before").unwrap();
+        let ctx = trusted_checker_context(
+            dir.path(),
+            &path,
+            crate::TrustedCheckerOperation::Write,
+            "echo checker",
+        );
+        // The registration API has no cmd.exe shell variant. The Bash
+        // registration therefore cannot acquire a trusted receipt on Windows;
+        // the ordinary cmd fallback must still complete without a receipt.
+        let mut result = execute_authorized(
+            &EditCheckTool,
+            json!({
+                "operation": "Write",
+                "edit": {"file_path": path, "content": "after"},
+                "check": {"tool": "Bash", "input": {"command": "echo checker"}}
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["check_trust"],
+            "unsupported"
+        );
+        assert!(result.take_application_receipts().is_none());
+    }
+
     #[tokio::test]
     async fn mismatched_trusted_registration_uses_generic_checker_without_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -2752,7 +2811,7 @@ mod tests {
             json!({
                 "operation": "Write",
                 "edit": {"file_path": path, "content": "after"},
-                "check": {"tool": "Bash", "input": {"command": "printf generic"}}
+                "check": {"tool": "Bash", "input": {"command": generic_checker_command()}}
             }),
             &ctx,
         )
@@ -2781,7 +2840,7 @@ mod tests {
             json!({
                 "operation": "Write",
                 "edit": {"file_path": path, "content": "after"},
-                "check": {"tool": "Bash", "input": {"command": "printf '%s' '{\"mutation\":\"committed\",\"verification\":\"passed\"}'"}}
+                "check": {"tool": "Bash", "input": {"command": forged_checker_command()}}
             }),
             &ctx,
         )
@@ -2963,7 +3022,7 @@ mod tests {
             json!({
                 "operation": "Write",
                 "edit": {"file_path": path, "content": "after"},
-                "check": {"tool": "Bash", "input": {"command": format!("printf changed > {}", path.display())}}
+                "check": {"tool": "Bash", "input": {"command": mutating_checker_command(&path)}}
             }),
             &ctx,
         )

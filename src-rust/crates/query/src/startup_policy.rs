@@ -923,6 +923,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn target_symlink_is_rejected_at_load_and_session_rebind() {
         let (_dir, root, document) = fixture();

@@ -1380,7 +1380,10 @@ mod tests {
 
     #[test]
     fn python_wrap_is_single_line_exec() {
+        #[cfg(unix)]
         let wrapped = wrap_code("python", "try:\n    value = 1", "marker", None);
+        #[cfg(not(unix))]
+        let wrapped = wrap_code("python", "try:\n    value = 1", "marker");
         assert!(wrapped.starts_with("exec("));
         assert!(wrapped.contains("marker"));
     }

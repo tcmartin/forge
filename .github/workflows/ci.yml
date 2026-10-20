@@ -7,7 +7,7 @@ on:
       - 'src-rust/**'
       - '.github/workflows/ci.yml'
   pull_request:
-    branches: [main]
+    branches: [main, forge/baseline-b0637c9]
     paths:
       - 'src-rust/**'
       - '.github/workflows/ci.yml'
@@ -16,8 +16,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
 
 jobs:
   test:

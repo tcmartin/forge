@@ -6,6 +6,16 @@
 use std::process::Command;
 
 fn main() {
+    // The Windows MSVC default main-thread stack is 1 MiB. The Forge CLI's
+    // tokio entry future is large enough to overflow that fixed stack before
+    // ACP can emit its first response. Increase only this executable's stack;
+    // other targets and Tokio worker stacks retain their defaults.
+    if std::env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(std::ffi::OsStr::new("windows"))
+        && std::env::var_os("CARGO_CFG_TARGET_ENV").as_deref() == Some(std::ffi::OsStr::new("msvc"))
+    {
+        println!("cargo:rustc-link-arg-bin=forge=/STACK:8388608");
+    }
+
     // Embed build timestamp (RFC 3339 format)
     let now = chrono::Utc::now().to_rfc3339();
     println!("cargo:rustc-env=BUILD_TIME={}", now);

@@ -68,6 +68,31 @@ jobs:
         # parallel execution, flaking non-deterministically across runners.
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
+      - name: Build Windows CLI for PE verification
+        id: windows_cli_build
+        if: runner.os == 'Windows' && always()
+        working-directory: src-rust
+        run: cargo build --locked --package claurst --bin forge
+
+      - name: Verify Windows executable stack reserve
+        if: runner.os == 'Windows' && always() && steps.windows_cli_build.outcome == 'success'
+        shell: pwsh
+        working-directory: src-rust
+        run: |
+          $path = 'target/debug/forge.exe'
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) $path))
+          if ([BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) { throw 'Missing DOS header' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw 'Missing PE signature' }
+          $optional = $pe + 24
+          if ([BitConverter]::ToUInt16($bytes, $optional) -ne 0x20b) { throw 'Expected PE32+ executable' }
+          $reserve = [BitConverter]::ToUInt64($bytes, $optional + 72)
+          $commit = [BitConverter]::ToUInt64($bytes, $optional + 80)
+          if ($reserve -ne 8388608) { throw "Unexpected main stack reserve: $reserve" }
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          $revision = git rev-parse HEAD
+          Write-Output "checkout=$revision forge.exe sha256=$hash stack_reserve_bytes=$reserve stack_commit_bytes=$commit"
+
       - name: Repeat queued-event close regression
         if: runner.os == 'Linux'
         shell: bash

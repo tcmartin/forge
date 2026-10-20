@@ -275,7 +275,7 @@ impl Tool for RegisteredChecker {
                 Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                     let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                     return ToolResult::error(format!(
-                        "Registered checker ownership failed: {error}; cleanup remains unknown ({cleanup})"
+                        "Registered checker ownership failed: {error}; cleanup remains unknown ({cleanup:?})"
                     ))
                     .with_execution_status(crate::ExecutionStatus::Unknown);
                 }

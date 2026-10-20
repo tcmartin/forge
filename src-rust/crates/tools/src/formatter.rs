@@ -144,7 +144,7 @@ async fn run_formatter_argv(
                     evidence: None,
                     partial: true,
                     error: Some(format!(
-                        "Formatter ownership failed: {error}; cleanup remains unknown ({cleanup})"
+                        "Formatter ownership failed: {error}; cleanup remains unknown ({cleanup:?})"
                     )),
                     timed_out: false,
                     cancelled: false,

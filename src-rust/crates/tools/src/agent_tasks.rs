@@ -988,7 +988,7 @@ async fn owned_git_stdout(
             Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                 let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                 return Err(format!(
-                    "Could not arm Git artifact inventory: {error}; cleanup remains unknown ({cleanup})"
+                    "Could not arm Git artifact inventory: {error}; cleanup remains unknown ({cleanup:?})"
                 ));
             }
         }
@@ -1146,7 +1146,7 @@ async fn run_acceptance_checker(
             Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                 let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                 return Err(format!(
-                    "Could not arm registered parent verification: {error}; cleanup remains unknown ({cleanup})"
+                    "Could not arm registered parent verification: {error}; cleanup remains unknown ({cleanup:?})"
                 ));
             }
         }

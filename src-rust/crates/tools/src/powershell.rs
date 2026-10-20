@@ -375,7 +375,7 @@ impl Tool for PowerShellTool {
                     let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                     return with_command_metadata(
                         ToolResult::error(format!(
-                            "Failed to arm PowerShell ownership: {error}; cleanup remains unknown ({cleanup})"
+                            "Failed to arm PowerShell ownership: {error}; cleanup remains unknown ({cleanup:?})"
                         )),
                         "unknown",
                         None,

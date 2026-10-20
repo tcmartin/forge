@@ -874,7 +874,7 @@ async fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String>
             Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                 let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                 return Err(format!(
-                    "Git Job Object arm failed: {error}; cleanup remains unknown ({cleanup})"
+                    "Git Job Object arm failed: {error}; cleanup remains unknown ({cleanup:?})"
                 ));
             }
         };

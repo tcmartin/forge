@@ -900,7 +900,7 @@ async fn get_or_spawn_session(key: &ReplKey) -> Result<Arc<Mutex<ReplSession>>, 
                 Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                     let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                     return Err(format!(
-                        "Failed to arm REPL interpreter '{program}': {error}; cleanup remains unknown ({cleanup})"
+                        "Failed to arm REPL interpreter '{program}': {error}; cleanup remains unknown ({cleanup:?})"
                     ));
                 }
             }

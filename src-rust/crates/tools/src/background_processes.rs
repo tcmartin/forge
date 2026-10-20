@@ -231,7 +231,7 @@ async fn child_for(
             Err(crate::command_capture::SpawnOwnedError::Arm { child, error }) => {
                 let cleanup = crate::command_capture::cleanup_unarmed_child(child).await;
                 Err(ChildLaunchError::Arm(format!(
-                    "background Job Object arm failed: {error}; cleanup remains unknown ({cleanup})"
+                    "background Job Object arm failed: {error}; cleanup remains unknown ({cleanup:?})"
                 )))
             }
         };

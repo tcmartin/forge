@@ -1,6 +1,7 @@
 use super::*;
 use crate::provider_witness::{
-    PreparedWitnessAttempt, ProviderWireWitnessSeed, WireAttemptOutcome, WireEffort,
+    NativeResponseBinding, PreparedWitnessAttempt, ProviderWireWitnessSeed, WireAttemptOutcome,
+    WireEffort,
 };
 use claurst_core::crypto_utils::sha256_hex;
 use claurst_core::types::Message;
@@ -243,7 +244,7 @@ fn witness_extracts_model_effort_and_digest_from_exact_prepared_bytes() {
         messages: vec![Message::user("PRIVATE_CODEX_PROMPT")],
         system_prompt: None,
         tools: vec![],
-        max_tokens: 128,
+        max_tokens: 512,
         temperature: None,
         top_p: None,
         top_k: None,
@@ -279,6 +280,111 @@ fn witness_extracts_model_effort_and_digest_from_exact_prepared_bytes() {
     assert!(!serde_json::to_string(accepted)
         .expect("witness JSON")
         .contains("PRIVATE_CODEX_PROMPT"));
+    let mut response = NativeResponseBinding::default();
+    response.observe(
+        Some(&json!({
+            "id": "response_fixture",
+            "model": "fixture-codex-model",
+            "reasoning": {"effort": "xhigh"}
+        })),
+        true,
+    );
+    let witness = response.finalize(&seed).expect("provider witness");
+    let witness = serde_json::to_value(&witness).expect("witness JSON");
+    assert_eq!(witness["request_max_output_tokens"], 512);
+    assert_eq!(witness["attempts"][0]["wire_max_output_tokens"], 512);
+}
+
+#[test]
+fn witness_output_cap_rejects_invalid_and_inconsistent_serialized_caps() {
+    fn prepared_body(cap: Value, missing: bool) -> crate::provider_wire::PreparedWireRequest {
+        let request = ProviderRequest {
+            model: "fixture-codex-model".into(),
+            messages: vec![Message::user("PRIVATE_CODEX_PROMPT")],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 512,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: json!({"reasoningEffort":"xhigh"}),
+            cache_scope: None,
+            response_continuation: None,
+            wire_budget: Some(
+                crate::WireBudget::finite(
+                    8192,
+                    7680,
+                    512,
+                    1024 * 1024,
+                    crate::MediaAccounting::None,
+                )
+                .expect("fixture budget"),
+            ),
+            dispatch: None,
+        };
+        let mut body = CodexProvider::build_responses_body(&request, false);
+        if missing {
+            body.as_object_mut()
+                .expect("responses body object")
+                .remove("max_output_tokens");
+        } else {
+            body["max_output_tokens"] = cap;
+        }
+        // Exercise the witness boundary with immutable raw preparation. The
+        // provider JSON boundary rejects malformed output options earlier.
+        crate::provider_wire::prepare_bytes(
+            "codex",
+            "https://fixture.invalid/responses",
+            true,
+            serde_json::to_vec(&body).expect("serialized witness fixture"),
+            request.wire_budget.as_ref().expect("fixture budget"),
+        )
+        .expect("prepared witness fixture")
+    }
+
+    for (label, cap, missing) in [
+        ("missing", Value::Null, true),
+        ("zero", json!(0), false),
+        ("fractional", json!(512.5), false),
+        ("oversized", json!(u64::from(u32::MAX) + 1), false),
+    ] {
+        let body = prepared_body(cap, missing);
+        let attempt = PreparedWitnessAttempt::from_prepared(&body, 0, false)
+            .finish(200, WireAttemptOutcome::Accepted);
+        assert!(
+            ProviderWireWitnessSeed::try_new(vec![attempt]).is_err(),
+            "invalid serialized cap must be rejected: {label}"
+        );
+    }
+
+    let body = prepared_body(json!(512), false);
+    let accepted_continuation = PreparedWitnessAttempt::from_prepared(&body, 0, true)
+        .finish(200, WireAttemptOutcome::Accepted);
+    assert!(ProviderWireWitnessSeed::try_new(vec![accepted_continuation]).is_ok());
+
+    let mut body = body;
+    body.wire_sha256 = "0".repeat(64);
+    let mutated = PreparedWitnessAttempt::from_prepared(&body, 0, false)
+        .finish(200, WireAttemptOutcome::Accepted);
+    assert!(ProviderWireWitnessSeed::try_new(vec![mutated]).is_err());
+
+    let rejected =
+        PreparedWitnessAttempt::from_prepared(&prepared_body(json!(512), false), 0, true)
+            .finish(400, WireAttemptOutcome::RejectedContinuation);
+    let accepted =
+        PreparedWitnessAttempt::from_prepared(&prepared_body(json!(512), false), 1, false)
+            .finish(200, WireAttemptOutcome::Accepted);
+    assert!(ProviderWireWitnessSeed::try_new(vec![rejected, accepted]).is_ok());
+
+    let rejected =
+        PreparedWitnessAttempt::from_prepared(&prepared_body(json!(511), false), 0, true)
+            .finish(400, WireAttemptOutcome::RejectedContinuation);
+    let accepted =
+        PreparedWitnessAttempt::from_prepared(&prepared_body(json!(512), false), 1, false)
+            .finish(200, WireAttemptOutcome::Accepted);
+    assert!(ProviderWireWitnessSeed::try_new(vec![rejected, accepted]).is_err());
 }
 
 #[tokio::test]

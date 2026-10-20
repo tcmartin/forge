@@ -62,6 +62,8 @@ pub struct ProviderWireAttempt {
     pub wire_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<WireEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_max_output_tokens: Option<u32>,
     pub wire_sha256: String,
     pub wire_bytes: u64,
     pub wire_fields_valid: bool,
@@ -83,6 +85,8 @@ pub struct ProviderWireWitness {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<WireEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_effort: Option<WireEffort>,
@@ -95,6 +99,7 @@ pub struct PreparedWitnessAttempt {
     continuation: bool,
     wire_model: Option<String>,
     wire_effort: Option<WireEffort>,
+    wire_max_output_tokens: Option<u32>,
     wire_sha256: String,
     wire_bytes: u64,
     wire_fields_valid: bool,
@@ -125,6 +130,12 @@ impl PreparedWitnessAttempt {
             .and_then(|value| value.get("effort"))
             .and_then(Value::as_str)
             .and_then(WireEffort::parse);
+        let wire_max_output_tokens = parsed
+            .as_ref()
+            .and_then(|value| value.get("max_output_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
         let wire_fields_valid = parsed.is_some()
             && wire_model.is_some()
             && parsed
@@ -132,13 +143,15 @@ impl PreparedWitnessAttempt {
                 .and_then(|value| value.get("reasoning"))
                 .and_then(|value| value.get("effort"))
                 .and_then(Value::as_str)
-                .is_some_and(|value| WireEffort::parse(value).is_some());
+                .is_some_and(|value| WireEffort::parse(value).is_some())
+            && wire_max_output_tokens.is_some();
 
         Self {
             attempt_index,
             continuation,
             wire_model,
             wire_effort,
+            wire_max_output_tokens,
             wire_sha256: prepared.wire_sha256.clone(),
             wire_bytes: prepared.wire_bytes,
             wire_fields_valid,
@@ -155,6 +168,7 @@ impl PreparedWitnessAttempt {
             outcome,
             wire_model: self.wire_model,
             wire_effort: self.wire_effort,
+            wire_max_output_tokens: self.wire_max_output_tokens,
             wire_sha256: self.wire_sha256,
             wire_bytes: self.wire_bytes,
             wire_fields_valid: self.wire_fields_valid,
@@ -200,6 +214,9 @@ impl ProviderWireWitnessSeed {
         let every_attempt_valid = attempts.iter().all(|attempt| {
             bounded_string_option(attempt.wire_model.as_deref())
                 && attempt.wire_effort.is_some()
+                && attempt
+                    .wire_max_output_tokens
+                    .is_some_and(|value| value > 0)
                 && is_sha256(&attempt.wire_sha256)
                 && attempt.wire_bytes > 0
                 && attempt.wire_bytes <= MAX_WITNESS_BYTES
@@ -228,6 +245,7 @@ impl ProviderWireWitnessSeed {
                         .is_some_and(|status| (200..300).contains(&status))
                     && rejected.wire_model == accepted.wire_model
                     && rejected.wire_effort == accepted.wire_effort
+                    && rejected.wire_max_output_tokens == accepted.wire_max_output_tokens
             }
             _ => false,
         };
@@ -342,6 +360,7 @@ impl NativeResponseBinding {
             status = WitnessBindingStatus::Malformed;
         } else if accepted.wire_model.as_ref() != self.completed_model.as_ref()
             || (self.effort.is_some() && accepted.wire_effort.as_ref() != self.effort.as_ref())
+            || accepted.wire_max_output_tokens.is_none()
         {
             status = WitnessBindingStatus::Mismatch;
         }
@@ -359,6 +378,7 @@ impl NativeResponseBinding {
             native_response_id: self.completed_id.clone()?,
             wire_model: accepted.wire_model.clone(),
             wire_effort: accepted.wire_effort,
+            request_max_output_tokens: accepted.wire_max_output_tokens,
             server_model: self.completed_model.clone(),
             server_effort: self.effort,
             binding_status: status,
@@ -401,6 +421,7 @@ mod tests {
             outcome,
             wire_model: Some("fixture-model".to_owned()),
             wire_effort: Some(WireEffort::XHigh),
+            wire_max_output_tokens: Some(512),
             wire_sha256: "0".repeat(64),
             wire_bytes: 1,
             wire_fields_valid: true,

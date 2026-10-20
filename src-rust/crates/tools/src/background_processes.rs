@@ -817,6 +817,7 @@ mod tests {
         assert!(text.contains("stderr-before-pipe-error"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cap_admits_after_evicting_oldest_terminal_entry() {
         let workspace = tempfile::tempdir().unwrap();
@@ -844,6 +845,7 @@ mod tests {
         assert!(global_registry().get(evicted).is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn completed_owned_process_clears_only_after_group_cleanup() {
         let workspace = tempfile::tempdir().unwrap();
@@ -952,6 +954,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn scoped_shutdown_does_not_cancel_foreign_session() {
         let workspace = tempfile::tempdir().unwrap();
@@ -975,6 +978,7 @@ mod tests {
         let _ = wait_for_terminal(&id, &owner).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_failure_clears_its_pending_owner() {
         let workspace = tempfile::tempdir().unwrap();
@@ -988,6 +992,30 @@ mod tests {
         assert_eq!(result["task"]["status"], "failed");
         assert_eq!(result["task"]["metadata"]["execution_status"], "unknown");
         assert!(!mutation::pending_for_scope(&ctx));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unavailable_windows_background_launch_leaves_no_task_or_pending_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = test_context(
+            workspace.path(),
+            &format!("windows-background-unavailable-{}", Uuid::new_v4()),
+        );
+        let marker = workspace.path().join("must-not-launch.txt");
+        assert!(list(&ctx).await.is_empty());
+        assert!(!mutation::pending_for_scope(&ctx));
+        let error = spawn(
+            format!("echo forbidden > \"{}\"", marker.display()),
+            workspace.path().into(),
+            30_000,
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(error.contains("unavailable on Windows until Job Object cleanup is supported"));
+        assert!(list(&ctx).await.is_empty());
+        assert!(!mutation::pending_for_scope(&ctx));
+        assert!(!marker.exists());
     }
 
     #[test]

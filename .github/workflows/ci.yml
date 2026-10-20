@@ -66,7 +66,7 @@ jobs:
         # Run serially: a number of tests mutate process-global state (env vars
         # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
         # parallel execution, flaking non-deterministically across runners.
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
       - name: Repeat queued-event close regression
         if: runner.os == 'Linux'

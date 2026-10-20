@@ -5613,7 +5613,9 @@ pub mod hooks {
             )
             .await
             .expect("arm-failure cleanup must be bounded");
-            let error = result.expect_err("pre-resume arm failure must reject hook");
+            let Err(error) = result else {
+                panic!("pre-resume arm failure must reject hook");
+            };
             let message = error.to_string();
             assert!(message.contains("cleanup remains unknown"));
             assert!(message.contains("direct_child=true"));

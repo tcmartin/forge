@@ -152,6 +152,7 @@ extern "system" {
 }
 
 fn last_error(operation: &str) -> io::Error {
+    // SAFETY: GetLastError reads thread-local error state and takes no pointers.
     let code = unsafe { GetLastError() };
     io::Error::new(
         io::ErrorKind::Other,
@@ -222,8 +223,10 @@ fn sole_initial_thread(process_id: Dword) -> io::Result<OwnedHandle> {
         ..ThreadEntry32::default()
     };
     let mut candidate = None;
+    // SAFETY: snapshot is owned and entry is initialized writable THREADENTRY32 storage.
     let first = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
     if first != TRUE {
+        // SAFETY: GetLastError reads thread-local error state and takes no pointers.
         let error = unsafe { GetLastError() } as i32;
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -243,10 +246,12 @@ fn sole_initial_thread(process_id: Dword) -> io::Result<OwnedHandle> {
                 ));
             }
         }
+        // SAFETY: snapshot is owned and entry is initialized writable THREADENTRY32 storage.
         let next = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
         if next == TRUE {
             continue;
         }
+        // SAFETY: GetLastError reads thread-local error state and takes no pointers.
         let error = unsafe { GetLastError() } as i32;
         if error != ERROR_NO_MORE_FILES {
             return Err(io::Error::new(
@@ -287,11 +292,15 @@ pub struct JobObjectGuard {
 }
 
 #[cfg(test)]
-static FAIL_BEFORE_RESUME: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+    // Arming is synchronous before the first await. Scope a fault to its test
+    // thread rather than allowing another parallel test to consume it.
+    static FAIL_BEFORE_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 pub(crate) fn fail_next_arm_before_resume() {
-    FAIL_BEFORE_RESUME.store(true, Ordering::Release);
+    FAIL_BEFORE_RESUME.with(|failure| failure.set(true));
 }
 
 pub enum SpawnOwnedError {
@@ -334,6 +343,7 @@ impl JobObjectGuard {
             .raw_handle()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child handle unavailable"))?;
         let process = duplicate_process_handle(raw)?;
+        // SAFETY: the process handle is owned and retained through this identity query.
         let retained_pid = unsafe { GetProcessId(process.as_raw_handle()) };
         if retained_pid == 0 || retained_pid != direct_pid {
             return Err(io::Error::new(
@@ -380,6 +390,7 @@ impl JobObjectGuard {
             ));
         }
         let thread = sole_initial_thread(retained_pid)?;
+        // SAFETY: thread is a live owned handle retained through this identity query.
         let thread_pid = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
         if thread_pid == 0 || thread_pid != retained_pid {
             return Err(io::Error::new(
@@ -388,12 +399,13 @@ impl JobObjectGuard {
             ));
         }
         #[cfg(test)]
-        if FAIL_BEFORE_RESUME.swap(false, Ordering::AcqRel) {
+        if FAIL_BEFORE_RESUME.with(|failure| failure.replace(false)) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "test-only pre-resume arm failure",
             ));
         }
+        // SAFETY: thread is the retained initial thread whose process identity was verified.
         let previous_suspend_count = unsafe { ResumeThread(thread.as_raw_handle()) };
         if previous_suspend_count != 1 {
             return Err(io::Error::new(
@@ -424,6 +436,7 @@ impl JobObjectGuard {
             self.ownership_lost.store(true, Ordering::Release);
             return;
         };
+        // SAFETY: job is a live owned handle retained for the termination call.
         let result = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
         if result != TRUE {
             self.ownership_lost.store(true, Ordering::Release);
@@ -434,6 +447,7 @@ impl JobObjectGuard {
 
     pub fn child_running(&mut self) -> io::Result<bool> {
         let process = self.process.as_raw_handle();
+        // SAFETY: the process handle is owned and retained through this identity query.
         let pid = unsafe { GetProcessId(process) };
         let creation_time = process_creation_time(process)?;
         if pid == 0 || pid != self.direct_pid || creation_time != self.creation_time {
@@ -462,6 +476,7 @@ impl JobObjectGuard {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let mut accounting = JobObjectBasicAccountingInformation::default();
+            // SAFETY: job is retained and accounting is initialized writable repr(C) storage.
             let result = unsafe {
                 QueryInformationJobObject(
                     job.as_raw_handle(),
@@ -531,7 +546,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let result = spawn_owned_command_checked(command);
-        let SpawnOwnedError::Arm { mut child, error } = result else {
+        let Err(SpawnOwnedError::Arm { mut child, error }) = result else {
             panic!("pre-resume fault must be returned as an arm error");
         };
         assert!(error.to_string().contains("pre-resume"));

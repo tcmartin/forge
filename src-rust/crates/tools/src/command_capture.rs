@@ -667,6 +667,55 @@ mod tests {
         ]
     }
 
+    // These ignored fixtures are invoked by the owned-process-tree tests. The
+    // exact filter prevents a broad or zero-match test invocation from being
+    // mistaken for the intended parent/descendant witness.
+    #[cfg(windows)]
+    const WINDOWS_TREE_MARKER: &str = "windows-job-object-pids.txt";
+
+    #[cfg(windows)]
+    const WINDOWS_TREE_STARTED_MARKER: &str = "windows-job-object-descendant-started.txt";
+
+    #[cfg(windows)]
+    fn windows_tree_fixture_argv(test_name: &str) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .expect("test executable")
+                .to_string_lossy()
+                .into_owned(),
+            test_name.into(),
+            "--exact".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn write_windows_marker(path: &Path, contents: &str) -> io::Result<()> {
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, contents)?;
+        std::fs::rename(temporary, path)
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_fixture_started(marker: &Path, descendant_pid: u32) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(marker)
+                && contents.trim().parse::<u32>().ok() == Some(descendant_pid)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "exact descendant fixture did not publish its startup witness",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(windows)]
     fn checked_spawn(argv: &[String], cwd: &Path) -> (Child, ProcessGroupGuard) {
         spawn_owned_argv_checked(argv, cwd).unwrap_or_else(|error| panic!("{}", error.message()))
@@ -741,6 +790,47 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    #[ignore = "launched as a child by the owned-process-tree tests"]
+    fn windows_process_tree_parent_fixture() {
+        let marker = Path::new(WINDOWS_TREE_MARKER);
+        let started = Path::new(WINDOWS_TREE_STARTED_MARKER);
+        let mut descendant =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "windows_process_tree_descendant_fixture",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .spawn()
+                .expect("spawn native descendant fixture");
+        if let Err(error) = wait_for_windows_fixture_started(started, descendant.id()) {
+            let _ = descendant.kill();
+            let _ = descendant.wait();
+            panic!("exact descendant fixture startup witness: {error}");
+        }
+        write_windows_marker(
+            marker,
+            &format!("{},{}", std::process::id(), descendant.id()),
+        )
+        .expect("publish process-tree witness");
+        let _ = descendant.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "launched as a child by the owned-process-tree tests"]
+    fn windows_process_tree_descendant_fixture() {
+        write_windows_marker(
+            Path::new(WINDOWS_TREE_STARTED_MARKER),
+            &std::process::id().to_string(),
+        )
+        .expect("publish descendant startup witness");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_direct_completion_proves_empty_job() {
         let output = capture_windows(
@@ -757,12 +847,8 @@ mod tests {
     #[tokio::test]
     async fn windows_descendant_cancel_proves_job_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("cancel-pids.txt");
-        let marker_literal = marker.display().to_string().replace('\'', "''");
-        let script = format!(
-            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
-        );
-        let argv = powershell_argv(&script);
+        let marker = dir.path().join(WINDOWS_TREE_MARKER);
+        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
         let (child, mut group) = checked_spawn(&argv, dir.path());
         let parent_pid = child.id().expect("owned parent pid");
         let cancel = CancellationToken::new();
@@ -803,12 +889,8 @@ mod tests {
     #[tokio::test]
     async fn windows_dropped_capture_proves_parent_and_descendant_gone() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("owned-pids.txt");
-        let marker_literal = marker.display().to_string().replace('\'', "''");
-        let script = format!(
-            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
-        );
-        let argv = powershell_argv(&script);
+        let marker = dir.path().join(WINDOWS_TREE_MARKER);
+        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
         let cwd = dir.path().to_path_buf();
         let (child, mut group) = checked_spawn(&argv, &cwd);
         let parent_pid = child.id().expect("owned parent pid");
@@ -841,12 +923,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut foreign, mut foreign_group) =
             checked_spawn(&powershell_argv("Start-Sleep 30"), dir.path());
-        let marker = dir.path().join("owned-cancel-pids.txt");
-        let marker_literal = marker.display().to_string().replace('\'', "''");
-        let script = format!(
-            "$p=Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep 30' -PassThru; Set-Content -Path '{marker_literal}' -Value \"$PID,$($p.Id)\"; Wait-Process -Id $p.Id"
-        );
-        let (child, mut group) = checked_spawn(&powershell_argv(&script), dir.path());
+        let marker = dir.path().join(WINDOWS_TREE_MARKER);
+        let argv = windows_tree_fixture_argv("windows_process_tree_parent_fixture");
+        let (child, mut group) = checked_spawn(&argv, dir.path());
         let parent_pid = child.id().expect("owned parent pid");
         let cancel = CancellationToken::new();
         let task = tokio::spawn({

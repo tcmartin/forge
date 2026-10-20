@@ -372,14 +372,33 @@ fn event_charge(event: &QueryEvent) -> Option<usize> {
             tool_name,
             tool_id,
             result,
+            native_operation_receipt,
             ..
-        } => (
-            tool_name
+        } => {
+            let capacity = tool_name
                 .capacity()
                 .saturating_add(tool_id.capacity())
-                .saturating_add(result.capacity()),
-            Some(result.as_bytes()),
-        ),
+                .saturating_add(result.capacity());
+            let charge = capacity.saturating_mul(8).saturating_add(1024);
+            if charge > MAX_EVENT_BYTES {
+                return Some(usize::MAX);
+            }
+            let result_charge = input_charge(result.as_bytes()).ok().unwrap_or(usize::MAX);
+            let receipt_charge = native_operation_receipt
+                .as_ref()
+                .map(|receipt| {
+                    serde_json::to_vec(receipt)
+                        .ok()
+                        .and_then(|bytes| input_charge(&bytes).ok())
+                        .unwrap_or(usize::MAX)
+                })
+                .unwrap_or(0);
+            return Some(
+                charge
+                    .saturating_add(result_charge)
+                    .saturating_add(receipt_charge),
+            );
+        }
         QueryEvent::Error(message) => (message.capacity(), None),
         QueryEvent::McpDiscovery(_) | QueryEvent::McpInvocation { .. } => {
             return claurst_query::event_channel::diagnostic_event_charge(event);
@@ -446,6 +465,7 @@ async fn forward_events(
                 tool_id,
                 result,
                 is_error,
+                native_operation_receipt: _,
                 execution_witness: _,
             } => {
                 let status = if *is_error {
@@ -682,6 +702,7 @@ mod tests {
             tool_id: "call-1".to_string(),
             result: "{\"mutation\":\"committed\"}".to_string(),
             is_error: false,
+            native_operation_receipt: None,
             execution_witness: None,
         })
         .unwrap();

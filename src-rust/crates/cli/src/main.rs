@@ -2196,6 +2196,7 @@ async fn run_headless(
                 tool_id,
                 result,
                 is_error,
+                native_operation_receipt,
                 execution_witness,
             } if is_stream_json => {
                 // Rejected or undisclosed calls can return a result without
@@ -2212,6 +2213,9 @@ async fn run_headless(
                 if let Some(witness) = execution_witness {
                     event["execution_witness"] =
                         serde_json::to_value(witness).unwrap_or(serde_json::Value::Null);
+                }
+                if let Some(receipt) = native_operation_receipt {
+                    event["native_operation_receipt"] = receipt.clone();
                 }
                 forward_stream_json!(event);
             }
@@ -4665,6 +4669,7 @@ async fn run_interactive(
                         tool_id,
                         result,
                         is_error,
+                        native_operation_receipt: _,
                         execution_witness: _,
                     } => Some(
                         serde_json::json!({

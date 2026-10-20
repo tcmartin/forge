@@ -198,6 +198,7 @@ impl App {
                 tool_id,
                 result,
                 is_error,
+                native_operation_receipt: _,
                 execution_witness: _,
             } => {
                 // Build a multi-line preview: show up to 3 lines, truncate if more.

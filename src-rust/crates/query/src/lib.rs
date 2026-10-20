@@ -498,6 +498,8 @@ pub enum QueryEvent {
         tool_id: String,
         result: String,
         is_error: bool,
+        /// Bounded source-bound operation metadata for stream-json only.
+        native_operation_receipt: Option<Value>,
         /// Present only on stream-json for a registered built-in PTY Bash
         /// handle. Other surfaces intentionally discard this additive field.
         execution_witness: Option<NativeBashExecutionWitness>,
@@ -3532,6 +3534,7 @@ async fn run_query_loop_inner(
                             tool_id: tool_id.clone(),
                             result: result_display,
                             is_error: result_is_error,
+                            native_operation_receipt: result.native_operation_receipt(),
                             execution_witness,
                         });
                     }
@@ -4493,6 +4496,7 @@ async fn run_query_loop_inner(
                             tool_id: p.id.clone(),
                             result: result_display,
                             is_error: result_is_error,
+                            native_operation_receipt: result.native_operation_receipt(),
                             execution_witness,
                         });
                     }

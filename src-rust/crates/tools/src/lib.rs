@@ -473,6 +473,68 @@ impl ToolResult {
         self.execution_status
     }
 
+    /// Return bounded, source-bound operation metadata for diagnostic
+    /// forwarding. Unknown keys are ignored; malformed recognized keys make
+    /// the whole optional receipt unavailable. Private typed receipts and
+    /// model-visible content never cross this accessor.
+    pub fn native_operation_receipt(&self) -> Option<Value> {
+        const MAX_LONG_TEXT: usize = 16 * 1024;
+        const MAX_RECEIPT_BYTES: usize = 64 * 1024;
+
+        let metadata = self.metadata.as_ref().and_then(Value::as_object);
+        let mut receipt = serde_json::Map::new();
+        for (key, max) in [
+            ("operation_id", 256),
+            ("file_path", MAX_LONG_TEXT),
+            ("mutation", 128),
+            ("verification", 128),
+            ("before_hash", 128),
+            ("after_hash", 128),
+            ("command_status", 64),
+        ] {
+            if let Some(value) = metadata.and_then(|object| object.get(key)) {
+                if value.is_null() && matches!(key, "before_hash" | "after_hash") {
+                    receipt.insert(key.to_string(), Value::Null);
+                    continue;
+                }
+                let text = value.as_str()?;
+                if text.len() > max {
+                    return None;
+                }
+                receipt.insert(key.to_string(), Value::String(text.to_string()));
+            }
+        }
+
+        if let Some(value) = metadata.and_then(|object| object.get("bytes")) {
+            receipt.insert("bytes".to_string(), Value::from(value.as_u64()?));
+        }
+        if let Some(value) = metadata.and_then(|object| object.get("exit_code")) {
+            if let Some(code) = value.as_i64() {
+                i32::try_from(code).ok()?;
+            } else if !value.is_null() {
+                return None;
+            }
+            receipt.insert("exit_code".to_string(), value.clone());
+        }
+        if let Some(value) = metadata.and_then(|object| object.get("partial")) {
+            receipt.insert("partial".to_string(), Value::Bool(value.as_bool()?));
+        }
+
+        // This field is host-owned and cannot be forged through metadata.
+        if let Some(status) = self.execution_status {
+            receipt.insert(
+                "execution_status".to_string(),
+                Value::String(status.as_str().to_string()),
+            );
+        }
+
+        if receipt.is_empty() {
+            return None;
+        }
+        let receipt = Value::Object(receipt);
+        (serde_json::to_vec(&receipt).ok()?.len() <= MAX_RECEIPT_BYTES).then_some(receipt)
+    }
+
     /// Take the private host-only receipt bundle attached by an authorized
     /// mutator. Model-visible metadata never contains this value.
     pub fn take_application_receipts(&mut self) -> Option<ReceiptBundle> {
@@ -1332,6 +1394,84 @@ mod tests {
             result.metadata.as_ref().unwrap()["execution_status"],
             "completed"
         );
+    }
+
+    #[test]
+    fn native_operation_receipt_is_absent_without_metadata() {
+        assert!(ToolResult::success("done")
+            .native_operation_receipt()
+            .is_none());
+    }
+
+    #[test]
+    fn native_operation_receipt_allowlists_fields_and_keeps_typed_status() {
+        let result = ToolResult::success("done")
+            .with_execution_status(ExecutionStatus::Unknown)
+            .with_metadata(serde_json::json!({
+                "operation_id": "op-1",
+                "file_path": "src/lib.rs",
+                "mutation": "modified",
+                "verification": "not_run",
+                "before_hash": "a",
+                "after_hash": "b",
+                "bytes": 12,
+                "partial": false,
+                "execution_status": "completed",
+                "secret": "must not cross",
+                "formatter": {"command": "private"},
+            }));
+        let receipt = result.native_operation_receipt().unwrap();
+        assert_eq!(receipt["operation_id"], "op-1");
+        assert_eq!(receipt["bytes"], 12);
+        assert_eq!(receipt["execution_status"], "unknown");
+        assert!(receipt.get("secret").is_none());
+        assert!(receipt.get("formatter").is_none());
+    }
+
+    #[test]
+    fn native_operation_receipt_preserves_uncertain_mutation_and_typed_status() {
+        let result = ToolResult::error("Final bytes are unavailable; mutation unknown")
+            .with_metadata(serde_json::json!({
+                "operation_id": "uncertain-write-1",
+                "file_path": "src/lib.rs",
+                "mutation": "unknown",
+                "verification": "not_run",
+                "before_hash": "a".repeat(64),
+                "after_hash": null,
+            }))
+            .with_execution_status(ExecutionStatus::Unknown);
+        let receipt = result
+            .native_operation_receipt()
+            .expect("valid uncertain receipt");
+        assert!(result.is_error);
+        assert_eq!(receipt["operation_id"], "uncertain-write-1");
+        assert_eq!(receipt["mutation"], "unknown");
+        assert_eq!(receipt["verification"], "not_run");
+        assert_eq!(receipt["after_hash"], Value::Null);
+        assert_eq!(receipt["execution_status"], "unknown");
+    }
+
+    #[test]
+    fn native_operation_receipt_rejects_malformed_nested_and_oversized_fields() {
+        let malformed = ToolResult::success("done").with_metadata(serde_json::json!({
+            "operation_id": {"nested": true},
+        }));
+        assert!(malformed.native_operation_receipt().is_none());
+
+        let nested = ToolResult::success("done").with_metadata(serde_json::json!({
+            "bytes": {"value": 12},
+        }));
+        assert!(nested.native_operation_receipt().is_none());
+
+        let invalid_exit_code = ToolResult::success("done").with_metadata(serde_json::json!({
+            "exit_code": 2_147_483_648_i64,
+        }));
+        assert!(invalid_exit_code.native_operation_receipt().is_none());
+
+        let oversized = ToolResult::success("done").with_metadata(serde_json::json!({
+            "file_path": "x".repeat(16 * 1024 + 1),
+        }));
+        assert!(oversized.native_operation_receipt().is_none());
     }
 
     #[test]

@@ -183,10 +183,16 @@ pub fn stream_event_charge(event: &QueryEvent) -> Option<usize> {
             tool_name,
             tool_id,
             result,
+            native_operation_receipt,
             execution_witness,
             ..
         } => strings(&[tool_name, tool_id, result]).and_then(|n| {
-            structured(bounded_diagnostic_charge(execution_witness)).and_then(|w| n.checked_add(w))
+            structured(bounded_diagnostic_charge(execution_witness))
+                .and_then(|w| n.checked_add(w))
+                .and_then(|n| {
+                    structured(bounded_diagnostic_charge(native_operation_receipt))
+                        .and_then(|receipt| n.checked_add(receipt))
+                })
         }),
         QueryEvent::TurnComplete { stop_reason, .. } => strings(&[stop_reason]),
         QueryEvent::Stream(stream) => match stream {

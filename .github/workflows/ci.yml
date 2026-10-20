@@ -68,6 +68,15 @@ jobs:
         # parallel execution, flaking non-deterministically across runners.
         run: cargo test --workspace --locked -- --test-threads=1
 
+      - name: Repeat queued-event close regression
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: src-rust
+        run: |
+          for attempt in {1..20}; do
+            cargo test --package claurst-mcp --locked streamable_get_close_joins_reader_before_return_and_blocks_events -- --test-threads=1
+          done
+
       # Enforced (#227): clippy is clean under `-D warnings`, aside from a few
       # documented crate-level / targeted `#[allow]`s for noisy or risky lints.
       # rustfmt stays advisory below: the tree is intentionally not fmt-clean

@@ -1267,6 +1267,7 @@ impl Transport<RoleClient> for BoundedStreamableHttpTransport {
         let fatal = self.fatal.clone();
         async move {
             tokio::select! {
+                biased;
                 _ = fatal.cancelled() => None,
                 message = async { incoming.lock().await.recv().await } => message,
             }
@@ -1905,6 +1906,15 @@ mod tests {
             .unwrap()
             .expect("fixture should hold the active GET reader");
         transport.state.lock().await.session_id = None;
+
+        // Keep a message queued while close cancels `fatal`, making both
+        // receive branches ready at the post-close assertion.
+        let queued: RxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        }))
+        .unwrap();
+        transport.incoming_tx.try_send(queued).unwrap();
 
         transport.close().await.unwrap();
         assert!(transport.reader_slot.lock().unwrap().handle.is_none());

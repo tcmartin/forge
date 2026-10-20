@@ -1102,13 +1102,15 @@ mod tests {
 
 #[cfg(test)]
 mod contract_tests {
+    #[cfg(any(unix, windows))]
+    use super::run_bounded_command_with_limits;
+    #[cfg(unix)]
+    use super::MAX_ARCHIVE_BYTES;
     use super::{
         archive_listing, archive_name_for_target, binary_name_for_target, download_to_file,
         expected_sha256, extract_archive, normalize_version, validate_archive_listing,
         validate_extracted_binary, validate_repository, verify_archive_checksum,
     };
-    #[cfg(unix)]
-    use super::{run_bounded_command_with_limits, MAX_ARCHIVE_BYTES};
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1505,18 +1507,36 @@ mod contract_tests {
         assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
     }
 
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn streamed_oversize_helper_rejects_before_destination_create() {
         let dir = TestDir::new();
         let destination = dir.path().join("destination").join("forge");
-        let result = run_bounded_command_with_limits(
-            "sh",
-            &["-c".to_string(), "printf 1234567890".to_string()],
-            std::time::Duration::from_secs(2),
-            4,
-        )
-        .await;
-        assert!(result.is_err());
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec![
+                    "/D".to_string(),
+                    "/C".to_string(),
+                    "echo 1234567890".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh",
+                vec!["-c".to_string(), "printf 1234567890".to_string()],
+            )
+        };
+        let result =
+            run_bounded_command_with_limits(program, &args, std::time::Duration::from_secs(2), 4)
+                .await;
+        let error = result.err().expect("oversize helper output must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("helper process output exceeds 4 bytes"),
+            "unexpected helper failure: {error:#}"
+        );
         assert!(
             !destination.exists(),
             "oversize bytes must precede destination creation"

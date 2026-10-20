@@ -3375,6 +3375,82 @@ pub mod permissions {
             }
         }
 
+        /// Decide whether metadata discovery may expose a tool whose actual
+        /// parameters will be checked later by its self-gating implementation.
+        ///
+        /// A headless catalog cannot supply a path or command. It therefore
+        /// exposes a gated tool only when a global allow exists or a
+        /// parameter-scoped allow exists for a tool that performs the final
+        /// parameter-aware check itself. The final execution decision still
+        /// goes through `evaluate` with the actual path/command.
+        pub fn evaluate_catalog(
+            &self,
+            tool_name: &str,
+            is_read_only: bool,
+            parameterized_self_gate: bool,
+        ) -> PermissionDecision {
+            use crate::config::PermissionMode;
+
+            if self.mode == PermissionMode::BypassPermissions {
+                return PermissionDecision::Allow;
+            }
+
+            let all_rules = self
+                .persistent_rules
+                .iter()
+                .chain(self.session_rules.iter());
+            let mut global_deny = false;
+            let mut global_allow = false;
+            let mut parameterized_allow = false;
+
+            for rule in all_rules {
+                if rule
+                    .tool_name
+                    .as_deref()
+                    .is_some_and(|name| name != tool_name)
+                {
+                    continue;
+                }
+                match (&rule.action, rule.path_pattern.is_some()) {
+                    (PermissionAction::Deny, false) => global_deny = true,
+                    (PermissionAction::Allow, false) => global_allow = true,
+                    (PermissionAction::Allow, true)
+                        if rule
+                            .path_pattern
+                            .as_deref()
+                            .is_some_and(|pattern| glob::Pattern::new(pattern).is_ok()) =>
+                    {
+                        parameterized_allow = true;
+                    }
+                    (PermissionAction::Allow, true) => {}
+                    // A path-scoped deny cannot be evaluated without the
+                    // actual parameter. The runtime `evaluate` call keeps
+                    // deny precedence once that parameter is available.
+                    (PermissionAction::Deny, true) => {}
+                }
+            }
+
+            if global_deny {
+                return PermissionDecision::Deny;
+            }
+            if global_allow {
+                return PermissionDecision::Allow;
+            }
+            if parameterized_allow && parameterized_self_gate {
+                return PermissionDecision::Allow;
+            }
+            if is_read_only {
+                return PermissionDecision::Allow;
+            }
+            if self.mode == PermissionMode::AcceptEdits && tool_name == "Edit" {
+                return PermissionDecision::Allow;
+            }
+            if self.mode == PermissionMode::Plan {
+                return PermissionDecision::Deny;
+            }
+            PermissionDecision::Deny
+        }
+
         // ----------------------------------------------------------------
         // Rule management
         // ----------------------------------------------------------------
@@ -3533,6 +3609,26 @@ pub mod permissions {
     /// Trait implemented by anything that can decide whether to allow a tool.
     pub trait PermissionHandler: Send + Sync {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision;
+
+        /// Capability check used while building the metadata catalog. The
+        /// default preserves existing handlers; managed headless mode
+        /// overrides it with a path-grant-aware decision.
+        fn check_catalog_permission(
+            &self,
+            request: &PermissionRequest,
+            parameterized_self_gate: bool,
+        ) -> PermissionDecision {
+            let _ = parameterized_self_gate;
+            self.check_permission(request)
+        }
+
+        /// Capability check for a tool that owns its parameter-aware gate.
+        /// `Ask` must reach the tool so its exact path/command check remains
+        /// authoritative; non-self-gating tools keep the ordinary check.
+        fn check_self_gating_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+
         fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision;
     }
 
@@ -3627,17 +3723,44 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
+                return match m.evaluate(
+                    &request.tool_name,
+                    &request.description,
+                    request.path.as_deref(),
+                    request.working_dir.as_deref(),
+                    &request.allowed_roots,
+                ) {
+                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
+                    other => other,
+                };
+            }
+            PermissionDecision::Deny
+        }
+
+        fn check_catalog_permission(
+            &self,
+            request: &PermissionRequest,
+            parameterized_self_gate: bool,
+        ) -> PermissionDecision {
+            if let Ok(m) = self.manager.lock() {
+                return m.evaluate_catalog(
+                    &request.tool_name,
+                    request.is_read_only,
+                    parameterized_self_gate,
+                );
+            }
+            PermissionDecision::Deny
+        }
+
+        fn check_self_gating_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            if let Ok(m) = self.manager.lock() {
+                return m.evaluate(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
-                return match decision {
-                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
-                    other => other,
-                };
             }
             PermissionDecision::Deny
         }
@@ -3778,6 +3901,66 @@ pub mod permissions {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
+        }
+
+        #[test]
+        fn catalog_requires_real_parameter_grant_and_runtime_keeps_exact_match() {
+            let mut m = mgr(PermissionMode::Default);
+            assert_eq!(
+                m.evaluate_catalog("Bash", false, true),
+                PermissionDecision::Deny
+            );
+            m.add_session_allow_path("Bash", "echo fixed");
+            assert_eq!(
+                m.evaluate_catalog("Bash", false, true),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                m.evaluate("Bash", "echo fixed", Some("echo fixed"), None, &[]),
+                PermissionDecision::Allow
+            );
+            assert!(matches!(
+                m.evaluate("Bash", "echo other", Some("echo other"), None, &[]),
+                PermissionDecision::Ask { .. }
+            ));
+
+            let mut denied = mgr(PermissionMode::Default);
+            denied.add_session_allow_path("Edit", "/workspace/fixture.txt");
+            assert_eq!(
+                denied.evaluate_catalog("Edit", false, true),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                denied.evaluate(
+                    "Edit",
+                    "Edit /workspace/fixture.txt",
+                    Some("/workspace/fixture.txt"),
+                    None,
+                    &[],
+                ),
+                PermissionDecision::Allow
+            );
+            assert!(matches!(
+                denied.evaluate(
+                    "Edit",
+                    "Edit /tmp/outside.txt",
+                    Some("/tmp/outside.txt"),
+                    None,
+                    &[],
+                ),
+                PermissionDecision::Ask { .. }
+            ));
+
+            denied.add_rule(PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: None,
+                action: PermissionAction::Deny,
+                scope: PermissionScope::Session,
+            });
+            assert_eq!(
+                denied.evaluate_catalog("Bash", false, true),
+                PermissionDecision::Deny
+            );
         }
 
         #[test]

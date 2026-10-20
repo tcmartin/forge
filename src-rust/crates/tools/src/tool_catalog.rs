@@ -278,9 +278,11 @@ pub struct ToolCatalogView {
 impl ToolCatalogView {
     /// Build from the exact final tool handles selected by the host.
     ///
-    /// This performs policy and capability filtering but does not prompt. An
-    /// `Ask` capability remains discoverable and is checked again at execute
-    /// time. Denied entries are omitted. Input schemas are deliberately not
+    /// This performs policy and capability filtering but does not prompt. A
+    /// parameterized self-gating tool is discoverable only when the host has
+    /// a real global or parameter-scoped grant; its actual parameter is
+    /// checked again at execute time. Denied entries are omitted. Input
+    /// schemas are deliberately not
     /// evaluated here, including for deferred or MCP tools.
     pub fn from_tools(
         ctx: &ToolContext,
@@ -313,7 +315,12 @@ impl ToolCatalogView {
                 PermissionLevel::None | PermissionLevel::ReadOnly
             );
             if matches!(
-                ctx.check_capability(name, tool.description(), is_read_only),
+                ctx.check_catalog_capability(
+                    name,
+                    tool.description(),
+                    is_read_only,
+                    tool.self_gates(),
+                ),
                 PermissionDecision::Deny | PermissionDecision::DenyPermanently
             ) {
                 continue;
@@ -770,5 +777,112 @@ mod tests {
         drop(scope_clone);
         fs::remove_dir(&workspace).expect("scope release permits removal");
         fs::create_dir(&workspace).expect("replacement workspace");
+    }
+
+    #[test]
+    fn managed_default_catalog_uses_real_parameter_grants_and_final_checks() {
+        use claurst_core::config::{PermissionMode, Settings};
+        use claurst_core::permissions::{
+            ManagedAutoPermissionHandler, PermissionAction, PermissionManager, PermissionRule,
+            PermissionScope,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = "echo fixed";
+        let edit_path = workspace.path().join("fixture.txt");
+        let make_context = |manager: Arc<Mutex<PermissionManager>>| {
+            let mut ctx = crate::test_support::allow_all_context(workspace.path().to_path_buf());
+            ctx.permission_handler = Arc::new(ManagedAutoPermissionHandler::new(manager));
+            ctx
+        };
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(crate::PtyBashTool), Box::new(crate::FileEditTool)];
+
+        let no_grant = Arc::new(Mutex::new(PermissionManager::new(
+            PermissionMode::Default,
+            &Settings::default(),
+        )));
+        let view = ToolCatalogView::from_tools(&make_context(no_grant), &tools).expect("catalog");
+        assert!(
+            view.entries().is_empty(),
+            "ungranted gated tools must stay hidden"
+        );
+
+        let granted = Arc::new(Mutex::new(PermissionManager::new(
+            PermissionMode::Default,
+            &Settings::default(),
+        )));
+        {
+            let mut manager = granted.lock().expect("manager");
+            manager.add_session_allow_path("Bash", command);
+            manager.add_session_allow_path("Edit", &edit_path.display().to_string());
+        }
+        let granted_ctx = make_context(granted);
+        let view = ToolCatalogView::from_tools(&granted_ctx, &tools).expect("catalog");
+        let names: std::collections::BTreeSet<_> =
+            view.entries().iter().map(|entry| entry.name()).collect();
+        assert!(
+            names.contains("Bash"),
+            "exact Bash grant must disclose Bash"
+        );
+        assert!(
+            names.contains("Edit"),
+            "exact Edit grant must disclose Edit"
+        );
+        granted_ctx
+            .check_permission_for_path("Bash", "fixed", command.into(), false)
+            .expect("exact command grant");
+        assert!(granted_ctx
+            .check_permission_for_path("Bash", "wrong", "echo other".into(), false)
+            .is_err());
+        granted_ctx
+            .check_permission_for_path("Edit", "fixture", edit_path.clone(), false)
+            .expect("exact Edit path grant");
+        assert!(granted_ctx
+            .check_permission_for_path(
+                "Edit",
+                "outside",
+                workspace.path().join("outside.txt"),
+                false,
+            )
+            .is_err());
+
+        let invalid = Arc::new(Mutex::new(PermissionManager::new(
+            PermissionMode::Default,
+            &Settings::default(),
+        )));
+        invalid.lock().expect("manager").add_rule(PermissionRule {
+            tool_name: Some("Bash".to_string()),
+            path_pattern: Some("[".to_string()),
+            action: PermissionAction::Allow,
+            scope: PermissionScope::Session,
+        });
+        let view = ToolCatalogView::from_tools(&make_context(invalid), &tools).expect("catalog");
+        assert!(
+            view.entries().is_empty(),
+            "invalid glob must not disclose Bash"
+        );
+
+        let deny = Arc::new(Mutex::new(PermissionManager::new(
+            PermissionMode::Default,
+            &Settings::default(),
+        )));
+        {
+            let mut manager = deny.lock().expect("manager");
+            manager.add_session_allow_path("Bash", command);
+            manager.add_rule(PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: None,
+                action: PermissionAction::Deny,
+                scope: PermissionScope::Session,
+            });
+        }
+        let deny_ctx = make_context(deny);
+        let view = ToolCatalogView::from_tools(&deny_ctx, &tools).expect("catalog");
+        assert!(view.entries().is_empty(), "global deny must hide Bash");
+        assert!(deny_ctx
+            .check_permission_for_path("Bash", "denied", command.into(), false)
+            .is_err());
     }
 }

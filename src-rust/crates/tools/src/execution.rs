@@ -84,7 +84,12 @@ pub fn authorization_preflight(
         tool.permission_level(),
         PermissionLevel::None | PermissionLevel::ReadOnly
     );
-    match ctx.check_capability(name, &description, is_read_only) {
+    let capability = if tool.self_gates() {
+        ctx.check_self_gating_capability(name, &description, is_read_only)
+    } else {
+        ctx.check_capability(name, &description, is_read_only)
+    };
+    match capability {
         PermissionDecision::Deny | PermissionDecision::DenyPermanently => {
             tracing::warn!("Tool blocked by central capability policy");
             Err(Box::new(not_run(format!(

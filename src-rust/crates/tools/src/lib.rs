@@ -1008,6 +1008,35 @@ impl ToolContext {
         self.permission_handler.check_permission(&request)
     }
 
+    /// Catalog-only capability filtering. A parameterized self-gating tool
+    /// may be disclosed when a path/command grant exists; execution still
+    /// supplies the real parameter to `check_permission_for_path`.
+    pub fn check_catalog_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        is_read_only: bool,
+        parameterized_self_gate: bool,
+    ) -> PermissionDecision {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        self.permission_handler
+            .check_catalog_permission(&request, parameterized_self_gate)
+    }
+
+    /// Preflight for a tool that owns its exact path/command permission check.
+    pub fn check_self_gating_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        is_read_only: bool,
+    ) -> PermissionDecision {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        self.permission_handler
+            .check_self_gating_permission(&request)
+    }
+
     pub fn check_permission_for_path(
         &self,
         tool_name: &str,
